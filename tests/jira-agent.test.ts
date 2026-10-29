@@ -102,7 +102,7 @@ describe("jira agent side", () => {
     expect(c.instructions).toBeNull();
   });
 
-  it("configure selects every registered tool; the Jira ones only while on (the verdict tool only while verifying)", async () => {
+  it("configure selects every registered tool; the Jira ones only while on (the verdict tool only once a verify turn was sent)", async () => {
     await load({ jiraEnabled: false });
     const jiraTools = ["focus_board_jira_link", "focus_board_spawn_child", "focus_board_done_verdict"];
     const all = harness.inspection.registrations.agentTools.map((t) => t.name).sort();
@@ -113,7 +113,8 @@ describe("jira agent side", () => {
     await harness.behavior.setSettings({ jiraEnabled: true });
     await flush();
     expect(await names()).toEqual(all.filter((n) => n !== "focus_board_done_verdict"));
-    expect(await names({ jira: rec({ verifying: { startedAt: "x" } }) })).toEqual(all);
+    // verifying alone is not enough: the verify turn must have been sent (tests/jira-done-check.test.ts).
+    expect(await names({ jira: rec({ verifying: { startedAt: "x" } }) })).toEqual(all.filter((n) => n !== "focus_board_done_verdict"));
   });
 
   // registerJira alone, its settings reads held open so the test orders them.

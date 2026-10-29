@@ -26,8 +26,8 @@ export type JiraCardBadgesProps = {
   record: ThreadJiraRecord | undefined;
   ticketByKey: Record<string, JiraTicket>;
   pendingOps: readonly QueueOp[];
-  /** index: which Done-check reason (spin-off / keep-working / not-needed). */
-  onAction: (kind: JiraCardKind, threadId: string, index?: number) => void;
+  /** index + reason: which Done-check reason (spin-off / not-needed); the server refuses a stale pair. */
+  onAction: (kind: JiraCardKind, threadId: string, index?: number, reason?: string) => void;
 };
 
 export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, pendingOps, onAction }: JiraCardBadgesProps) {
@@ -84,14 +84,19 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
           Confirm done
         </button>
       ) : null}
+      {record?.verifying != null || record?.doneCheck?.verdict === "pending-confirm" ? (
+        <button type="button" className={cn(chip, "underline")} onClick={() => onAction("keep-working", threadId)}>
+          Keep working
+        </button>
+      ) : null}
       {failed.length > 0 ? (
         <ul className="w-full text-[10px] text-muted-foreground" data-jira-reasons="">
           {failed.map((r, i) => (
             <li key={i} className="flex flex-wrap items-center gap-1">
               <span className="truncate">{r}</span>
-              <button type="button" className="underline" onClick={() => onAction("spin-off", threadId, i)}>Spin off</button>
-              <button type="button" className="underline" onClick={() => onAction("keep-working", threadId, i)}>Keep working</button>
-              <button type="button" className="underline" onClick={() => onAction("not-needed", threadId, i)}>Not needed</button>
+              <button type="button" className="underline" onClick={() => onAction("spin-off", threadId, i, r)}>Spin off</button>
+              <button type="button" className="underline" onClick={() => onAction("keep-working", threadId)}>Keep working</button>
+              <button type="button" className="underline" onClick={() => onAction("not-needed", threadId, i, r)}>Not needed</button>
             </li>
           ))}
         </ul>

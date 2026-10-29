@@ -65,7 +65,7 @@ describe("doneSummary", () => {
     expect(s).toContain("Ship it");
     expect(s).toContain("https://github.com/o/r/pull/1");
     expect(s).toContain("PT-2");
-    expect(doneSummary({ title: "x".repeat(9000), prUrls: [], childKeys: [], skipped: true }).length).toBeLessThanOrEqual(4000);
+    expect(doneSummary({ title: "x".repeat(9000), prUrls: [], childKeys: [], skipped: true }).length).toBeLessThan(4000);
   });
 });
 
@@ -96,6 +96,7 @@ const rec = (over: object = {}) => ({
   nudgedAt: null, deepCheckedAt: null, reason: null, checkInWith: null, ...over,
 });
 const flush = () => new Promise((r) => setTimeout(r, 0));
+const T1 = { id: "t1", title: null, parentThreadId: null, sourceThreadId: null };
 
 describe("Done check flow", () => {
   let harness: FakePluginHarness;
@@ -104,6 +105,7 @@ describe("Done check flow", () => {
   const status = new Map<string, string>();
   const rows = new Map<string, { parentThreadId?: string; title?: string; branch?: string | null }>();
   let send: ReturnType<typeof vi.fn>;
+  let metaHook: ((set: Record<string, any> | undefined) => void) | null = null;
 
   async function load(opts: { enabled?: boolean; snapshot?: object | null; kv?: Record<string, unknown> } = {}) {
     send = vi.fn(async () => ({}));
@@ -124,6 +126,7 @@ describe("Done check flow", () => {
           send,
           getPluginMetadata: async ({ threadId }: { threadId: string }) => metadata.get(threadId) ?? {},
           updatePluginMetadata: async ({ threadId, set, remove }: { threadId: string; set?: Record<string, unknown>; remove?: string[] }) => {
+            metaHook?.(set);
             const next = { ...(metadata.get(threadId) ?? {}), ...(set ?? {}) };
             for (const k of remove ?? []) delete next[k];
             metadata.set(threadId, next);
@@ -141,6 +144,7 @@ describe("Done check flow", () => {
     await flush();
   }
   const reset = () => {
+    metaHook = null;
     metadata.clear();
     status.clear();
     rows.clear();
@@ -153,8 +157,9 @@ describe("Done check flow", () => {
   const doneOf = (id: string) => metadata.get(id)?.[DONE_METADATA_KEY];
   const ops = async () => ((await bb.storage.kv.get("jira:queue")) as { op: string; key: string; toCategory?: string; body?: string }[] | undefined) ?? [];
   const doneSet = (threadId: string, done = true) => harness.behavior.callRpc("done_set", { threadId, done });
-  const card = (kind: string, threadId = "t1", index?: number) =>
-    harness.behavior.callRpc("jira_card_action", { kind, threadId, ...(index === undefined ? {} : { index }) }) as Promise<{ ok: boolean; error?: string }>;
+  const card = (kind: string, threadId = "t1", index?: number, reason?: string) =>
+    harness.behavior.callRpc("jira_card_action", { kind, threadId, ...(index === undefined ? {} : { index }), ...(reason === undefined ? {} : { reason }) }) as Promise<{ ok: boolean; error?: string }>;
+  const busy409 = () => Object.assign(new Error("not writable"), { status: 409, code: "thread_not_writable" });
   const idle = async (id: string) => {
     status.set(id, "idle");
     await harness.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id }), lastAssistantText: null });
@@ -254,7 +259,7 @@ describe("Done check flow", () => {
     expect(JSON.stringify(send.mock.calls[0])).toContain("focus_board_done_verdict");
     expect(jiraOf("t1")?.verifying).not.toBeNull();
     expect(doneOf("t1")).toBeUndefined();
-    const configured = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ pluginMetadata: metadata.get("t1") } as never));
+    const configured = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ pluginMetadata: metadata.get("t1"), thread: T1 } as never));
     expect(configured.tools.map((t) => t.name)).toContain("focus_board_done_verdict");
     expect(await card("confirm-done")).toEqual({ ok: false, error: "nothing to confirm" });
     const r = await verdict({ verdict: "pass", remaining: [] });
@@ -262,7 +267,7 @@ describe("Done check flow", () => {
     expect(jiraOf("t1")).toMatchObject({ verifying: null, doneCheck: { verdict: "pending-confirm" } });
     expect(doneOf("t1")).toBeUndefined();
     // Not verifying any more: the tool is not offered and is rejected.
-    const after = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ pluginMetadata: metadata.get("t1") } as never));
+    const after = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ pluginMetadata: metadata.get("t1"), thread: T1 } as never));
     expect(after.tools.map((t) => t.name)).not.toContain("focus_board_done_verdict");
     expect((await verdict({ verdict: "fail", remaining: ["x"] })).isError).toBe(true);
     expect(jiraOf("t1")?.doneCheck.verdict).toBe("pending-confirm");
@@ -271,7 +276,7 @@ describe("Done check flow", () => {
     expect((await ops()).map((o) => o.op)).toEqual(["comment", "transition"]);
   });
 
-  it("a busy verify turn waits for idle; a throwing send keeps verifying and re-queues", async () => {
+  it("a throwing verify send keeps verifying and re-queues verify-turn for the next idle", async () => {
     seed("t1");
     rows.get("t1")!.branch = null;
     await load();
@@ -317,7 +322,7 @@ describe("Done check flow", () => {
     expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
     expect(jiraOf("t1")).toMatchObject({ verifying: null, reason: null, doneCheck: { skipped: true } });
     expect((await ops()).map((o) => o.op)).toEqual(["comment"]);
-    expect(await harness.behavior.callRpc("jira_done_confirm", { threadId: "t1", skip: true })).toEqual({ ok: true });
+    expect(await harness.behavior.callRpc("jira_done_confirm", { threadId: "t1", skip: true })).toEqual({ ok: false, error: "already done" });
     expect((await ops()).map((o) => o.op)).toEqual(["comment"]);
   });
 
@@ -372,5 +377,135 @@ describe("Done check flow", () => {
     await load({ enabled: false });
     expect((await verdict({ verdict: "pass", remaining: [] })).isError).toBe(true);
     expect(jiraOf("t1")?.doneCheck).toBeNull();
+  });
+
+  // ---- fix round 1 ----
+
+  it("a busy verify turn (sendIfIdle 'busy') is queued as verify-turn; the verdict is refused until it is sent", async () => {
+    seed("t1");
+    rows.get("t1")!.branch = null;
+    await load();
+    send.mockImplementationOnce(async () => {
+      status.set("t1", "active"); // it started running between the read and the send
+      throw busy409();
+    });
+    await doneSet("t1");
+    expect(jiraOf("t1")?.verifying).not.toBeNull();
+    const jobs = (await bb.storage.kv.get(IDLE_JOBS_KEY)) as { threadId: string; kind: string }[];
+    expect(jobs).toEqual([expect.objectContaining({ threadId: "t1", kind: "verify-turn" })]);
+    expect((await verdict({ verdict: "pass", remaining: [] })).isError).toBe(true);
+    await idle("t1");
+    expect(send).toHaveBeenCalledTimes(2);
+    expect((await verdict({ verdict: "pass", remaining: [] })).isError).toBeFalsy();
+  });
+
+  it("the verdict before the mechanical check ran: not offered, isError, no write", async () => {
+    seed("t1");
+    status.set("t1", "active");
+    await load({ snapshot: snap({ prs: [pr(8, "open")] }) });
+    await doneSet("t1");
+    const before = JSON.stringify(jiraOf("t1"));
+    const c = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ pluginMetadata: metadata.get("t1"), thread: T1 } as never));
+    expect(c.tools.map((t) => t.name)).not.toContain("focus_board_done_verdict");
+    expect((await verdict({ verdict: "pass", remaining: [] })).isError).toBe(true);
+    expect(JSON.stringify(jiraOf("t1"))).toBe(before);
+    await idle("t1");
+    expect(jiraOf("t1")?.doneCheck.reasons).toEqual(["PR #8 still open"]);
+  });
+
+  it("Keep working on a verifying card: it leaves Done, nothing sent, nothing stamped", async () => {
+    seed("t1");
+    status.set("t1", "active");
+    await load({ snapshot: snap({ prs: [pr(1, "merged")] }) });
+    await doneSet("t1");
+    expect(boardDoneIds(new Set(), true, { t1: jiraOf("t1") } as never).has("t1")).toBe(true);
+    expect(await card("keep-working")).toEqual({ ok: true });
+    expect(jiraOf("t1")).toMatchObject({ verifying: null, doneCheck: null, reason: null });
+    expect(boardDoneIds(new Set(), true, { t1: jiraOf("t1") } as never).has("t1")).toBe(false);
+    await idle("t1"); // the queued check finds nothing to do
+    expect(send).not.toHaveBeenCalled();
+    expect(doneOf("t1")).toBeUndefined();
+    expect(await ops()).toEqual([]);
+  });
+
+  it("Keep working on a pending-confirm card clears it", async () => {
+    seed("t1", { doneCheck: { at: "x", verdict: "pending-confirm", reasons: [] } });
+    await load();
+    expect(await card("keep-working")).toEqual({ ok: true });
+    expect(jiraOf("t1")?.doneCheck).toBeNull();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("Spin off on a busy thread is refused and keeps the reason; nothing queued", async () => {
+    seed("t1", { doneCheck: { at: "x", verdict: "fail", reasons: ["write docs"] }, reason: "write docs" });
+    status.set("t1", "active");
+    await load();
+    expect(await card("spin-off", "t1", 0, "write docs")).toEqual({ ok: false, error: "thread is busy — try after this turn" });
+    expect(send).not.toHaveBeenCalled();
+    expect(jiraOf("t1")?.doneCheck.reasons).toEqual(["write docs"]);
+    expect(((await bb.storage.kv.get(IDLE_JOBS_KEY)) as unknown[] | undefined) ?? []).toEqual([]);
+  });
+
+  it("a double click on Not needed drops one reason, not two", async () => {
+    seed("t1", { doneCheck: { at: "x", verdict: "fail", reasons: ["a", "b"] }, reason: "a; b" });
+    await load();
+    const rs = await Promise.all([card("not-needed", "t1", 0, "a"), card("not-needed", "t1", 0, "a")]);
+    expect(rs).toContainEqual({ ok: true });
+    expect(rs).toContainEqual({ ok: false, error: "no such reason" });
+    expect(jiraOf("t1")).toMatchObject({ reason: "b", doneCheck: { verdict: "fail", reasons: ["b"] } });
+  });
+
+  it("finishDone queues the ticket ops before clearing verifying", async () => {
+    seed("t1");
+    const order: string[] = [];
+    await load({ snapshot: snap({ prs: [pr(1, "merged")] }) });
+    const set = bb.storage.kv.set.bind(bb.storage.kv);
+    vi.spyOn(bb.storage.kv, "set").mockImplementation(async (k: string, v: unknown) => {
+      if (k === "jira:queue") order.push("enqueue");
+      return set(k, v as never);
+    });
+    metaHook = (set) => {
+      if (set?.jira && set.jira.verifying === null && set.jira.doneCheck?.verdict === "pass") order.push("clear");
+    };
+    await doneSet("t1");
+    expect(order[0]).toBe("enqueue");
+    expect(order).toContain("clear");
+    expect(order.indexOf("clear")).toBeGreaterThan(order.lastIndexOf("enqueue"));
+  });
+
+  it("a second Mark done anyway on a Done thread is refused: no duplicate comment after the first was acked", async () => {
+    seed("t1", { doneCheck: { at: "x", verdict: "fail", reasons: ["r"] }, reason: "r" });
+    await load();
+    expect(await card("skip-done")).toEqual({ ok: true });
+    await bb.storage.kv.set("jira:queue", []); // the script drained and acked
+    expect(await harness.behavior.callRpc("jira_done_confirm", { threadId: "t1", skip: true })).toEqual({ ok: false, error: "already done" });
+    expect(await card("skip-done")).toEqual({ ok: false, error: "already done" });
+    expect(await ops()).toEqual([]);
+  });
+
+  it("startup: a queued done-check plus verifying runs the check once (one verify turn)", async () => {
+    seed("t1", { verifying: { startedAt: "2026-10-29T00:00:00Z" } });
+    rows.get("t1")!.branch = null;
+    await load({ kv: { [IDLE_JOBS_KEY]: [{ threadId: "t1", kind: "done-check", queuedAt: "2026-10-29T00:00:00Z" }] } });
+    await flush();
+    await flush();
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("startup: a verify turn already sent for this check is not resent, and its verdict is accepted", async () => {
+    seed("t1", { verifying: { startedAt: "2026-10-29T00:00:00Z" } });
+    rows.get("t1")!.branch = null;
+    await load({ kv: { "jira:verify-sent": { t1: "2026-10-29T00:00:00Z" } } });
+    await flush();
+    expect(send).not.toHaveBeenCalled();
+    expect((await verdict({ verdict: "pass", remaining: [] })).isError).toBeFalsy();
+    expect(jiraOf("t1")?.doneCheck.verdict).toBe("pending-confirm");
+  });
+
+  it("the ticket-update dedupe ignores an unrelated pending comment for the thread", async () => {
+    seed("t1");
+    await load({ snapshot: snap({ prs: [pr(1, "merged")] }), kv: { "jira:queue": [{ id: "o1", createdAt: "x", threadId: "t1", op: "comment", key: "PT-1", body: "Focus Board: moving this to In Progress." }] } });
+    await doneSet("t1");
+    expect((await ops()).map((o) => o.op)).toEqual(["comment", "comment", "transition"]);
   });
 });

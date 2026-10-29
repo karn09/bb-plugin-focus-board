@@ -10,7 +10,7 @@ import type { KvLike } from "./jira-store";
 
 export const IDLE_JOBS_KEY = "jira:idle-jobs";
 
-export type JobKind = "done-check" | "verify-turn" | "nudge-turn" | "find-ticket" | "promote-epic" | "spin-off";
+export type JobKind = "done-check" | "verify-turn" | "nudge-turn" | "find-ticket" | "promote-epic";
 export type IdleHandler = (threadId: string, payload: JsonValue | undefined) => Promise<void>;
 
 /** The slice of bb.sdk.threads this module uses. */
@@ -22,7 +22,7 @@ type Log = (msg: string) => void;
 
 const Job = z.object({
   threadId: z.string(),
-  kind: z.enum(["done-check", "verify-turn", "nudge-turn", "find-ticket", "promote-epic", "spin-off"]),
+  kind: z.enum(["done-check", "verify-turn", "nudge-turn", "find-ticket", "promote-epic"]),
   payload: z.unknown().optional(),
   queuedAt: z.string(),
 });

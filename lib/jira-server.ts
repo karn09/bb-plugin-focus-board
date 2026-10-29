@@ -16,7 +16,7 @@ import { createIdleWaiters, sendIfIdle, type JobKind } from "./jira-idle";
 import { findTicketText, JIRA_AGENT_TOOLS, JIRA_LINK_TOOL, JIRA_SPAWN_TOOL, jiraConfigure, JiraLinkParams, promoteEpicText, SpawnChildParams, titleWithKey, trackedRegisterTool } from "./jira-agent";
 import { jiraBrowseUrl } from "./jira-keys";
 import { fixQueued, livePrs, prUrl } from "./jira-drift";
-import { capReasons, doneSummary, evaluateMechanical, JIRA_VERDICT_TOOL, spinOffText, ticketUpdate, verifyTurnText } from "./jira-done-check";
+import { capReasons, DONE_SUMMARY_PREFIX, doneSummary, evaluateMechanical, JIRA_VERDICT_TOOL, spinOffText, ticketUpdate, verifyTurnText } from "./jira-done-check";
 import { applyReconcile, externalJiraKey, planReconcile, StoredReconcilePlan, threadPrsOf, type ReconThread } from "./jira-reconcile";
 import { DriftItem, JiraTicket, OpResult, QueueOp, ThreadJiraRecord } from "./jira-schema";
 import { jiraSettings } from "./jira-settings";
@@ -54,6 +54,8 @@ const ENABLED_SEEN_KEY = "jira:enabled-seen";
 /** `${threadId} ${key}` suggestions the operator dismissed; never re-suggested. */
 // ponytail: grows by one entry per dismissal, never pruned; prune archived threads if it ever matters.
 const DISMISSED_KEY = "jira:dismissed-suggestions";
+/** threadId → verifying.startedAt of the check whose verify turn was sent (the verdict tool's gate). */
+const VERIFY_SENT_KEY = "jira:verify-sent";
 export const JIRA_RECONCILE_CHANGED = "jira-reconcile-changed";
 export const JIRA_CHANGED = "jira-changed";
 
@@ -90,6 +92,8 @@ export const jiraRpcContract = defineRpcContract({
       threadId: z.string(),
       /** spin-off / not-needed: which doneCheck reason. */
       index: z.number().int().min(0).optional(),
+      /** The reason text the card showed at that index; refused if it changed. */
+      reason: z.string().optional(),
     }),
     output: z.object({ ok: z.boolean(), error: z.string().optional() }),
   },
@@ -154,12 +158,29 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   // so every registered tool is selected, Jira's only while enabled.
   const toolNames = deps.agentTools ?? [];
   const registerTool = trackedRegisterTool(bb.agents, toolNames);
+  // configure is synchronous: the verify-sent markers live in memory, mirrored
+  // to KV so a restart keeps them (none offered until the load lands).
+  const verifySent = new Map<string, string>();
+  const sentLoaded = bb.storage.kv.get(VERIFY_SENT_KEY).then((raw) => {
+    if (raw && typeof raw === "object") for (const [k, v] of Object.entries(raw)) if (typeof v === "string" && !verifySent.has(k)) verifySent.set(k, v);
+  });
+  let sentChain: Promise<unknown> = Promise.resolve();
+  const setSent = (threadId: string, startedAt: string | null) => {
+    if (startedAt === null) verifySent.delete(threadId);
+    else verifySent.set(threadId, startedAt);
+    const run = sentChain.then(() => bb.storage.kv.set(VERIFY_SENT_KEY, Object.fromEntries(verifySent)));
+    sentChain = run.catch(() => undefined);
+    return run;
+  };
+  /** The verify turn of this thread's running check was sent: only then is a verdict taken. */
+  const awaitingVerdict = (threadId: string, rec: ThreadJiraRecord | undefined) => rec?.verifying != null && verifySent.get(threadId) === rec.verifying.startedAt;
   bb.agents.configure((context) => {
     const j = jiraConfigure(cfg.enabled, cfg, context.pluginMetadata as Record<string, unknown>);
     const others = toolNames.filter((n) => !JIRA_AGENT_TOOLS.includes(n) && n !== JIRA_VERDICT_TOOL);
-    // The verdict tool only while a Done check is running on this thread.
-    const verifying = cfg.enabled && ThreadJiraRecord.safeParse((context.pluginMetadata as Record<string, unknown>).jira).data?.verifying != null;
-    const tools = [...others, ...j.tools, ...(verifying ? [JIRA_VERDICT_TOOL] : [])];
+    // The verdict tool only once this thread's check sent its verify turn.
+    const rec = ThreadJiraRecord.safeParse((context.pluginMetadata as Record<string, unknown>).jira).data;
+    const offer = cfg.enabled && awaitingVerdict(context.thread.id, rec);
+    const tools = [...others, ...j.tools, ...(offer ? [JIRA_VERDICT_TOOL] : [])];
     return { tools, skills: [], ...(j.instructions ? { instructions: j.instructions } : {}) };
   });
 
@@ -517,14 +538,18 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
 
   const failCheck = async (threadId: string, reasons: string[]) => {
     await store.updateThread(threadId, () => ({ verifying: null, doneCheck: { at: isoNow(), verdict: "fail", reasons }, reason: reasons.join("; ") }));
+    await setSent(threadId, null);
     notDone(threadId);
   };
 
   // Comment (and maybe transition) on every linked ticket, once: a second
-  // Done while the first's ops are un-acked queues nothing.
+  // Done while the first's Done ops are un-acked queues nothing.
   const queueTicketUpdate = (threadId: string, skipped: boolean) =>
     onceQueued(
-      (ops) => ops.some((o) => o.threadId === threadId && (o.op === "comment" || (o.op === "transition" && o.toCategory === "done"))),
+      (ops) =>
+        ops.some(
+          (o) => o.threadId === threadId && ((o.op === "comment" && o.body.startsWith(DONE_SUMMARY_PREFIX)) || (o.op === "transition" && o.toCategory === "done")),
+        ),
       async () => {
         const rec = await store.readThread(threadId);
         if (rec.links.length === 0) return { ok: true };
@@ -551,23 +576,30 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       },
     );
 
-  /** The final Done: stamp, record the verdict, queue the ticket update. */
+  /** The final Done: stamp, queue the ticket update, then record the verdict
+   *  (a crash before the last write leaves `verifying`, so the resumed check re-queues; onceQueued dedupes). */
   const finishDone = async (threadId: string, skipped: boolean) => {
     await markDone(threadId);
+    await queueTicketUpdate(threadId, skipped);
     await store.updateThread(threadId, () => ({
       verifying: null,
       reason: null,
       doneCheck: { at: isoNow(), verdict: "pass", reasons: [], ...(skipped ? { skipped: true as const } : {}) },
     }));
-    await queueTicketUpdate(threadId, skipped);
+    await setSent(threadId, null);
   };
 
-  // A send that throws keeps `verifying` and retries on the next idle (not at once: no loop).
+  // The marker is set before sending, since the new turn's configure must offer
+  // the tool, and cleared when nothing was sent. A send that throws keeps
+  // `verifying` and retries on the next idle (not at once: no loop).
   const verifyTurn = async (threadId: string) => {
-    if (!(await enabled()) || !(await store.readThread(threadId)).verifying) return;
+    const rec = await store.readThread(threadId);
+    if (!(await enabled()) || !rec.verifying || awaitingVerdict(threadId, rec)) return;
+    await setSent(threadId, rec.verifying.startedAt);
     try {
-      await turnOrWait(threadId, "verify-turn", verifyTurnText());
+      if ((await turnOrWait(threadId, "verify-turn", verifyTurnText())) !== "sent") await setSent(threadId, null);
     } catch (e) {
+      await setSent(threadId, null);
       bb.log.warn(`jira: verify turn on ${threadId} not sent, retrying on next idle: ${(e as Error).message}`);
       await idle.waitFor(threadId, "verify-turn", undefined, { nextIdle: true });
     }
@@ -581,11 +613,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     if (m.verdict === "needs-agent") return verifyTurn(threadId);
     return failCheck(threadId, m.reasons);
   };
-  void idle.register("done-check", runCheck);
-  void idle.register("verify-turn", verifyTurn);
-  void idle.register("spin-off", async (threadId, payload) => {
-    if (typeof payload === "string" && (await enabled())) await turnOrWait(threadId, "spin-off", spinOffText(payload), payload);
-  });
+  const registered = Promise.all([idle.register("done-check", runCheck), idle.register("verify-turn", verifyTurn)]);
 
   /** done=true while on. An already-Done thread re-stamps as upstream (never checked). */
   const startDoneCheck = async (threadId: string): Promise<"done" | "checking"> => {
@@ -599,39 +627,88 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   };
 
   // Jobs are taken before their handler runs, so a restart mid-check can
-  // leave `verifying` with no job: re-queue those.
+  // leave `verifying` with no job: re-queue those. After the register sweeps
+  // (they run queued jobs), and never for a check whose verify turn was sent.
   const resumeChecks = async () => {
+    await registered;
+    await sentLoaded;
     if (!(await enabled())) return;
     for (const { id } of await deps.liveLinks()) {
-      if ((await store.readThread(id)).verifying && !(await idle.queued(id, ["done-check", "verify-turn"]))) await idle.waitFor(id, "done-check");
+      const rec = await store.readThread(id);
+      if (!rec.verifying || awaitingVerdict(id, rec) || (await idle.queued(id, ["done-check", "verify-turn"]))) continue;
+      await idle.waitFor(id, "done-check");
     }
   };
   resumeChecks().catch((e) => bb.log.warn(`jira: resuming Done checks failed: ${(e as Error).message}`));
 
+  // Done card actions run one at a time per thread: a double click sees the first's write.
+  const threadChains = new Map<string, Promise<unknown>>();
+  const perThread = <T>(threadId: string, task: () => Promise<T>): Promise<T> => {
+    const run = (threadChains.get(threadId) ?? Promise.resolve()).then(task);
+    const tail = run.catch(() => undefined);
+    threadChains.set(threadId, tail);
+    void tail.then(() => threadChains.get(threadId) === tail && threadChains.delete(threadId));
+    return run;
+  };
+
   const confirmDone = async (threadId: string, skip: boolean): Promise<{ ok: boolean; error?: string }> => {
-    if (!skip && (await store.readThread(threadId)).doneCheck?.verdict !== "pending-confirm") return { ok: false, error: "nothing to confirm" };
+    const rec = await store.readThread(threadId);
+    if (rec.doneCheck?.verdict === "pass" && (await isDone(threadId))) return { ok: false, error: "already done" };
+    if (!skip && rec.doneCheck?.verdict !== "pending-confirm") return { ok: false, error: "nothing to confirm" };
     await finishDone(threadId, skip);
     return { ok: true };
   };
 
-  /** Drop one fail reason; none left means the operator can confirm. */
-  const dropReason = (threadId: string, index: number) =>
+  /** Drop one fail reason by value; none left means the operator can confirm. */
+  const dropReason = (threadId: string, reason: string) =>
     store.updateThread(threadId, (cur) => {
-      const left = (cur.doneCheck?.reasons ?? []).filter((_, i) => i !== index);
+      const all = cur.doneCheck?.reasons ?? [];
+      const at = all.indexOf(reason);
+      if (at === -1) return {};
+      const left = all.filter((_, i) => i !== at);
       if (left.length === 0) return { reason: null, doneCheck: { at: isoNow(), verdict: "pending-confirm", reasons: [] } };
       return { reason: left.join("; "), doneCheck: { ...cur.doneCheck!, reasons: left } };
+    });
+
+  /** Card actions on a running or failed check (serialized per thread). */
+  const doneAction = (kind: "confirm-done" | "skip-done" | "keep-working" | "not-needed" | "spin-off", threadId: string, index?: number, expected?: string) =>
+    perThread(threadId, async (): Promise<{ ok: boolean; error?: string }> => {
+      if (kind === "confirm-done" || kind === "skip-done") return confirmDone(threadId, kind === "skip-done");
+      if (kind === "keep-working") {
+        await store.writeThread(threadId, { verifying: null, reason: null, doneCheck: null });
+        await setSent(threadId, null);
+        notDone(threadId);
+        return { ok: true };
+      }
+      const reason = index === undefined ? undefined : (await store.readThread(threadId)).doneCheck?.reasons[index];
+      if (reason === undefined || (expected !== undefined && expected !== reason)) return { ok: false, error: "no such reason" };
+      if (kind === "spin-off") {
+        // Sent now or refused: a queued spin-off could be overwritten by the next one.
+        try {
+          const r = await sendIfIdle(bb.sdk.threads as never, threadId, spinOffText(reason), { log: (m) => bb.log.warn(m) });
+          if (r === "busy") return { ok: false, error: "thread is busy — try after this turn" };
+          if (r === "gone") return { ok: false, error: "thread gone" };
+        } catch (e) {
+          return { ok: false, error: `not sent: ${(e as Error).message}` };
+        }
+      }
+      await dropReason(threadId, reason);
+      return { ok: true };
     });
 
   registerTool({
     name: JIRA_VERDICT_TOOL,
     description:
-      "Report the Done check for this thread: verdict \"pass\" when the work it set out to do is finished, \"fail\" with what is left in remaining. Offered only while a Done check runs.",
+      "Report the Done check for this thread: verdict \"pass\" when the work it set out to do is finished, \"fail\" with what is left in remaining. Offered only after a Done check asked for it.",
     parameters: z.object({ verdict: z.enum(["pass", "fail"]), remaining: z.array(z.string()) }),
     execute: async ({ verdict, remaining }, ctx) => {
       if (!(await enabled())) return toolText(TOOL_OFF, true);
-      if (!(await store.readThread(ctx.threadId)).verifying) return toolText("No Done check is running on this thread; nothing was written.", true);
+      if (!awaitingVerdict(ctx.threadId, await store.readThread(ctx.threadId))) {
+        return toolText("No Done check is waiting on a verdict from this thread; nothing was written.", true);
+      }
       if (verdict === "pass") {
         await store.updateThread(ctx.threadId, () => ({ verifying: null, doneCheck: { at: isoNow(), verdict: "pending-confirm", reasons: [] } }));
+        await setSent(ctx.threadId, null);
         return toolText("Recorded. The operator confirms Done on the board; nothing else to do.");
       }
       const reasons = capReasons(remaining);
@@ -671,31 +748,15 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         pending: Object.fromEntries((await store.pendingOps()).map((o) => [o.id, o])),
       };
     },
-    jira_card_action: async ({ kind, threadId, index }) => {
+    jira_card_action: async ({ kind, threadId, index, reason }) => {
       if (!(await enabled())) return { ok: false, error: OFF };
       if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread" };
       if (kind === "clear-check-in") {
         await store.writeThread(threadId, { checkInWith: null });
         return { ok: true };
       }
-      if (kind === "confirm-done" || kind === "skip-done") return confirmDone(threadId, kind === "skip-done");
-      if (kind === "keep-working") {
-        await store.writeThread(threadId, { verifying: null, reason: null, doneCheck: null });
-        notDone(threadId);
-        return { ok: true };
-      }
-      if (kind === "not-needed" || kind === "spin-off") {
-        const reason = index === undefined ? undefined : (await store.readThread(threadId)).doneCheck?.reasons[index];
-        if (reason === undefined) return { ok: false, error: "no such reason" };
-        if (kind === "spin-off") {
-          try {
-            if ((await turnOrWait(threadId, "spin-off", spinOffText(reason), reason)) === "gone") return { ok: false, error: "thread gone" };
-          } catch (e) {
-            return { ok: false, error: `not sent: ${(e as Error).message}` };
-          }
-        }
-        await dropReason(threadId, index!);
-        return { ok: true };
+      if (kind === "confirm-done" || kind === "skip-done" || kind === "keep-working" || kind === "not-needed" || kind === "spin-off") {
+        return doneAction(kind, threadId, index, reason);
       }
       try {
         if (kind === "find-ticket") {
@@ -717,7 +778,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     jira_done_confirm: async ({ threadId, skip }) => {
       if (!(await enabled())) return { ok: false, error: OFF };
       if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread" };
-      return confirmDone(threadId, skip === true);
+      return doneAction(skip === true ? "skip-done" : "confirm-done", threadId);
     },
     jira_column_action: async ({ action, key, threadId, kind, confirm }) => {
       if (!(await enabled())) return { ok: false, error: OFF };

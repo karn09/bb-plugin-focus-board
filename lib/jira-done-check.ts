@@ -33,17 +33,19 @@ export function ticketUpdate(input: { ticket: JiraTicket; linkedThreadsDone: boo
 }
 
 const MAX_SUMMARY = 4000;
+/** Every Done comment starts with this (the ticket-update dedupe keys on it). */
+export const DONE_SUMMARY_PREFIX = "Focus Board: thread ";
 
 /** The ticket comment: plain text, under 4,000 chars. */
 export function doneSummary(input: { title: string; prUrls: string[]; childKeys: string[]; skipped: boolean }): string {
   const lines = [
-    `Focus Board: thread "${input.title}" is Done.`,
+    `${DONE_SUMMARY_PREFIX}"${input.title}" is Done.`,
     ...(input.skipped ? ["The operator marked it done without the Done check."] : []),
     ...(input.prUrls.length > 0 ? ["Pull requests:", ...input.prUrls.map((u) => `- ${u}`)] : []),
     ...(input.childKeys.length > 0 ? [`Child tickets: ${input.childKeys.join(", ")}`] : []),
   ];
   const s = lines.join("\n");
-  return s.length > MAX_SUMMARY ? `${s.slice(0, MAX_SUMMARY - 1)}…` : s;
+  return s.length >= MAX_SUMMARY ? `${s.slice(0, MAX_SUMMARY - 2)}…` : s;
 }
 
 /** Agent `remaining` strings are untrusted: at most 10, each at most 200 chars. */

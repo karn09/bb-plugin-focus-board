@@ -72,11 +72,11 @@ describe("JiraCardBadges", () => {
     expect(document.querySelector("b")).toBeNull();
     expect(screen.queryByText(reasons.join("; "))).toBeNull(); // the checklist replaces the reason line
     fireEvent.click(screen.getAllByText("Spin off")[1]!);
-    expect(onAction).toHaveBeenCalledWith("spin-off", "t1", 1);
+    expect(onAction).toHaveBeenCalledWith("spin-off", "t1", 1, "<b>x</b>");
     fireEvent.click(screen.getAllByText("Not needed")[0]!);
-    expect(onAction).toHaveBeenCalledWith("not-needed", "t1", 0);
+    expect(onAction).toHaveBeenCalledWith("not-needed", "t1", 0, "PR #7 still open");
     fireEvent.click(screen.getAllByText("Keep working")[0]!);
-    expect(onAction).toHaveBeenCalledWith("keep-working", "t1", 0);
+    expect(onAction).toHaveBeenCalledWith("keep-working", "t1");
     fireEvent.click(screen.getByText("Mark done anyway"));
     expect(onAction).toHaveBeenCalledWith("skip-done", "t1");
   });
@@ -91,5 +91,14 @@ describe("JiraCardBadges", () => {
     render(<JiraCardBadges {...props} record={rec({ doneCheck: { at: "x", verdict: "pass", reasons: [] } })} />);
     expect(screen.queryByText("Confirm done")).toBeNull();
     expect(screen.queryByText("Mark done anyway")).toBeNull();
+  });
+  it.each([
+    ["verifying", { verifying: { startedAt: "x" } }],
+    ["pending confirm", { doneCheck: { at: "x", verdict: "pending-confirm", reasons: [] } }],
+  ])("%s: a Keep working button", (_, over) => {
+    const onAction = vi.fn();
+    render(<JiraCardBadges {...props} onAction={onAction} record={rec(over)} />);
+    fireEvent.click(screen.getByText("Keep working"));
+    expect(onAction).toHaveBeenCalledWith("keep-working", "t1");
   });
 });

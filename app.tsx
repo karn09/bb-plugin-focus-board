@@ -570,8 +570,8 @@ function BoardPage({ subPath }: { subPath: string }) {
       ticketByKey: jiraState.tickets,
       threads: jiraState.threads,
       pendingOps: jiraState.pending,
-      onAction: (kind, threadId, index) => {
-        jiraRpc.call("jira_card_action", { kind, threadId, ...(index === undefined ? {} : { index }) }).then(refetchJira, () => {});
+      onAction: (kind, threadId, index, reason) => {
+        jiraRpc.call("jira_card_action", { kind, threadId, ...(index === undefined ? {} : { index, reason }) }).then(refetchJira, () => {});
       },
     }),
     [jiraState, jiraRpc, refetchJira],
