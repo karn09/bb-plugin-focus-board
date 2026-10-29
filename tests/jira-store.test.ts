@@ -5,14 +5,18 @@ import type { JiraSnapshot } from "../lib/jira-schema";
 const MIN = 60_000;
 const T0 = Date.parse("2026-10-29T12:00:00Z");
 
-function setup(opts?: { refreshMinutes?: () => number }) {
+function setup(opts?: { refreshMinutes?: () => number }, failSetAfter = Infinity) {
   const kv = new Map<string, unknown>();
+  let sets = 0;
   const meta = new Map<string, Record<string, unknown>>();
   let t = T0;
   const store = createJiraStore(
     {
       get: async (k: string) => kv.get(k),
-      set: async (k: string, v: unknown) => void kv.set(k, v),
+      set: async (k: string, v: unknown) => {
+        if (++sets > failSetAfter) throw new Error("boom");
+        kv.set(k, v);
+      },
     },
     {
       getPluginMetadata: async ({ threadId }) => meta.get(threadId) ?? {},
@@ -23,7 +27,7 @@ function setup(opts?: { refreshMinutes?: () => number }) {
     () => t,
     opts,
   );
-  return { store, meta, advance: (ms: number) => void (t += ms) };
+  return { store, kv, meta, advance: (ms: number) => void (t += ms) };
 }
 
 const snap = (over: Partial<JiraSnapshot> = {}): JiraSnapshot => ({
@@ -106,6 +110,45 @@ describe("queue", () => {
   });
 });
 
+describe("ack hardening", () => {
+  const res = (id: string) => ({ id, ok: true, error: null, createdKey: null });
+  it("duplicate id in a batch records one result", async () => {
+    const { store, kv } = setup();
+    const a = await store.enqueue(comment("PT-1"));
+    await store.ack([res(a.id), res(a.id)]);
+    expect((kv.get("jira:results") as unknown[]).length).toBe(1);
+  });
+  it("results persist before queue removal", async () => {
+    // sets: 1 enqueue, 2 results, 3 queue (fails)
+    const { store, kv } = setup(undefined, 2);
+    const a = await store.enqueue(comment("PT-1"));
+    await expect(store.ack([res(a.id)])).rejects.toThrow("boom");
+    expect((await store.pendingOps()).map((o) => o.id)).toEqual([a.id]);
+    expect((await store.lastResult(a.id))?.ok).toBe(true);
+    expect(kv.has("jira:results")).toBe(true);
+  });
+  it("invalid raw queue entries survive enqueue+ack and are logged", async () => {
+    const { store, kv } = setup();
+    kv.set("jira:queue", [{ junk: true }]);
+    const a = await store.enqueue(comment("PT-1"));
+    await store.ack([res(a.id)]);
+    expect(kv.get("jira:queue")).toEqual([{ junk: true }]);
+    expect(await store.pendingOps()).toEqual([]);
+  });
+  it("logs skipped invalid entries", async () => {
+    const msgs: string[] = [];
+    const kv = new Map<string, unknown>([["jira:queue", [{ junk: 1 }]]]);
+    const s = createJiraStore(
+      { get: async (k) => kv.get(k), set: async (k, v) => void kv.set(k, v) },
+      { getPluginMetadata: async () => ({}), updatePluginMetadata: async () => {} },
+      () => T0,
+      { log: (m) => msgs.push(m) },
+    );
+    await s.pendingOps();
+    expect(msgs.length).toBe(1);
+  });
+});
+
 describe("thread record", () => {
   it("absent or invalid gives the empty record", async () => {
     const { store, meta } = setup();
@@ -131,5 +174,11 @@ describe("thread record", () => {
     expect(r.links.map((l) => l.key)).toEqual(["PT-1", "PT-2"]);
     expect(r.links[0]?.role).toBe("watching");
     expect(await store.readThread("t1")).toEqual(r);
+  });
+  it("undefined keeps, null clears", async () => {
+    const { store } = setup();
+    await store.writeThread("t1", { reason: "keep" });
+    expect((await store.writeThread("t1", { reason: undefined })).reason).toBe("keep");
+    expect((await store.writeThread("t1", { reason: null })).reason).toBeNull();
   });
 });

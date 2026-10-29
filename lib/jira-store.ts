@@ -48,7 +48,7 @@ export function createJiraStore(
   kv: KvLike,
   threads: MetadataLike,
   now: () => number,
-  opts?: { refreshMinutes?: () => number },
+  opts?: { refreshMinutes?: () => number; log?: (msg: string) => void },
 ) {
   // One in-process chain serializes every read-modify-write (rows and
   // thread records alike), like the board's withKvWriteLock.
@@ -59,14 +59,18 @@ export function createJiraStore(
     return run;
   };
 
-  const readQueue = async (): Promise<QueueOp[]> => {
+  const log = opts?.log ?? (() => {});
+  // Raw stored entries; unparseable ones are kept untouched in storage.
+  const rawQueue = async (): Promise<unknown[]> => {
     const raw = await kv.get(QUEUE_KEY);
-    if (!Array.isArray(raw)) return [];
-    return raw.flatMap((x) => {
+    return Array.isArray(raw) ? raw : [];
+  };
+  const readQueue = async (): Promise<QueueOp[]> =>
+    (await rawQueue()).flatMap((x) => {
       const p = QueueOp.safeParse(x);
+      if (!p.success) log(`jira queue: skipping invalid entry: ${p.error.message}`);
       return p.success ? [p.data] : [];
     });
-  };
   const readResults = async (): Promise<OpResult[]> => {
     const raw = await kv.get(RESULTS_KEY);
     if (!Array.isArray(raw)) return [];
@@ -118,7 +122,7 @@ export function createJiraStore(
     enqueue(op: Omit<QueueOp, "id" | "createdAt">): Promise<QueueOp> {
       return locked(async () => {
         const full = { ...op, id: crypto.randomUUID(), createdAt: new Date(now()).toISOString() } as QueueOp;
-        await kv.set(QUEUE_KEY, [...(await readQueue()), full]);
+        await kv.set(QUEUE_KEY, [...(await rawQueue()), full]);
         return full;
       });
     },
@@ -130,12 +134,20 @@ export function createJiraStore(
       return locked(async () => {
         const queue = await readQueue();
         const known = new Set(queue.map((o) => o.id));
-        // Unknown ids (replayed ack) are ignored.
-        const hits = results.filter((r) => known.has(r.id));
+        // Unknown ids (replayed ack) are ignored; duplicate ids in a batch count once.
+        const hits = [...new Map(results.filter((r) => known.has(r.id)).map((r) => [r.id, r])).values()];
         if (hits.length === 0) return;
         const done = new Set(hits.map((r) => r.id));
-        await kv.set(QUEUE_KEY, queue.filter((o) => !done.has(o.id)));
+        // Results first: a crash between the writes leaves the op queued AND recorded.
         await kv.set(RESULTS_KEY, [...(await readResults()), ...hits].slice(-MAX_RESULTS));
+        const raw = await rawQueue();
+        await kv.set(
+          QUEUE_KEY,
+          raw.filter((x) => {
+            const p = QueueOp.safeParse(x);
+            return !(p.success && done.has(p.data.id));
+          }),
+        );
       });
     },
 
@@ -150,7 +162,7 @@ export function createJiraStore(
         const cur = await readThread(threadId);
         const next: ThreadJiraRecord = {
           ...cur,
-          ...patch,
+          ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)),
           links: dedupeLinks([...cur.links, ...(patch.links ?? [])]),
         };
         await threads.updatePluginMetadata({ threadId, set: { [THREAD_JIRA_KEY]: next } });
