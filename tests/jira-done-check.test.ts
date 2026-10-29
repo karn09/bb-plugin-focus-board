@@ -277,9 +277,7 @@ describe("Done check flow", () => {
     expect(r.isError).toBeFalsy();
     expect(jiraOf("t1")).toMatchObject({ verifying: null, doneCheck: { verdict: "pending-confirm" } });
     expect(doneOf("t1")).toBeUndefined();
-    // Not verifying any more: the tool is not offered and is rejected.
-    const after = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ pluginMetadata: metadata.get("t1"), thread: T1 } as never));
-    expect(after.tools.map((t) => t.name)).not.toContain("focus_board_done_verdict");
+    // Not verifying any more: the tool stays selected (always while on) but is rejected.
     expect((await verdict({ verdict: "fail", remaining: ["x"] })).isError).toBe(true);
     expect(jiraOf("t1")?.doneCheck.verdict).toBe("pending-confirm");
     await Promise.all([card("confirm-done"), card("confirm-done")]);
@@ -410,14 +408,12 @@ describe("Done check flow", () => {
     expect((await verdict({ verdict: "pass", remaining: [] })).isError).toBeFalsy();
   });
 
-  it("the verdict before the mechanical check ran: not offered, isError, no write", async () => {
+  it("the verdict before the mechanical check ran: isError, no write", async () => {
     seed("t1");
     status.set("t1", "active");
     await load({ snapshot: snap({ prs: [pr(8, "open")] }) });
     await doneSet("t1");
     const before = JSON.stringify(jiraOf("t1"));
-    const c = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ pluginMetadata: metadata.get("t1"), thread: T1 } as never));
-    expect(c.tools.map((t) => t.name)).not.toContain("focus_board_done_verdict");
     expect((await verdict({ verdict: "pass", remaining: [] })).isError).toBe(true);
     expect(JSON.stringify(jiraOf("t1"))).toBe(before);
     await idle("t1");
@@ -582,4 +578,106 @@ describe("Done check flow", () => {
     expect(await bb.storage.kv.get("jira:verify-sent")).toEqual({ t1: "s1" });
     expect((await verdict({ verdict: "pass", remaining: [] })).isError).toBeFalsy();
   });
+  // ---- final review fix wave ----
+
+  it("dragging out of Done during a held check: no Done stamp, no ops, the check is cleared", async () => {
+    seed("t1");
+    await load({ snapshot: snap({ prs: [pr(1, "merged")] }) });
+    let release!: () => void;
+    listGate = new Promise((r) => (release = r));
+    const drop = doneSet("t1");
+    await vi.waitFor(() => expect(listGate).toBeNull()); // the check is held inside its read
+    expect(await doneSet("t1", false)).toEqual({ done: false });
+    expect(jiraOf("t1")).toMatchObject({ verifying: null, doneCheck: null, reason: null });
+    release();
+    await drop;
+    await flush();
+    expect(doneOf("t1")).toBeUndefined();
+    expect(await ops()).toEqual([]);
+  });
+
+  it("done clear from the CLI also stops a running check (verify marker gone)", async () => {
+    seed("t1");
+    rows.get("t1")!.branch = null;
+    await load();
+    await doneSet("t1"); // verify turn sent
+    expect(await bb.storage.kv.get("jira:verify-sent")).toHaveProperty("t1");
+    const r = await harness.behavior.runCli(["done", "clear", "t1"]);
+    expect(r.exitCode).toBe(0);
+    expect(jiraOf("t1")).toMatchObject({ verifying: null, doneCheck: null });
+    expect(await bb.storage.kv.get("jira:verify-sent")).not.toHaveProperty("t1");
+    expect((await verdict({ verdict: "pass", remaining: [] })).isError).toBe(true);
+  });
+
+  it("the verdict tool is selected whenever Jira is on (the handler gates it)", async () => {
+    seed("t1");
+    await load();
+    const c = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ pluginMetadata: metadata.get("t1"), thread: T1 } as never));
+    expect(c.tools.map((t) => t.name)).toContain("focus_board_done_verdict");
+    expect((await verdict({ verdict: "pass", remaining: [] })).isError).toBe(true);
+  });
+
+  it("the verify turn ends with no verdict: the check fails with the no-verdict reason", async () => {
+    seed("t1");
+    rows.get("t1")!.branch = null;
+    await load();
+    await doneSet("t1");
+    expect(send).toHaveBeenCalledTimes(1);
+    status.set("t1", "active");
+    await harness.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "t1" }) });
+    await flush();
+    await idle("t1");
+    expect(jiraOf("t1")).toMatchObject({
+      verifying: null,
+      reason: "no verdict from the agent — use Keep working or Mark done anyway",
+      doneCheck: { verdict: "fail", reasons: ["no verdict from the agent — use Keep working or Mark done anyway"] },
+    });
+    expect(doneOf("t1")).toBeUndefined();
+    expect(await bb.storage.kv.get("jira:verify-sent")).not.toHaveProperty("t1");
+  });
+
+  it("an idle before the verify turn ran (no thread.active yet) does not fail the check", async () => {
+    seed("t1");
+    rows.get("t1")!.branch = null;
+    await load();
+    await doneSet("t1");
+    await idle("t1");
+    expect(jiraOf("t1")?.verifying).not.toBeNull();
+    expect((await verdict({ verdict: "pass", remaining: [] })).isError).toBeFalsy();
+  });
+
+  it("a verify turn that answered with a verdict is untouched by its idle", async () => {
+    seed("t1");
+    rows.get("t1")!.branch = null;
+    await load();
+    await doneSet("t1");
+    await harness.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "t1" }) });
+    await flush();
+    await verdict({ verdict: "pass", remaining: [] });
+    await idle("t1");
+    expect(jiraOf("t1")?.doneCheck).toMatchObject({ verdict: "pending-confirm" });
+  });
+
+  it("an ok snapshot with a partial gh error: the thread's present PRs still pass", async () => {
+    seed("t1");
+    await load({ snapshot: { ...snap({ prs: [pr(1, "merged")] }), error: "gh: 1 of 2 PRs unreadable (gh pr failed: 404)" } });
+    await doneSet("t1");
+    expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
+  });
+
+  it("link_clear removes the cleared Jira key from the record: no ticket update, configure no longer names it", async () => {
+    seed("t1");
+    metadata.get("t1")!.linkedIssues = [
+      { tracker: "external", url: "https://x.atlassian.net/browse/PT-1", hostname: "x.atlassian.net", createdAt: "2026-10-29T00:00:00Z", source: "auto", jira: { key: "PT-1" } },
+    ];
+    await load({ snapshot: snap({ prs: [pr(1, "merged")] }) });
+    await harness.behavior.callRpc("link_clear", { threadId: "t1" });
+    expect(jiraOf("t1")?.links).toEqual([]);
+    const c = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ pluginMetadata: metadata.get("t1"), thread: T1 } as never));
+    expect(c.instructions).not.toContain("PT-1");
+    await doneSet("t1");
+    expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
+    expect((await ops()).filter((o) => o.key === "PT-1")).toEqual([]);
+  });
 });
+

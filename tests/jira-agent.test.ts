@@ -87,6 +87,13 @@ describe("jira agent side", () => {
     expect(c.tools.map((t) => t.name)).toEqual(expect.arrayContaining(["focus_board_link_issue", "focus_board_group_set", "focus_board_jira_link", "focus_board_spawn_child"]));
   });
 
+  it("configure, side-chat fork: no find-ticket instructions (the tools stay)", async () => {
+    await load({ jiraEnabled: true });
+    const c = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ pluginMetadata: {}, origin: { kind: "fork", pluginId: "side-chat" } } as never));
+    expect(c.instructions ?? "").not.toContain("before creating a branch");
+    expect(c.tools.map((t) => t.name)).toContain("focus_board_jira_link");
+  });
+
   it("configure, linked thread: the quoted key and the spawn rule", async () => {
     await load({ jiraEnabled: true });
     const c = await configure({ jira: rec({ links: [{ key: "PT-9", role: "owner", source: "agent" }] }) });
@@ -102,7 +109,7 @@ describe("jira agent side", () => {
     expect(c.instructions).toBeNull();
   });
 
-  it("configure selects every registered tool; the Jira ones only while on (the verdict tool only once a verify turn was sent)", async () => {
+  it("configure selects every registered tool; the Jira ones (the verdict tool too) only while on", async () => {
     await load({ jiraEnabled: false });
     const jiraTools = ["focus_board_jira_link", "focus_board_spawn_child", "focus_board_done_verdict"];
     const all = harness.inspection.registrations.agentTools.map((t) => t.name).sort();
@@ -112,9 +119,9 @@ describe("jira agent side", () => {
     expect(await names({ jira: rec({ verifying: { startedAt: "x" } }) })).toEqual(all.filter((n) => !jiraTools.includes(n)));
     await harness.behavior.setSettings({ jiraEnabled: true });
     await flush();
-    expect(await names()).toEqual(all.filter((n) => n !== "focus_board_done_verdict"));
-    // verifying alone is not enough: the verify turn must have been sent (tests/jira-done-check.test.ts).
-    expect(await names({ jira: rec({ verifying: { startedAt: "x" } }) })).toEqual(all.filter((n) => n !== "focus_board_done_verdict"));
+    // The verdict tool whenever on: its handler refuses unless a verify turn was sent (tests/jira-done-check.test.ts).
+    expect(await names()).toEqual(all);
+    expect(await names({ jira: rec({ verifying: { startedAt: "x" } }) })).toEqual(all);
   });
 
   // registerJira alone, its settings reads held open so the test orders them.

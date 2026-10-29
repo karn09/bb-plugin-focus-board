@@ -194,12 +194,11 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   /** The verify turn of this thread's running check was sent: only then is a verdict taken. */
   const awaitingVerdict = (threadId: string, rec: ThreadJiraRecord | undefined) => rec?.verifying != null && verifySent.get(threadId) === rec.verifying.startedAt;
   bb.agents.configure((context) => {
-    const j = jiraConfigure(cfg.enabled, cfg, context.pluginMetadata as Record<string, unknown>);
+    const j = jiraConfigure(cfg.enabled, cfg, context.pluginMetadata as Record<string, unknown>, context.origin?.kind === "fork");
     const others = toolNames.filter((n) => !JIRA_AGENT_TOOLS.includes(n) && n !== JIRA_VERDICT_TOOL);
-    // The verdict tool only once this thread's check sent its verify turn.
-    const rec = ThreadJiraRecord.safeParse((context.pluginMetadata as Record<string, unknown>).jira).data;
-    const offer = cfg.enabled && awaitingVerdict(context.thread.id, rec);
-    const tools = [...others, ...j.tools, ...(offer ? [JIRA_VERDICT_TOOL] : [])];
+    // The verdict tool whenever on: configure lands only at session start/resume, so a
+    // live session must already hold it; the handler refuses unless a verify turn was sent.
+    const tools = [...others, ...j.tools, ...(cfg.enabled ? [JIRA_VERDICT_TOOL] : [])];
     return { tools, skills: [], ...(j.instructions ? { instructions: j.instructions } : {}) };
   });
 
@@ -731,16 +730,46 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       return { reason: left.join("; "), doneCheck: { ...cur.doneCheck!, reasons: left } };
     });
 
+  /** Keep working's write (inside perThread): a running, pending or failed check ends with no stamp. False when none was open. */
+  const endCheck = async (threadId: string) => {
+    const rec = await store.readThread(threadId);
+    const open = rec.verifying != null || rec.doneCheck?.verdict === "pending-confirm" || rec.doneCheck?.verdict === "fail";
+    if (!open) return false;
+    await store.writeThread(threadId, { verifying: null, reason: null, doneCheck: null });
+    await setSent(threadId, null);
+    return true;
+  };
+
+  // A sent verify turn's run starts at its thread.active; the rest after it with no
+  // verdict ends the check (a rest seen before that active is an earlier turn's).
+  // ponytail: in memory, so a restart mid-turn leaves the card verifying until Keep working; persist if that bites.
+  const verifyRunning = new Map<string, string>();
+  const NO_VERDICT = "no verdict from the agent — use Keep working or Mark done anyway";
+  const onVerifyActive = (threadId: string) => {
+    const sent = verifySent.get(threadId);
+    if (sent !== undefined) verifyRunning.set(threadId, sent);
+  };
+  const onVerifyRest = async (threadId: string) => {
+    const startedAt = verifyRunning.get(threadId);
+    if (startedAt === undefined) return;
+    verifyRunning.delete(threadId);
+    if (!cfg.enabled) return;
+    await perThread(threadId, async () => {
+      const rec = await store.readThread(threadId);
+      if (rec.verifying?.startedAt === startedAt && awaitingVerdict(threadId, rec)) await failCheck(threadId, [NO_VERDICT]);
+    });
+  };
+  const logVerify = (e: unknown) => bb.log.warn(`jira: verify turn end failed: ${(e as Error).message}`);
+  bb.events.on("thread.active", ({ thread }) => onVerifyActive(thread.id));
+  bb.events.on("thread.idle", ({ thread }) => void onVerifyRest(thread.id).catch(logVerify));
+  bb.events.on("thread.failed", ({ thread }) => void onVerifyRest(thread.id).catch(logVerify));
+
   /** Card actions on a running or failed check (serialized per thread). */
   const doneAction = (kind: "confirm-done" | "skip-done" | "keep-working" | "not-needed" | "spin-off", threadId: string, index?: number, expected?: string) =>
     perThread(threadId, async (): Promise<{ ok: boolean; error?: string }> => {
       if (kind === "confirm-done" || kind === "skip-done") return confirmDone(threadId, kind === "skip-done");
       if (kind === "keep-working") {
-        const rec = await store.readThread(threadId);
-        const open = rec.verifying != null || rec.doneCheck?.verdict === "pending-confirm" || rec.doneCheck?.verdict === "fail";
-        if (!open) return { ok: false, error: "no Done check to stop" };
-        await store.writeThread(threadId, { verifying: null, reason: null, doneCheck: null });
-        await setSent(threadId, null);
+        if (!(await endCheck(threadId))) return { ok: false, error: "no Done check to stop" };
         notDone(threadId);
         return { ok: true };
       }
@@ -1082,6 +1111,15 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     /** Whether jiraEnabled is on (done_set / done mark route through the check only then). */
     enabled,
     startDoneCheck,
+    /** Leaving Done while on: Keep working's path (no stamp, no ops). */
+    stopDoneCheck: (threadId: string) => perThread(threadId, () => endCheck(threadId)).then(() => undefined),
+    /** Board links cleared (link_clear): their Jira keys leave the thread's record too. */
+    async unlinkCleared(threadId: string, before: ThreadLink[] | null, after: ThreadLink[] | null) {
+      const kept = new Set((after ?? []).flatMap((l) => (l.tracker === "external" && l.jira ? [l.jira.key] : [])));
+      const gone = (before ?? []).flatMap((l) => (l.tracker === "external" && l.jira && !kept.has(l.jira.key) ? [l.jira.key] : []));
+      if (gone.length === 0 || !(await store.readThread(threadId)).links.some((l) => gone.includes(l.key))) return;
+      await store.removeLinks(threadId, gone);
+    },
     dispose() {},
   };
 }

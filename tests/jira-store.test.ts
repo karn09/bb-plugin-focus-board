@@ -5,7 +5,7 @@ import type { JiraSnapshot } from "../lib/jira-schema";
 const MIN = 60_000;
 const T0 = Date.parse("2026-10-29T12:00:00Z");
 
-function setup(opts?: { refreshMinutes?: () => number | Promise<number> }, failSetAfter = Infinity) {
+function setup(opts?: { refreshMinutes?: () => number | Promise<number>; log?: (m: string) => void }, failSetAfter = Infinity) {
   const kv = new Map<string, unknown>();
   let sets = 0;
   const meta = new Map<string, Record<string, unknown>>();
@@ -194,6 +194,22 @@ describe("thread record", () => {
     const stamp = (at: string) => store.updateThread("t1", (cur) => ({ enrolledAt: cur.enrolledAt ?? at }));
     await Promise.all([stamp("2026-10-29T00:00:00Z"), stamp("2026-10-30T00:00:00Z")]);
     expect((await store.readThread("t1")).enrolledAt).toBe("2026-10-29T00:00:00Z");
+  });
+  it("an unparseable stored record is logged (once per thread on read, and on the overwrite)", async () => {
+    const msgs: string[] = [];
+    const { store, meta } = setup({ log: (m) => msgs.push(m) });
+    meta.set("t1", { jira: { links: "garbage" } });
+    await store.readThread("t1");
+    await store.readThread("t1");
+    expect(msgs.filter((m) => m.includes("t1") && m.includes("unparseable"))).toHaveLength(1);
+    await store.writeThread("t1", { reason: "r" });
+    expect(msgs.some((m) => m.includes("overwriting") && m.includes("t1"))).toBe(true);
+  });
+  it("removeLinks drops the given keys, keeps the rest", async () => {
+    const { store } = setup();
+    await store.writeThread("t1", { links: [{ key: "PT-1", role: "owner", source: "auto" }, { key: "PT-2", role: "watching", source: "agent" }] });
+    expect((await store.removeLinks("t1", ["PT-1"])).links.map((l) => l.key)).toEqual(["PT-2"]);
+    expect((await store.readThread("t1")).links.map((l) => l.key)).toEqual(["PT-2"]);
   });
   it("undefined keeps, null clears", async () => {
     const { store } = setup();

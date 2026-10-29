@@ -66,12 +66,12 @@ function linkedText(rec: ThreadJiraRecord): string {
   ].join("\n");
 }
 
-/** What configure contributes for one thread: nothing while Jira is off. */
-export function jiraConfigure(enabled: boolean, s: Projects, pluginMetadata: Record<string, unknown>): { tools: string[]; instructions?: string } {
+/** What configure contributes for one thread: nothing while Jira is off; a side-chat fork gets no find-ticket instructions. */
+export function jiraConfigure(enabled: boolean, s: Projects, pluginMetadata: Record<string, unknown>, fork = false): { tools: string[]; instructions?: string } {
   if (!enabled) return { tools: [] };
   const rec = ThreadJiraRecord.safeParse(pluginMetadata.jira);
-  const linked = rec.success && rec.data.links.length > 0;
-  return { tools: JIRA_AGENT_TOOLS, instructions: linked ? linkedText(rec.data) : findTicketText(s) };
+  if (rec.success && rec.data.links.length > 0) return { tools: JIRA_AGENT_TOOLS, instructions: linkedText(rec.data) };
+  return fork ? { tools: JIRA_AGENT_TOOLS } : { tools: JIRA_AGENT_TOOLS, instructions: findTicketText(s) };
 }
 
 export function promoteEpicText(key: string): string {

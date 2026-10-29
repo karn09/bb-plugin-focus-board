@@ -87,25 +87,37 @@ export function createJiraStore(
       return p.success ? [p.data] : [];
     });
   };
-  const readThread = async (threadId: string): Promise<ThreadJiraRecord> => {
+  const loggedBad = new Set<string>(); // one read log per thread, not one per pass
+  /** The record, and whether a stored value failed to parse (read as empty). */
+  const readStored = async (threadId: string): Promise<{ rec: ThreadJiraRecord; bad: boolean }> => {
     const ns = (await threads.getPluginMetadata({ threadId })) as Record<string, unknown> | null;
-    const p = ThreadJiraRecord.safeParse(ns?.[THREAD_JIRA_KEY]);
-    return p.success ? p.data : emptyRecord();
+    const raw = ns?.[THREAD_JIRA_KEY];
+    const p = ThreadJiraRecord.safeParse(raw);
+    if (p.success) return { rec: p.data, bad: false };
+    const bad = raw !== undefined && raw !== null;
+    if (bad && !loggedBad.has(threadId)) {
+      loggedBad.add(threadId);
+      log(`jira: unparseable record on ${threadId}, read as empty: ${p.error.message}`);
+    }
+    return { rec: emptyRecord(), bad };
   };
+  const readThread = async (threadId: string): Promise<ThreadJiraRecord> => (await readStored(threadId)).rec;
 
-  /** writeThread with the patch computed from the current record, inside the lock; `remove` drops optional keys. */
+  /** writeThread with the patch computed from the current record, inside the lock; `remove` drops optional keys, `dropKeys` drops links. */
   const updateThread = (
     threadId: string,
     makePatch: (cur: ThreadJiraRecord) => Partial<ThreadJiraRecord>,
     remove: "epicSuggested"[] = [],
+    dropKeys: readonly string[] = [],
   ): Promise<ThreadJiraRecord> =>
     locked(async () => {
-      const cur = await readThread(threadId);
+      const { rec: cur, bad } = await readStored(threadId);
+      if (bad) log(`jira: overwriting unparseable record on ${threadId}`);
       const patch = makePatch(cur);
       const next: ThreadJiraRecord = {
         ...cur,
         ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)),
-        links: dedupeLinks([...cur.links, ...(patch.links ?? [])]),
+        links: dedupeLinks([...cur.links, ...(patch.links ?? [])]).filter((l) => !dropKeys.includes(l.key)),
       };
       for (const k of remove) delete next[k];
       await threads.updatePluginMetadata({ threadId, set: { [THREAD_JIRA_KEY]: next } });
@@ -205,6 +217,11 @@ export function createJiraStore(
     },
 
     updateThread,
+
+    /** Drop links by key (an operator's unlink), inside the lock. */
+    removeLinks(threadId: string, keys: readonly string[]): Promise<ThreadJiraRecord> {
+      return updateThread(threadId, () => ({}), [], keys);
+    },
   };
 }
 

@@ -2250,6 +2250,8 @@ export default async function plugin(bb: BbPluginApi) {
       await importLegacyDone();
       // Jira on: a Done drop is a request (lib/jira-server startDoneCheck).
       if (done && (await jira.enabled())) return { done: (await jira.startDoneCheck(threadId)) === "done" };
+      // Jira on: leaving Done ends a running check (Keep working), so it cannot stamp Done.
+      if (!done && (await jira.enabled())) await jira.stopDoneCheck(threadId);
       await writeDoneRecord(threadId, done);
       bb.realtime.publish(DONE_CHANGED, { threadId, done });
       return { done };
@@ -2299,7 +2301,9 @@ export default async function plugin(bb: BbPluginApi) {
     },
     link_clear: async ({ threadId, number }) => {
       const existing = await readLinkedIssues(threadId);
-      await writeLinkedIssues(threadId, clearLinkedIssues(existing, number));
+      const remaining = clearLinkedIssues(existing, number);
+      await writeLinkedIssues(threadId, remaining);
+      await jira.unlinkCleared(threadId, existing, remaining);
       await publishLinksChanged([threadId]);
       return { threadId, cleared: true };
     },
@@ -2879,7 +2883,9 @@ export default async function plugin(bb: BbPluginApi) {
     async run(input) {
       await importLegacyDone();
       const cleared: string[] = [];
+      const stopCheck = await jira.enabled(); // Jira on: a clear ends a running Done check
       for (const threadId of input.positionals["thread-id"]) {
+        if (stopCheck) await jira.stopDoneCheck(threadId);
         await writeDoneRecord(threadId, false);
         bb.realtime.publish(DONE_CHANGED, { threadId, done: false });
         cleared.push(threadId);
@@ -3369,13 +3375,15 @@ export default async function plugin(bb: BbPluginApi) {
         }
         return parsed;
       });
-      let links = await readLinkedIssues(threadId);
+      const existing = await readLinkedIssues(threadId);
+      let links = existing;
       if (numbers.length === 0) {
         links = null;
       } else {
         for (const number of numbers) links = clearLinkedIssues(links, number);
       }
       await writeLinkedIssues(threadId, links);
+      await jira.unlinkCleared(threadId, existing, links);
       await publishLinksChanged([threadId]);
       const stdout = input.options.json
         ? JSON.stringify({ threadId, cleared: numbers }, null, 2) + "\n"
