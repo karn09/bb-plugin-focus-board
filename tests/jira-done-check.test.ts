@@ -106,6 +106,7 @@ describe("Done check flow", () => {
   const rows = new Map<string, { parentThreadId?: string; title?: string; branch?: string | null }>();
   let send: ReturnType<typeof vi.fn>;
   let metaHook: ((set: Record<string, any> | undefined) => void) | null = null;
+  let listGate: Promise<void> | null = null;
 
   async function load(opts: { enabled?: boolean; snapshot?: object | null; kv?: Record<string, unknown> } = {}) {
     send = vi.fn(async () => ({}));
@@ -121,7 +122,16 @@ describe("Done check flow", () => {
       settings: { jiraEnabled: opts.enabled ?? true } as never,
       sdk: {
         threads: {
-          list: async (args?: { archived?: boolean }) => (args?.archived ? [] : [...rows.keys()].map(row)),
+          list: async (args?: { archived?: boolean }) => {
+            // Held once, at the check's own read (verifying already written).
+            const jira = metadata.get("t1")?.jira as { verifying?: unknown } | undefined;
+            if (listGate && jira?.verifying) {
+              const g = listGate;
+              listGate = null;
+              await g;
+            }
+            return args?.archived ? [] : [...rows.keys()].map(row);
+          },
           get: async ({ threadId }: { threadId: string }) => row(threadId),
           send,
           getPluginMetadata: async ({ threadId }: { threadId: string }) => metadata.get(threadId) ?? {},
@@ -145,6 +155,7 @@ describe("Done check flow", () => {
   }
   const reset = () => {
     metaHook = null;
+    listGate = null;
     metadata.clear();
     status.clear();
     rows.clear();
@@ -507,5 +518,68 @@ describe("Done check flow", () => {
     await load({ snapshot: snap({ prs: [pr(1, "merged")] }), kv: { "jira:queue": [{ id: "o1", createdAt: "x", threadId: "t1", op: "comment", key: "PT-1", body: "Focus Board: moving this to In Progress." }] } });
     await doneSet("t1");
     expect((await ops()).map((o) => o.op)).toEqual(["comment", "comment", "transition"]);
+  });
+
+  // ---- fix round 2 ----
+
+  it("Keep working while a mechanical pass is in flight: no Done stamp, no ops", async () => {
+    seed("t1");
+    await load({ snapshot: snap({ prs: [pr(1, "merged")] }) });
+    let release!: () => void;
+    listGate = new Promise((r) => (release = r));
+    const drop = doneSet("t1");
+    await vi.waitFor(() => expect(listGate).toBeNull()); // the check is held inside its read
+    expect(await card("keep-working")).toEqual({ ok: true });
+    release();
+    await drop;
+    await flush();
+    expect(doneOf("t1")).toBeUndefined();
+    expect(await ops()).toEqual([]);
+    expect(jiraOf("t1")).toMatchObject({ verifying: null, doneCheck: null });
+  });
+
+  it("Keep working while a mechanical fail is in flight: no checklist written", async () => {
+    seed("t1");
+    await load({ snapshot: snap({ prs: [pr(8, "open")] }) });
+    let release!: () => void;
+    listGate = new Promise((r) => (release = r));
+    const drop = doneSet("t1");
+    await vi.waitFor(() => expect(listGate).toBeNull());
+    expect(await card("keep-working")).toEqual({ ok: true });
+    release();
+    await drop;
+    expect(jiraOf("t1")).toMatchObject({ verifying: null, doneCheck: null, reason: null });
+  });
+
+  it("a verdict after Keep working is refused (the click ended the check)", async () => {
+    seed("t1");
+    rows.get("t1")!.branch = null;
+    await load();
+    await doneSet("t1");
+    expect(await card("keep-working")).toEqual({ ok: true });
+    expect((await verdict({ verdict: "pass", remaining: [] })).isError).toBe(true);
+    expect(jiraOf("t1")?.doneCheck).toBeNull();
+  });
+
+  it("Keep working on a passed Done thread is refused: doneCheck and the stamp stay, no done=false", async () => {
+    seed("t1", { doneCheck: { at: "x", verdict: "pass", reasons: [] } });
+    metadata.get("t1")![DONE_METADATA_KEY] = { doneAt: "2026-10-01T00:00:00.000Z" };
+    await load();
+    expect(await card("keep-working")).toEqual({ ok: false, error: "no Done check to stop" });
+    expect(jiraOf("t1")?.doneCheck.verdict).toBe("pass");
+    expect(doneOf("t1")).toBeTruthy();
+    expect(harness.inspection.realtimeSignals).not.toContainEqual({ channel: "done-changed", payload: { threadId: "t1", done: false } });
+  });
+
+  it("a marker write before the stored markers load keeps the other threads' markers", async () => {
+    seed("t1", { verifying: { startedAt: "s1" } });
+    seed("t2", { doneCheck: { at: "x", verdict: "pending-confirm", reasons: [] } });
+    // keep-working on t2 writes the marker map during startup.
+    const loading = load({ kv: { "jira:verify-sent": { t1: "s1", t2: "old" } } });
+    await loading;
+    await card("keep-working", "t2");
+    await flush();
+    expect(await bb.storage.kv.get("jira:verify-sent")).toEqual({ t1: "s1" });
+    expect((await verdict({ verdict: "pass", remaining: [] })).isError).toBeFalsy();
   });
 });

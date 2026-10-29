@@ -162,13 +162,16 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   // to KV so a restart keeps them (none offered until the load lands).
   const verifySent = new Map<string, string>();
   const sentLoaded = bb.storage.kv.get(VERIFY_SENT_KEY).then((raw) => {
-    if (raw && typeof raw === "object") for (const [k, v] of Object.entries(raw)) if (typeof v === "string" && !verifySent.has(k)) verifySent.set(k, v);
+    if (raw && typeof raw === "object") for (const [k, v] of Object.entries(raw)) if (typeof v === "string") verifySent.set(k, v);
   });
-  let sentChain: Promise<unknown> = Promise.resolve();
+  // Every change waits for the load, so an early write never drops (or resurrects) stored markers.
+  let sentChain: Promise<unknown> = sentLoaded.catch((e) => bb.log.warn(`jira: verify markers unreadable: ${(e as Error).message}`));
   const setSent = (threadId: string, startedAt: string | null) => {
-    if (startedAt === null) verifySent.delete(threadId);
-    else verifySent.set(threadId, startedAt);
-    const run = sentChain.then(() => bb.storage.kv.set(VERIFY_SENT_KEY, Object.fromEntries(verifySent)));
+    const run = sentChain.then(() => {
+      if (startedAt === null) verifySent.delete(threadId);
+      else verifySent.set(threadId, startedAt);
+      return bb.storage.kv.set(VERIFY_SENT_KEY, Object.fromEntries(verifySent));
+    });
     sentChain = run.catch(() => undefined);
     return run;
   };
@@ -536,6 +539,24 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     return { rows, title: row.title ?? row.titleFallback ?? threadId, prs, stale: stale || missing, snapshot, children };
   };
 
+  // Done-check decisions and card actions run one at a time per thread: a
+  // double click sees the first's write, and Keep working beats an in-flight check.
+  const threadChains = new Map<string, Promise<unknown>>();
+  const perThread = <T>(threadId: string, task: () => Promise<T>): Promise<T> => {
+    const run = (threadChains.get(threadId) ?? Promise.resolve()).then(task);
+    const tail = run.catch(() => undefined);
+    threadChains.set(threadId, tail);
+    void tail.then(() => threadChains.get(threadId) === tail && threadChains.delete(threadId));
+    return run;
+  };
+
+  /** Inside perThread: is the check that started at startedAt still the running one? Logs when not. */
+  const stillChecking = async (threadId: string, startedAt: string, what: string) => {
+    if ((await store.readThread(threadId)).verifying?.startedAt === startedAt) return true;
+    bb.log.info(`jira: Done check on ${threadId} ended before its ${what}; nothing written`);
+    return false;
+  };
+
   const failCheck = async (threadId: string, reasons: string[]) => {
     await store.updateThread(threadId, () => ({ verifying: null, doneCheck: { at: isoNow(), verdict: "fail", reasons }, reason: reasons.join("; ") }));
     await setSent(threadId, null);
@@ -606,12 +627,18 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   };
 
   const runCheck = async (threadId: string) => {
-    if (!(await enabled()) || !(await store.readThread(threadId)).verifying) return;
+    const startedAt = (await store.readThread(threadId)).verifying?.startedAt;
+    if (!(await enabled()) || startedAt === undefined) return;
     const f = await doneFacts(threadId);
     const m = evaluateMechanical({ prs: f.prs, children: f.children.map((c) => ({ id: c.id, title: c.title, linked: c.keys.length > 0 })), snapshotStale: f.stale });
-    if (m.verdict === "pass") return finishDone(threadId, false);
+    // verifyTurn re-reads verifying itself and must stay outside perThread
+    // (its waitFor can run this thread's jobs, which would wait on the lock).
     if (m.verdict === "needs-agent") return verifyTurn(threadId);
-    return failCheck(threadId, m.reasons);
+    await perThread(threadId, async () => {
+      if (!(await stillChecking(threadId, startedAt, m.verdict === "pass" ? "Done stamp" : "fail"))) return;
+      if (m.verdict === "pass") await finishDone(threadId, false);
+      else await failCheck(threadId, m.reasons);
+    });
   };
   const registered = Promise.all([idle.register("done-check", runCheck), idle.register("verify-turn", verifyTurn)]);
 
@@ -641,16 +668,6 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   };
   resumeChecks().catch((e) => bb.log.warn(`jira: resuming Done checks failed: ${(e as Error).message}`));
 
-  // Done card actions run one at a time per thread: a double click sees the first's write.
-  const threadChains = new Map<string, Promise<unknown>>();
-  const perThread = <T>(threadId: string, task: () => Promise<T>): Promise<T> => {
-    const run = (threadChains.get(threadId) ?? Promise.resolve()).then(task);
-    const tail = run.catch(() => undefined);
-    threadChains.set(threadId, tail);
-    void tail.then(() => threadChains.get(threadId) === tail && threadChains.delete(threadId));
-    return run;
-  };
-
   const confirmDone = async (threadId: string, skip: boolean): Promise<{ ok: boolean; error?: string }> => {
     const rec = await store.readThread(threadId);
     if (rec.doneCheck?.verdict === "pass" && (await isDone(threadId))) return { ok: false, error: "already done" };
@@ -675,6 +692,9 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     perThread(threadId, async (): Promise<{ ok: boolean; error?: string }> => {
       if (kind === "confirm-done" || kind === "skip-done") return confirmDone(threadId, kind === "skip-done");
       if (kind === "keep-working") {
+        const rec = await store.readThread(threadId);
+        const open = rec.verifying != null || rec.doneCheck?.verdict === "pending-confirm" || rec.doneCheck?.verdict === "fail";
+        if (!open) return { ok: false, error: "no Done check to stop" };
         await store.writeThread(threadId, { verifying: null, reason: null, doneCheck: null });
         await setSent(threadId, null);
         notDone(threadId);
@@ -703,17 +723,20 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     parameters: z.object({ verdict: z.enum(["pass", "fail"]), remaining: z.array(z.string()) }),
     execute: async ({ verdict, remaining }, ctx) => {
       if (!(await enabled())) return toolText(TOOL_OFF, true);
-      if (!awaitingVerdict(ctx.threadId, await store.readThread(ctx.threadId))) {
-        return toolText("No Done check is waiting on a verdict from this thread; nothing was written.", true);
-      }
-      if (verdict === "pass") {
-        await store.updateThread(ctx.threadId, () => ({ verifying: null, doneCheck: { at: isoNow(), verdict: "pending-confirm", reasons: [] } }));
-        await setSent(ctx.threadId, null);
-        return toolText("Recorded. The operator confirms Done on the board; nothing else to do.");
-      }
-      const reasons = capReasons(remaining);
-      await failCheck(ctx.threadId, reasons.length > 0 ? reasons : ["the agent reported work left"]);
-      return toolText("Recorded. The thread stays open with those items for the operator.");
+      // Checked and written under the thread's lock: a Keep working click wins.
+      return perThread(ctx.threadId, async () => {
+        if (!awaitingVerdict(ctx.threadId, await store.readThread(ctx.threadId))) {
+          return toolText("No Done check is waiting on a verdict from this thread; nothing was written.", true);
+        }
+        if (verdict === "pass") {
+          await store.updateThread(ctx.threadId, () => ({ verifying: null, doneCheck: { at: isoNow(), verdict: "pending-confirm", reasons: [] } }));
+          await setSent(ctx.threadId, null);
+          return toolText("Recorded. The operator confirms Done on the board; nothing else to do.");
+        }
+        const reasons = capReasons(remaining);
+        await failCheck(ctx.threadId, reasons.length > 0 ? reasons : ["the agent reported work left"]);
+        return toolText("Recorded. The thread stays open with those items for the operator.");
+      });
     },
   });
 
