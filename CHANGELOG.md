@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Jira integration (off by default, `jiraEnabled`): threads link to Jira tickets; a companion script keeps a ticket/PR snapshot and drains a queue of ticket ops through `acli` and `gh`; the Attention view gets a Jira column with drift fixes and a Start thread action; cards show ticket chips and reason lines; Done becomes a checked request; nudges and deeper checks replace the long-idle sweep. Fork notes and the operator rollout checklist are in `docs/fork-notes.md`.
+
 ### Changed
 
 ### Fixed
