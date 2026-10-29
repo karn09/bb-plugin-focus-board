@@ -1,12 +1,17 @@
 // Jira integration wiring. This part: the `bb focus-board jira …` CLI bridge
 // the companion script (scripts/jira-sync.mjs) talks to. The commands work
 // whether or not jiraEnabled is set, and change no board behavior.
+// Also: reconciliation (`jira reconcile`, the jira_reconcile_* RPCs, and the
+// one-time run when jiraEnabled flips on).
 import { readFileSync } from "node:fs";
-import { cliCommand, type BbPluginApi } from "@get-bb/plugin-sdk";
-import { JiraSnapshot, OpResult } from "./jira-schema";
+import { z } from "zod";
+import { cliCommand, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { jiraBrowseUrl } from "./jira-keys";
+import { applyReconcile, externalJiraKey, planReconcile, StoredReconcilePlan, type ReconThread } from "./jira-reconcile";
+import { OpResult } from "./jira-schema";
 import { jiraSettings } from "./jira-settings";
 import { createJiraStore, type JiraStore } from "./jira-store";
-import type { ThreadLink } from "./link-metadata";
+import { makeExternalLink, type ThreadLink } from "./link-metadata";
 import { BB_PERSONAL_PROJECT_ID } from "./new-thread-seed";
 
 export type JiraDeps = {
@@ -16,7 +21,26 @@ export type JiraDeps = {
   liveLinks: () => Promise<{ id: string; links: ThreadLink[] }[]>;
   /** Plugin source directory, when the host can say; else a placeholder is printed. */
   repoDir?: string;
+  /** Live threads as reconcile input (title, branch, status, Done). */
+  reconThreads: () => Promise<ReconThread[]>;
+  /** One thread's board links (server.ts readLinkedIssues). */
+  readLinks: (threadId: string) => Promise<ThreadLink[]>;
+  /** Stamp one board link the way link_set does (write + publish). */
+  addLink: (threadId: string, link: ThreadLink) => Promise<void>;
+  /** Subscribe to plugin settings changes (settings.onChange). */
+  onSettingsChange?: (listener: () => void) => void;
 };
+
+const PLAN_KEY = "jira:reconcile-plan";
+const ENABLED_SEEN_KEY = "jira:enabled-seen";
+export const JIRA_RECONCILE_CHANGED = "jira-reconcile-changed";
+
+export const jiraRpcContract = defineRpcContract({
+  /** The stored plan from the last apply, else a fresh dry plan (nothing written). */
+  jira_reconcile_plan: { input: z.null(), output: StoredReconcilePlan },
+  /** Plan, apply (links + enrolledAt only) and store the plan. */
+  jira_reconcile_apply: { input: z.null(), output: StoredReconcilePlan },
+});
 
 const PLACEHOLDER_REPO = "<path-to-bb-plugin-focus-board>";
 const fail = (msg: string) => ({ exitCode: 1, stderr: `${msg}\n` });
@@ -139,8 +163,74 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     },
   });
 
+  async function freshPlan(): Promise<StoredReconcilePlan> {
+    const s = jiraSettings(await deps.settings());
+    const { snapshot } = await store.readSnapshot();
+    const links = Object.fromEntries((await deps.liveLinks()).map((t) => [t.id, t.links]));
+    const now = Date.now();
+    const plan = planReconcile({ threads: await deps.reconThreads(), links, prs: snapshot?.prs ?? [], snapshot, projects: s.projects, now });
+    return { ...plan, generatedAt: new Date(now).toISOString() };
+  }
+  // Board links go through server.ts's link_set path; a key the thread
+  // already links (any external link for it) is left as the operator set it.
+  const linkWriter = async (threadId: string, key: string) => {
+    if ((await deps.readLinks(threadId)).some((l) => externalJiraKey(l) === key)) return;
+    const link = makeExternalLink(jiraBrowseUrl(key), key, "auto", new Date());
+    await deps.addLink(threadId, { ...link, jira: { key } });
+  };
+  // Serialized so the start check and a settings flip never apply twice at once.
+  let applying: Promise<unknown> = Promise.resolve();
+  const reconcileApply = (): Promise<StoredReconcilePlan> => {
+    const run = applying.then(async () => {
+      const plan = await freshPlan();
+      await applyReconcile(plan, store, linkWriter, Date.parse(plan.generatedAt));
+      await bb.storage.kv.set(PLAN_KEY, plan);
+      bb.realtime.publish(JIRA_RECONCILE_CHANGED, { generatedAt: plan.generatedAt });
+      return plan;
+    });
+    applying = run.catch(() => undefined);
+    return run;
+  };
+
+  // Once per false→true flip of jiraEnabled: checked at load (a flip while
+  // unloaded) and on every settings change. Turning it off re-arms.
+  let checking: Promise<unknown> = Promise.resolve();
+  const checkFirstEnable = (): Promise<unknown> =>
+    (checking = checking.then(async () => {
+      const on = jiraSettings(await deps.settings()).enabled;
+      const seen = (await bb.storage.kv.get(ENABLED_SEEN_KEY)) === true;
+      if (!on) {
+        if (seen) await bb.storage.kv.set(ENABLED_SEEN_KEY, false);
+        return;
+      }
+      if (seen) return;
+      await reconcileApply();
+      await bb.storage.kv.set(ENABLED_SEEN_KEY, true);
+    }).catch((e) => bb.log.warn(`jira reconcile on enable failed: ${(e as Error).message}`)));
+  checkFirstEnable().catch(() => undefined);
+  deps.onSettingsChange?.(() => {
+    checkFirstEnable().catch(() => undefined);
+  });
+
+  bb.rpc.register(jiraRpcContract, {
+    jira_reconcile_plan: async () => {
+      const stored = StoredReconcilePlan.safeParse(await bb.storage.kv.get(PLAN_KEY));
+      return stored.success ? stored.data : freshPlan();
+    },
+    jira_reconcile_apply: () => reconcileApply(),
+  });
+
+  const reconcile = cliCommand({
+    summary: "Print the reconcile plan for existing threads; --confirm applies it (links + enrollment only)",
+    options: { confirm: { type: "boolean", description: "Apply the plan" } },
+    async run(input) {
+      const plan = input.options.confirm === true ? await reconcileApply() : await freshPlan();
+      return out({ applied: input.options.confirm === true, pendingOps: (await store.pendingOps()).length, plan });
+    },
+  });
+
   return {
-    commands: { "jira ingest": ingest, "jira wanted": wanted, "jira queue": queue, "jira ack": ack, "jira status": status, "jira setup": setup },
+    commands: { "jira reconcile": reconcile, "jira ingest": ingest, "jira wanted": wanted, "jira queue": queue, "jira ack": ack, "jira status": status, "jira setup": setup },
     store,
     dispose() {},
   };

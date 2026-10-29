@@ -103,3 +103,11 @@ export const ThreadJiraRecord = z.object({
   epicSuggested: z.literal(true).optional(),
 });
 export type ThreadJiraRecord = z.infer<typeof ThreadJiraRecord>;
+
+/** A board-vs-Jira mismatch worth showing. Task 8 (lib/jira-drift.ts) extends the producers. */
+export const DriftItem = z.object({
+  key: Key,
+  kind: z.enum(["todo-with-prs", "all-done-still-open", "stale-unlinked"]),
+  detail: z.string(),
+});
+export type DriftItem = z.infer<typeof DriftItem>;

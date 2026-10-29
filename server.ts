@@ -1388,6 +1388,12 @@ export default async function plugin(bb: BbPluginApi) {
     bb.realtime.publish(LINK_CHANGED, { threadIds });
   }
 
+  /** link_set's write: stamp one link as primary, then tell the board. */
+  async function stampLink(threadId: string, link: ThreadLink): Promise<void> {
+    await writeLinkedIssues(threadId, stampLinkedIssues(await readLinkedIssues(threadId), link));
+    await publishLinksChanged([threadId]);
+  }
+
   /**
    * Resolve the repo slug a link targets: an explicit `owner/repo` argument
    * wins, else the thread's project remote (fail loud when the project has
@@ -2284,8 +2290,7 @@ export default async function plugin(bb: BbPluginApi) {
           source,
         };
       }
-      await writeLinkedIssues(threadId, stampLinkedIssues(await readLinkedIssues(threadId), link));
-      await publishLinksChanged([threadId]);
+      await stampLink(threadId, link);
       return { threadId, link };
     },
     link_clear: async ({ threadId, number }) => {
@@ -3970,6 +3975,22 @@ export default async function plugin(bb: BbPluginApi) {
         live.map(async (row) => ({ id: row.id, links: (await readLinkedIssues(row.id)) ?? [] })),
       );
     },
+    reconThreads: async () => {
+      const rows = await bb.sdk.threads.list({});
+      return Promise.all(
+        rows.map(async (row) => ({
+          id: row.id,
+          title: row.title ?? row.titleFallback ?? "",
+          branch: row.environmentBranchName ?? null,
+          status: row.status,
+          archived: row.archivedAt !== null,
+          done: (await readDoneRecord(row.id)) !== null,
+        })),
+      );
+    },
+    readLinks: async (threadId) => (await readLinkedIssues(threadId)) ?? [],
+    addLink: stampLink,
+    onSettingsChange: (listener) => settings.onChange(listener),
   });
   bb.onDispose(() => jira.dispose());
 
