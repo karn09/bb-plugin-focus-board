@@ -156,11 +156,19 @@ function checksOf(rollup) {
 }
 const REVIEW = { APPROVED: "approved", CHANGES_REQUESTED: "changes_requested", REVIEW_REQUIRED: "review_required" };
 
+// One unreadable PR (or search) skips just that ref; the failures are counted in snapshot.error.
 async function fetchPrs(wanted, linkedKeys) {
   const prs = [];
+  const failed = [];
   for (const { repo, number } of wanted.prRefs) {
-    const p = json(await run("gh", ["pr", "view", String(number), "-R", repo, "--json",
-      "state,mergedAt,headRefName,title,body,statusCheckRollup,reviewDecision,updatedAt"]));
+    let p;
+    try {
+      p = json(await run("gh", ["pr", "view", String(number), "-R", repo, "--json",
+        "state,mergedAt,headRefName,title,body,statusCheckRollup,reviewDecision,updatedAt"]));
+    } catch (e) {
+      failed.push(String(e.message ?? e));
+      continue;
+    }
     prs.push({
       repo, number, state: p.state === "MERGED" || p.mergedAt ? "merged" : p.state === "CLOSED" ? "closed" : "open",
       headRef: p.headRefName ?? "", title: p.title ?? "", body: p.body ?? "", checks: checksOf(p.statusCheckRollup),
@@ -168,11 +176,22 @@ async function fetchPrs(wanted, linkedKeys) {
     });
   }
   const mentions = [];
+  const searchFailed = [];
   for (const key of linkedKeys) {
-    const rs = json(await run("gh", ["search", "prs", key, "--merged", "--json", "repository,number,closedAt", "--limit", "10"])) ?? [];
+    let rs;
+    try {
+      rs = json(await run("gh", ["search", "prs", key, "--merged", "--json", "repository,number,closedAt", "--limit", "10"])) ?? [];
+    } catch (e) {
+      searchFailed.push(String(e.message ?? e));
+      continue;
+    }
     for (const r of rs) mentions.push({ key, repo: r.repository?.nameWithOwner ?? "", number: r.number, mergedAt: r.closedAt ?? "" });
   }
-  return { prs, mentions };
+  const errors = [
+    ...(failed.length ? [`gh: ${failed.length} of ${wanted.prRefs.length} PRs unreadable (${failed[0]})`] : []),
+    ...(searchFailed.length ? [`gh: ${searchFailed.length} of ${linkedKeys.length} mention searches failed (${searchFailed[0]})`] : []),
+  ];
+  return { prs, mentions, error: errors.length ? errors.join("; ") : null };
 }
 
 export async function main() {

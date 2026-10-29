@@ -155,13 +155,15 @@ export function createJiraStore(
       snapshot: JiraSnapshot | null;
       ageMs: number | null;
       stale: boolean;
-      /** Last refresh failure (kept even with no prior good snapshot), else null. */
+      /** Last refresh failure (kept even with no prior good snapshot), else the ok snapshot's partial error, else null. */
       error: string | null;
     }> {
       const failure = await kv.get(SNAPSHOT_FAILURE_KEY);
-      const error = typeof failure === "string" ? failure : null;
+      const failed = typeof failure === "string" ? failure : null;
       const p = JiraSnapshot.safeParse(await kv.get(SNAPSHOT_KEY));
-      if (!p.success) return { snapshot: null, ageMs: null, stale: true, error };
+      if (!p.success) return { snapshot: null, ageMs: null, stale: true, error: failed };
+      // An ok snapshot's own error (a partial gh failure) is shown but does not make it stale.
+      const error = failed ?? p.data.error;
       const taken = Date.parse(p.data.takenAt);
       const ageMs = Number.isNaN(taken) ? null : Math.max(0, now() - taken);
       const refresh = (await opts?.refreshMinutes?.()) ?? 2;

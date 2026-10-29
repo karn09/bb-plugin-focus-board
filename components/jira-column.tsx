@@ -71,6 +71,8 @@ const FIX_LABEL: Record<DriftItem["kind"], string> = {
 };
 
 function statusLine({ error, stale, snapshotAgeMs }: Pick<JiraColumnProps, "error" | "stale" | "snapshotAgeMs">): string | null {
+  // An ok snapshot with some gh reads failed (scripts/jira-sync.mjs): Jira itself is connected.
+  if (error !== null && /^gh: \d+ of \d+ /.test(error)) return error;
   if ((error !== null && /unauthori[sz]ed|auth/i.test(error)) || (error === null && snapshotAgeMs === null)) return NOT_CONNECTED;
   if (error !== null) return `Jira refresh failed: ${error}`;
   if (stale && snapshotAgeMs !== null) return `data ${Math.floor(snapshotAgeMs / 60_000)} min old`;

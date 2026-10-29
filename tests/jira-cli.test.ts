@@ -85,6 +85,29 @@ describe("bb focus-board jira CLI", () => {
     expect(w.branchHeads).toEqual([]);
   });
 
+  it("wanted also lists configured-project keys from titles, branches and PR head refs (unassigned tickets auto-link)", async () => {
+    await load();
+    threads = [
+      makeThreadResponse({ id: "t1", title: "PT-3893: tidy the runbook (UTF-8)", environmentBranchName: null } as never),
+      makeThreadResponse({ id: "t2", title: "no key", environmentBranchName: "sre-12-alerts" } as never),
+      makeThreadResponse({ id: "t3", title: "PR only", environmentBranchName: null } as never),
+    ];
+    metadata.set("t3", { linkedIssues: [ghPull(7)] });
+    const pr = { repo: "o/r", number: 7, state: "open", headRef: "pt-3894-fix", title: "t", body: "", checks: "pass", reviewDecision: null, updatedAt: "2026-10-29T00:00:00Z" };
+    await harness.behavior.runCli(["jira", "ingest", "--file", file("w.json", fixture({ prs: [pr] }))]);
+    const w = JSON.parse((await harness.behavior.runCli(["jira", "wanted", "--json"])).stdout);
+    expect(w.linkedKeys.sort()).toEqual(["PT-3893", "PT-3894", "SRE-12"]);
+  });
+
+  it("status shows a partial gh failure on an ok snapshot", async () => {
+    await load();
+    await harness.behavior.runCli(["jira", "ingest", "--file", file("p.json", fixture({ error: "gh: 1 of 2 PRs unreadable (boom)" }))]);
+    const s = (await harness.behavior.runCli(["jira", "status"])).stdout;
+    expect(s).toContain("ok");
+    expect(s).toContain("gh: 1 of 2 PRs unreadable (boom)");
+    expect(s).not.toContain("stale");
+  });
+
   it("failed first snapshot: ingest and status surface the error", async () => {
     await load();
     const r = await harness.behavior.runCli(["jira", "ingest", "--file", file("f.json", { ok: false, error: "acli signed out" })]);

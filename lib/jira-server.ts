@@ -16,7 +16,7 @@ import { z } from "zod";
 import { cliCommand, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { createIdleWaiters, sendIfIdle, type JobKind } from "./jira-idle";
 import { findTicketText, JIRA_AGENT_TOOLS, JIRA_LINK_TOOL, JIRA_SPAWN_TOOL, jiraConfigure, JiraLinkParams, promoteEpicText, SpawnChildParams, titleWithKey, trackedRegisterTool } from "./jira-agent";
-import { jiraBrowseUrl } from "./jira-keys";
+import { extractJiraKeys, jiraBrowseUrl } from "./jira-keys";
 import { fixQueued, livePrs, prUrl } from "./jira-drift";
 import { capReasons, DONE_SUMMARY_PREFIX, doneSummary, evaluateMechanical, JIRA_VERDICT_TOOL, spinOffText, ticketUpdate, verifyTurnText } from "./jira-done-check";
 import { deepCheckFindings, NUDGE_TEXT, planReminders, replyLine, type DeepNext, type ReminderThread } from "./jira-reminders";
@@ -260,6 +260,17 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         }
         for (const l of (await store.readThread(id)).links) keys.add(l.key);
       }
+      // Exact keys in titles, branches and PR head refs (what reconcile auto-links), so
+      // tickets not assigned to the operator are fetched too. Branches are usually lowercase.
+      const add = (text: string | null | undefined, upper = false) => {
+        for (const k of text ? extractJiraKeys(upper ? text.toUpperCase() : text, s.projects) : []) keys.add(k);
+      };
+      for (const t of await deps.reconThreads()) {
+        if (t.archived) continue;
+        add(t.title);
+        add(t.branch, true);
+      }
+      for (const p of (await store.readSnapshot()).snapshot?.prs ?? []) if (prs.has(`${p.repo}#${p.number}`)) add(p.headRef, true);
       // branchHeads: thread rows expose no branch/repo pair cheaply, so none yet.
       return out({ projects: s.projects, linkedKeys: [...keys].sort(), prRefs: [...prs.values()], branchHeads: [] });
     },
@@ -302,7 +313,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       const lines = [
         snapshot === null
           ? `snapshot: none${error ? ` (last refresh failed: ${error})` : ""}`
-          : `snapshot: ${snapshot.ok ? "ok" : `error: ${snapshot.error}`}${stale ? " (stale)" : ""}, age ${ageMs === null ? "?" : `${Math.floor(ageMs / 1000)}s`}`,
+          : `snapshot: ${snapshot.ok ? "ok" : `error: ${snapshot.error}`}${error ? ` (${error})` : ""}${stale ? " (stale)" : ""}, age ${ageMs === null ? "?" : `${Math.floor(ageMs / 1000)}s`}`,
         `pending ops: ${ops.length}`,
         ...(await store.recentResults(5)).map((r) => `result ${r.id}: ${r.ok ? `ok${r.createdKey ? ` ${r.createdKey}` : ""}` : `error ${r.error}`}`),
       ];

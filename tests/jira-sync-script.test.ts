@@ -217,6 +217,24 @@ describe("jira-sync.mjs", () => {
     expect(snap.tickets).toHaveLength(1);
   });
 
+  it("one unreadable PR: the others are kept, ok stays true, the error counts the failures", () => {
+    rules("bb", [
+      { match: "jira wanted", stdout: JSON.stringify({ ...wanted, linkedKeys: ["ENG-1"], prRefs: [{ repo: "o/r", number: 7 }, { repo: "o/r", number: 8 }] }) },
+      { match: "jira queue", stdout: JSON.stringify({ ops: [] }) },
+    ]);
+    rules("acli", [{ match: "search", stdout: JSON.stringify([issue("ENG-1")]) }]);
+    rules("gh", [
+      { match: "pr view 8", code: 1, stderr: "no such PR" },
+      { match: "pr view 7", stdout: JSON.stringify({ state: "MERGED", mergedAt: "2026-10-28T00:00:00Z", headRefName: "b", title: "t", body: "", reviewDecision: null, updatedAt: "2026-10-29T00:00:00Z", statusCheckRollup: [] }) },
+      { match: "search prs", stdout: JSON.stringify([]) },
+    ]);
+    run();
+    const snap = JiraSnapshot.parse(ingested());
+    expect(snap.ok).toBe(true);
+    expect(snap.prs.map((p) => p.number)).toEqual([7]);
+    expect(snap.error).toMatch(/^gh: 1 of 2 PRs unreadable \(.*no such PR.*\)$/);
+  });
+
   it("never passes a space-joined command as one argv entry", () => {
     rules("bb", [
       { match: "jira wanted", stdout: JSON.stringify({ ...wanted, linkedKeys: ["ENG-1"], prRefs: [{ repo: "o/r", number: 7 }] }) },

@@ -39,6 +39,12 @@ describe("JiraColumn", () => {
     expect(screen.getByText("Jira not connected: run `acli jira auth login --web`")).toBeTruthy();
   });
 
+  it("a partial gh failure on an ok snapshot shows the gh line, not the login hint", () => {
+    render(<JiraColumn {...base()} error="gh: 1 of 3 PRs unreadable (gh pr failed: run gh auth login)" />);
+    expect(screen.getByText("gh: 1 of 3 PRs unreadable (gh pr failed: run gh auth login)")).toBeTruthy();
+    expect(screen.queryByText(/Jira not connected/)).toBeNull();
+  });
+
   it("hide-linked hides tickets that have threads; the toggle reports the flip", () => {
     const p = base();
     const { rerender } = render(<JiraColumn {...p} />);

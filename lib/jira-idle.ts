@@ -114,11 +114,13 @@ export function createIdleWaiters(
     }).then(() => undefined);
 
   // Taken jobs are removed before they run: at most once, never a retry loop.
+  // No job for the thread (every idle, Jira off included): one read, no write.
   async function onIdle(threadId: string): Promise<void> {
-    let taken: Job[] = [];
-    await update((jobs) => {
-      taken = jobs.filter((j) => j.threadId === threadId && handlers[j.kind]);
-      return jobs.filter((j) => !taken.includes(j));
+    const taken = await locked(async () => {
+      const jobs = await read();
+      const mine = jobs.filter((j) => j.threadId === threadId && handlers[j.kind]);
+      if (mine.length > 0) await kv.set(IDLE_JOBS_KEY, jobs.filter((j) => !mine.includes(j)));
+      return mine;
     });
     for (const job of taken) {
       try {

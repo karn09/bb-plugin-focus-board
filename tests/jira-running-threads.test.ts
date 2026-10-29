@@ -88,6 +88,20 @@ describe("sendIfIdle", () => {
 });
 
 describe("createIdleWaiters", () => {
+  it("onIdle with no jobs for the thread writes nothing", async () => {
+    const kv = memKv();
+    const set = vi.spyOn(kv, "set");
+    const h = vi.fn(async () => {});
+    const w = createIdleWaiters(kv, { "done-check": h }, { threads: fakeSdk(active) });
+    await w.onIdle("t1");
+    expect(set).not.toHaveBeenCalled();
+    await w.waitFor("t2", "done-check");
+    set.mockClear();
+    await w.onIdle("t1"); // another thread's job only
+    expect(set).not.toHaveBeenCalled();
+    expect(kv.m.get(IDLE_JOBS_KEY)).toHaveLength(1);
+  });
+
   it("waitFor while busy, then onIdle: the job runs exactly once and is removed", async () => {
     const kv = memKv();
     const h = vi.fn(async () => {});

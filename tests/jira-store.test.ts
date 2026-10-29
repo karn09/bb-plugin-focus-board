@@ -44,6 +44,13 @@ const snap = (over: Partial<JiraSnapshot> = {}): JiraSnapshot => ({
 const comment = (key: string) => ({ op: "comment" as const, key, body: "x", threadId: null });
 
 describe("snapshot", () => {
+  it("an ok snapshot with a partial error exposes it without going stale; the next clean one clears it", async () => {
+    const { store } = setup();
+    await store.ingestSnapshot(snap({ error: "gh: 1 of 2 PRs unreadable (boom)" }));
+    expect(await store.readSnapshot()).toMatchObject({ stale: false, error: "gh: 1 of 2 PRs unreadable (boom)" });
+    await store.ingestSnapshot(snap());
+    expect((await store.readSnapshot()).error).toBeNull();
+  });
   it("fresh at +3min, stale at +5min", async () => {
     const { store, advance } = setup({ refreshMinutes: () => 2 });
     expect(await store.ingestSnapshot(snap())).toEqual({ ok: true });
