@@ -69,7 +69,14 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
           </button>
         </span>
       ) : null}
-      {record?.reason ? <span className="w-full truncate text-[10px] text-muted-foreground">{record.reason}</span> : null}
+      {record?.epicSuggested && links[0] ? (
+        <span className={chip}>
+          <button type="button" className="underline" onClick={() => onAction("promote-epic", threadId)}>
+            Promote {(links.find((l) => l.role === "owner") ?? links[0]).key} to an epic?
+          </button>
+        </span>
+      ) : null}
+      {record?.reason ?<span className="w-full truncate text-[10px] text-muted-foreground">{record.reason}</span> : null}
     </div>
   );
 }

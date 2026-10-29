@@ -59,12 +59,15 @@ describe("focus_board_link_issue external URL forms", () => {
 });
 
 describe("focus_board_link_issue registration", () => {
-  it("registers exactly the link and group tools (no misnamed extras)", async () => {
+  it("registers exactly the link, group and Jira tools (no misnamed extras)", async () => {
     const { host } = await setup();
     const tools = registered(host);
+    // The Jira tools are registered always; configure selects them only while jiraEnabled.
     expect(tools.map((tool) => tool.name).sort()).toEqual([
       "focus_board_group_set",
+      "focus_board_jira_link",
       "focus_board_link_issue",
+      "focus_board_spawn_child",
     ]);
   });
 

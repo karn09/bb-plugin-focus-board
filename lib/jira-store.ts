@@ -93,10 +93,11 @@ export function createJiraStore(
     return p.success ? p.data : emptyRecord();
   };
 
-  /** writeThread with the patch computed from the current record, inside the lock. */
+  /** writeThread with the patch computed from the current record, inside the lock; `remove` drops optional keys. */
   const updateThread = (
     threadId: string,
     makePatch: (cur: ThreadJiraRecord) => Partial<ThreadJiraRecord>,
+    remove: "epicSuggested"[] = [],
   ): Promise<ThreadJiraRecord> =>
     locked(async () => {
       const cur = await readThread(threadId);
@@ -106,6 +107,7 @@ export function createJiraStore(
         ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)),
         links: dedupeLinks([...cur.links, ...(patch.links ?? [])]),
       };
+      for (const k of remove) delete next[k];
       await threads.updatePluginMetadata({ threadId, set: { [THREAD_JIRA_KEY]: next } });
       changed();
       return next;

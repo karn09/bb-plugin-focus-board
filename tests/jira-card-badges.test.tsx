@@ -42,6 +42,17 @@ describe("JiraCardBadges", () => {
     fireEvent.click(screen.getByLabelText("Clear check-in"));
     expect(onAction).toHaveBeenCalledWith("clear-check-in", "t1");
   });
+  it("epic suggestion: a Promote button that only acts on click", () => {
+    const onAction = vi.fn();
+    render(<JiraCardBadges {...props} onAction={onAction} record={rec({ epicSuggested: true })} />);
+    expect(onAction).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText("Promote PT-1 to an epic?"));
+    expect(onAction).toHaveBeenCalledWith("promote-epic", "t1");
+  });
+  it("no Promote button without the suggestion", () => {
+    render(<JiraCardBadges {...props} record={rec()} />);
+    expect(screen.queryByText(/Promote/)).toBeNull();
+  });
   it("pending next to a chip with an un-acked op for that key", () => {
     const op = { id: "o", createdAt: "", threadId: null, op: "comment" as const, key: "PT-1", body: "x" };
     render(<JiraCardBadges {...props} pendingOps={[op]} record={rec()} />);

@@ -71,7 +71,7 @@ describe("jira_board_state / jira_card_action", () => {
     expect(r).toEqual({ ok: true });
     expect((metadata.get("t1")!.jira as { checkInWith: unknown }).checkInWith).toBeNull();
     expect(harness.inspection.realtimeSignals.some((s) => s.channel === "jira-changed")).toBe(true);
-    expect(await harness.behavior.callRpc("jira_card_action", { kind: "find-ticket", threadId: "t1" })).toEqual({ ok: false, error: "not yet" });
+    expect(await harness.behavior.callRpc("jira_card_action", { kind: "confirm-done", threadId: "t1" })).toEqual({ ok: false, error: "not yet" });
   });
 
   it("card action: off -> error and no write; unknown thread -> error", async () => {

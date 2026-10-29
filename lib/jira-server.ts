@@ -4,10 +4,14 @@
 // Also: reconciliation (`jira reconcile`, the jira_reconcile_* RPCs, and the
 // one-time run when jiraEnabled flips on). And the Jira column's writes
 // (jira_column_action): Link / dismiss a suggestion, drift fixes, Start thread.
+// And the agent side (lib/jira-agent.ts): the one bb.agents.configure, the
+// focus_board_jira_link / focus_board_spawn_child tools, and the find-ticket /
+// promote-epic card turns.
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { cliCommand, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
-import { createIdleWaiters } from "./jira-idle";
+import { createIdleWaiters, sendIfIdle, type JobKind } from "./jira-idle";
+import { findTicketText, JIRA_LINK_TOOL, JIRA_SPAWN_TOOL, jiraConfigure, JiraLinkParams, promoteEpicText, SpawnChildParams, titleWithKey } from "./jira-agent";
 import { jiraBrowseUrl } from "./jira-keys";
 import { fixQueued, livePrs, prUrl } from "./jira-drift";
 import { applyReconcile, externalJiraKey, planReconcile, StoredReconcilePlan, threadPrsOf, type ReconThread } from "./jira-reconcile";
@@ -32,6 +36,8 @@ export type JiraDeps = {
   addLink: (threadId: string, link: ThreadLink) => Promise<void>;
   /** Subscribe to plugin settings changes (settings.onChange). */
   onSettingsChange?: (listener: () => void) => void;
+  /** The plugin's other agent tools: the one configure must keep selecting them. */
+  agentTools?: string[];
 };
 
 const PLAN_KEY = "jira:reconcile-plan";
@@ -112,6 +118,36 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   bb.events.on("thread.failed", ({ thread }) => idle.onIdle(thread.id)); // error is at rest
   bb.events.on("thread.archived", ({ thread }) => idle.drop(thread.id));
   idle.resume().catch((e) => bb.log.warn(`jira idle resume failed: ${(e as Error).message}`));
+
+  // configure is synchronous, so it reads a settings copy refreshed at load
+  // and on every change (off until the first read lands).
+  let cfg = jiraSettings({});
+  const refreshCfg = () =>
+    deps.settings().then((v) => {
+      cfg = jiraSettings(v);
+    });
+  const cfgFailed = (e: unknown) => bb.log.warn(`jira settings read failed: ${(e as Error).message}`);
+  refreshCfg().catch(cfgFailed);
+  // The plugin's only configure: with one registered, unselected tools are off,
+  // so the board's own tools are always selected; Jira's only while enabled.
+  bb.agents.configure((context) => {
+    const j = jiraConfigure(cfg.enabled, cfg, context.pluginMetadata as Record<string, unknown>);
+    return { tools: [...(deps.agentTools ?? []), ...j.tools], skills: [], ...(j.instructions ? { instructions: j.instructions } : {}) };
+  });
+
+  /** One card turn: sent now, or queued for the thread's next idle. A throw is "not sent". */
+  const turnOrWait = async (threadId: string, kind: JobKind, text: string, payload?: string) => {
+    const r = await sendIfIdle(bb.sdk.threads as never, threadId, text, { log: (m) => bb.log.warn(m) });
+    if (r === "busy") await idle.waitFor(threadId, kind, payload);
+    return r;
+  };
+  void idle.register("find-ticket", async (threadId) => {
+    const s = jiraSettings(await deps.settings());
+    if (s.enabled) await turnOrWait(threadId, "find-ticket", findTicketText(s));
+  });
+  void idle.register("promote-epic", async (threadId, payload) => {
+    if (typeof payload === "string" && (await enabled())) await turnOrWait(threadId, "promote-epic", promoteEpicText(payload), payload);
+  });
   const fileOpt = {
     file: { type: "string" as const, required: true as const, description: "JSON file path" },
   };
@@ -332,7 +368,94 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     });
 
   deps.onSettingsChange?.(() => {
+    refreshCfg().catch(cfgFailed);
     checkFirstEnable().catch(() => undefined);
+  });
+
+  const ownerKey = (rec: ThreadJiraRecord) => (rec.links.find((l) => l.role === "owner") ?? rec.links[0])?.key;
+  const toolText = (text: string, isError = false) => ({ content: [{ type: "text" as const, text }], ...(isError ? { isError: true as const } : {}) });
+  const TOOL_OFF = "Jira is off (the jiraEnabled setting is false); nothing was written.";
+  const prefixTitle = async (threadId: string, key: string) => {
+    try {
+      const row = await bb.sdk.threads.get({ threadId });
+      const title = row.title ?? row.titleFallback ?? "";
+      if (title !== "" && titleWithKey(title, key) !== title) await bb.sdk.threads.update({ threadId, title: titleWithKey(title, key) });
+    } catch (e) {
+      bb.log.warn(`jira: cannot retitle ${threadId}: ${(e as Error).message}`);
+    }
+  };
+
+  bb.agents.registerTool({
+    name: JIRA_LINK_TOOL,
+    description:
+      "Link this bb thread to its Jira ticket once the operator chose it. role \"owner\" when the operator works it (claimed: whether you assigned it to the operator), \"watching\" when someone else owns it (pass ownerName). Prefixes the thread title with the key.",
+    parameters: JiraLinkParams,
+    execute: async ({ key, role, ownerName, claimed }, ctx) => {
+      if (!(await enabled())) return toolText(TOOL_OFF, true);
+      await linkWriter(ctx.threadId, key, "agent");
+      await store.updateThread(ctx.threadId, () => ({ links: [{ key, role, source: "agent" }], ...(role === "watching" ? { checkInWith: ownerName ?? null } : {}) }));
+      await prefixTitle(ctx.threadId, key);
+      if (role === "watching") {
+        return toolText(`Linked ${JSON.stringify(key)} as watching. ${JSON.stringify(ownerName)} owns it: stop work on this thread now and tell the operator to check in with them. Make no Jira write.`);
+      }
+      return toolText(
+        `Linked ${JSON.stringify(key)} as owner. Put it in branch names and PR titles.` +
+          (claimed ? "" : " It is not claimed yet: assign it to the operator and move it to In Progress with acli once the operator agrees."),
+      );
+    },
+  });
+
+  // A parent whose ticket is not an epic and has 2+ children gets the card's
+  // "Promote <key> to an epic?" offer. Snapshot-confirmed non-epics only.
+  // ponytail: re-offered after a click if the ticket is still not an epic at the next spawn; add a "declined" marker if that nags.
+  const maybeSuggestEpic = async (parentId: string) => {
+    const rec = await store.readThread(parentId);
+    const key = ownerKey(rec);
+    if (key === undefined || rec.epicSuggested) return;
+    const t = (await store.readSnapshot()).snapshot?.tickets.find((x) => x.key === key);
+    if (!t || t.isEpic) return;
+    const kids = (await bb.sdk.threads.list({})).filter((r) => r.parentThreadId === parentId && r.archivedAt === null);
+    if (kids.length >= 2) await store.updateThread(parentId, () => ({ epicSuggested: true }));
+  };
+
+  bb.agents.registerTool({
+    name: JIRA_SPAWN_TOOL,
+    description:
+      "Spawn a child bb thread under this one, already linked to its Jira ticket. Create the child's ticket with acli first (after the operator confirmed it) and pass its key as ticketKey.",
+    parameters: SpawnChildParams,
+    execute: async ({ title, prompt, ticketKey }, ctx) => {
+      if (!(await enabled())) return toolText(TOOL_OFF, true);
+      // A complete record: lib/jira-store parses a partial one as empty.
+      const jira: ThreadJiraRecord = {
+        links: [{ key: ticketKey, role: "owner", source: "agent" }],
+        enrolledAt: new Date().toISOString(),
+        verifying: null,
+        doneCheck: null,
+        nudgedAt: null,
+        deepCheckedAt: null,
+        reason: null,
+        checkInWith: null,
+      };
+      const child = await bb.sdk.threads.spawn({
+        projectId: ctx.projectId,
+        environment: { type: "project-default" },
+        parentThreadId: ctx.threadId,
+        title: titleWithKey(title, ticketKey),
+        prompt,
+        pluginMetadata: { jira },
+      });
+      try {
+        await linkWriter(child.id, ticketKey, "agent");
+      } catch (e) {
+        bb.log.warn(`jira: child ${child.id} board link failed: ${(e as Error).message}`);
+      }
+      try {
+        await maybeSuggestEpic(ctx.threadId);
+      } catch (e) {
+        bb.log.warn(`jira: epic suggestion check failed: ${(e as Error).message}`);
+      }
+      return toolText(`Spawned child thread ${child.id}, linked to ${JSON.stringify(ticketKey)}.`);
+    },
   });
 
   bb.rpc.register(jiraRpcContract, {
@@ -366,13 +489,31 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         pending: Object.fromEntries((await store.pendingOps()).map((o) => [o.id, o])),
       };
     },
-    // Later tasks (9-11) wire the other kinds; "find-ticket" will go through sendIfIdle.
+    // Later tasks (10-11) wire the other kinds.
     jira_card_action: async ({ kind, threadId }) => {
       if (!(await enabled())) return { ok: false, error: OFF };
-      if (kind !== "clear-check-in") return { ok: false, error: "not yet" };
+      if (kind !== "clear-check-in" && kind !== "find-ticket" && kind !== "promote-epic") return { ok: false, error: "not yet" };
       if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread" };
-      await store.writeThread(threadId, { checkInWith: null });
-      return { ok: true };
+      if (kind === "clear-check-in") {
+        await store.writeThread(threadId, { checkInWith: null });
+        return { ok: true };
+      }
+      try {
+        if (kind === "find-ticket") {
+          const r = await turnOrWait(threadId, "find-ticket", findTicketText(jiraSettings(await deps.settings())));
+          return r === "gone" ? { ok: false, error: "thread gone" } : { ok: true };
+        }
+        const rec = await store.readThread(threadId);
+        const key = ownerKey(rec);
+        if (!rec.epicSuggested || key === undefined) return { ok: false, error: "no promotion suggested" };
+        const r = await turnOrWait(threadId, "promote-epic", promoteEpicText(key), key);
+        if (r === "gone") return { ok: false, error: "thread gone" };
+        // Cleared once the turn is sent or queued, never before the click.
+        await store.updateThread(threadId, () => ({}), ["epicSuggested"]);
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: `not sent: ${(e as Error).message}` };
+      }
     },
     jira_column_action: async ({ action, key, threadId, kind, confirm }) => {
       if (!(await enabled())) return { ok: false, error: OFF };

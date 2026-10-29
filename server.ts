@@ -3991,6 +3991,7 @@ export default async function plugin(bb: BbPluginApi) {
     readLinks: async (threadId) => (await readLinkedIssues(threadId)) ?? [],
     addLink: (threadId, link) => stampLink(threadId, link, { append: true }),
     onSettingsChange: (listener) => settings.onChange(listener),
+    agentTools: [LINK_AGENT_TOOL, GROUP_AGENT_TOOL],
   });
   bb.onDispose(() => jira.dispose());
 
