@@ -6,7 +6,7 @@ import { DOT_PULSE_ATTR, dotPulseStyle } from "./dot-pulse";
 import { pulsePeriodMs } from "@/lib/pulse-rate";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
-import { threadState, THREAD_STATE_LABELS } from "./grouping";
+import { threadState, THREAD_STATE_LABELS, type StateAcks } from "./grouping";
 import { resolveRepoSlug, type TicketRef } from "@/lib/tickets";
 import {
   ticketChipRows,
@@ -2236,8 +2236,12 @@ function sameSetMembership(
   ids: readonly string[],
 ): boolean {
   if (prev === next) return true;
+  // The acks may carry Jira's Needs-you ids (grouping.ts StateAcks): compare those too.
+  const a = (prev as StateAcks | undefined)?.needsYou;
+  const b = (next as StateAcks | undefined)?.needsYou;
   for (const id of ids) {
     if ((prev?.has(id) ?? false) !== (next?.has(id) ?? false)) return false;
+    if ((a?.has(id) ?? false) !== (b?.has(id) ?? false)) return false;
   }
   return true;
 }

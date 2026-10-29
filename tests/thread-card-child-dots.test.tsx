@@ -526,3 +526,13 @@ function threadCardWithActive(activeThreadId: string) {
   } as unknown as CardProps;
   return <ThreadCard {...props} />;
 }
+describe("Jira Needs-you on the child dot (Task 11)", () => {
+  it("a child with a Jira reason shows the attention dot; without the set it stays quiet", async () => {
+    const { withNeedsYou } = await import("../components/grouping");
+    renderCard({ isCollapsed: true, errorAckIds: withNeedsYou(new Set(), new Set(["thr_c1"])) } as Partial<CardProps>);
+    expect(dot("thr_c1").innerHTML).toMatch(/bg-amber-500(?!\/)/);
+    cleanup();
+    renderCard({ isCollapsed: true });
+    expect(dot("thr_c1").innerHTML).not.toMatch(/bg-amber-500(?!\/)/);
+  });
+});

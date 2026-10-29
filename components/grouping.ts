@@ -81,11 +81,22 @@ export interface GroupingContext {
   groupNames?: ReadonlyMap<string, string>;
 }
 
+/**
+ * The error-ack set with Jira's Needs-you ids riding along (`withNeedsYou`):
+ * every lane, filter, family and card call site already passes errorAcks to
+ * threadState, so the Jira reason reaches all of them on that one route.
+ */
+export type StateAcks = ReadonlySet<string> & { readonly needsYou?: ReadonlySet<string> };
+
+/** Jira on: a copy of the acks carrying the Needs-you ids. No ids → the same acks object (upstream-identical). */
+export function withNeedsYou(errorAcks: ReadonlySet<string>, needsYou: ReadonlySet<string> | undefined): StateAcks {
+  if (needsYou === undefined || needsYou.size === 0) return errorAcks;
+  return Object.assign(new Set(errorAcks), { needsYou });
+}
+
 export function threadState(
   thread: PluginSidebarThread,
-  errorAcks?: ReadonlySet<string>,
-  /** Jira on: threads whose Jira record carries a reason (a nudge, deeper check or failed Done check). */
-  needsYou?: ReadonlySet<string>,
+  errorAcks?: StateAcks,
 ): ThreadState {
   // Attention outranks working: a turn that is paused waiting on the operator
   // (a pending interaction such as a secret request, or an unread error) still
@@ -102,9 +113,10 @@ export function threadState(
   // interaction is never ackable — a wait for the operator needs a real
   // answer, and lib/interaction-sync.ts would fight a fake clear.
   const errorAcked = errorAcks?.has(thread.id) === true;
+  // A Jira reason line (nudge, deeper check, failed Done check) needs the operator too.
   if (
     thread.hasPendingInteraction ||
-    needsYou?.has(thread.id) === true ||
+    errorAcks?.needsYou?.has(thread.id) === true ||
     (!errorAcked &&
       (thread.indicator === "unread-error" ||
         thread.indicator === "queued-failed" ||
@@ -508,11 +520,10 @@ export function columnFor(
   context: GroupingContext,
   now: number = Date.now(),
   errorAcks?: ReadonlySet<string>,
-  needsYou?: ReadonlySet<string>,
 ): { id: string; label: string } {
   if (groupBy === "none") return { id: "all", label: "Threads" };
   if (groupBy === "status") {
-    const state = threadState(thread, errorAcks, needsYou);
+    const state = threadState(thread, errorAcks);
     if (state !== "idle") return { id: state, label: THREAD_STATE_LABELS[state] };
     const age = now - thread.updatedAt;
     return ageBucketFor(age, IDLE_BUCKETS);
@@ -586,11 +597,6 @@ export function buildColumns(
    * into its state column (or nests quiet) instead of Needs you.
    */
   errorAcks: ReadonlySet<string> = new Set(),
-  /**
-   * Jira on: threads with a Jira reason line read as Needs you (threadState).
-   * Done threads never reach it: they form the Done column first.
-   */
-  needsYou?: ReadonlySet<string>,
 ): BoardColumn[] {
   // Threads marked Done form their own column, always farthest right on the
   // Attention board and present (dimmed) on every other grouping.
@@ -617,7 +623,7 @@ export function buildColumns(
       attentionColumns.get(thread.id) ??
         columnOverrides.get(thread.id) ??
         frozenColumns.get(thread.id) ??
-        columnFor(thread, groupBy, context, now, errorAcks, needsYou),
+        columnFor(thread, groupBy, context, now, errorAcks),
     );
   }
 

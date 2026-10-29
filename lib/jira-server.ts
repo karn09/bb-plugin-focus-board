@@ -128,7 +128,7 @@ export const jiraRpcContract = defineRpcContract({
       /** Give back only: set by the column's confirm dialog. */
       confirm: z.literal(true).optional(),
     }),
-    output: z.object({ ok: z.boolean(), error: z.string().optional(), alreadyQueued: z.literal(true).optional(), started: z.number().int().optional() }),
+    output: z.object({ ok: z.boolean(), error: z.string().optional(), alreadyQueued: z.literal(true).optional() }),
   },
 });
 
@@ -439,6 +439,34 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       }
       return { ok: true };
     });
+
+  // Every linked thread is Done but the ticket is open: the Done ticket update
+  // (lib/jira-done-check ticketUpdate), queued once. The Done-summary prefix
+  // keeps the per-thread Done dedupe matching it.
+  const fixAllDone = (key: string): Promise<ColumnResult> =>
+    onceQueued(
+      (ops) => ops.some((o) => "key" in o && o.key === key && ((o.op === "comment" && o.body.startsWith(DONE_SUMMARY_PREFIX)) || (o.op === "transition" && o.toCategory === "done"))),
+      async () => {
+        const { plan, links, threads, prs, snapshot } = await planWithInputs();
+        const t = snapshot?.tickets.find((x) => x.key === key);
+        if (!t || !plan.drift.some((d) => d.key === key && d.kind === "all-done-still-open")) return { ok: false, error: "no such drift" };
+        const ids = new Set(plan.autoLinks.filter((l) => l.key === key).map((l) => l.threadId));
+        const linked = threads.filter((x) => ids.has(x.id));
+        const roles = await Promise.all(linked.map(async (x) => (await store.readThread(x.id)).links.find((l) => l.key === key)?.role ?? "owner"));
+        const summary = doneSummary({
+          title: linked.map((x) => x.title).join(", "),
+          prUrls: livePrs(linked.map((x) => ({ id: x.id, done: x.done, prs: threadPrsOf(x, links[x.id] ?? [], prs) }))).map(prUrl),
+          childKeys: [],
+          skipped: false,
+        });
+        // Stale ticket data: comment only, never a blind transition.
+        const ops: NewQueueOp[] = (await store.readSnapshot()).stale
+          ? [{ op: "comment", key, body: summary, threadId: null }]
+          : ticketUpdate({ ticket: t, linkedThreadsDone: linked.map((x) => x.done), role: roles.includes("owner") ? "owner" : "watching", skipped: false, summary });
+        for (const op of ops) await store.enqueue(op);
+        return { ok: true };
+      },
+    );
 
   deps.onSettingsChange?.(() => {
     refreshCfg().catch(cfgFailed);
@@ -780,9 +808,13 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     return { loaded, map, set };
   };
   // "sent" set first, since its thread.active may arrive before sendIfIdle returns; "running" on that
-  // active, "replied" on the next rest. Kept until real activity: until then the thread's
-  // last activity is the one from before the nudge.
-  type NudgeTurn = { phase: "sent" | "running" | "replied"; lastActivityAt: number };
+  // active, "replied" on the next rest. Kept until real activity: until then the thread's last
+  // activity is the one from before the nudge (the nudge turn and its markUnread bump updatedAt),
+  // so the deeper check still counts from the pre-nudge quiet start. `at` is the nudge time.
+  type NudgeTurn = { phase: "sent" | "running" | "replied"; lastActivityAt: number; at: number };
+  const MARKER_TTL_MS = 3_600_000; // a sent/running marker older than this never captures a reply
+  const awaitingReply = (t: NudgeTurn | undefined): t is NudgeTurn =>
+    t !== undefined && (t.phase === "sent" || t.phase === "running") && Date.now() - t.at < MARKER_TTL_MS;
   const nudgeTurns = persisted<NudgeTurn>(NUDGE_TURNS_KEY);
   const snoozeSeen = persisted<number>(SNOOZE_SEEN_KEY);
   const nextSteps = persisted<z.infer<typeof NextStep>>(NEXT_STEPS_KEY);
@@ -797,8 +829,8 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     if (!cfg.enabled) return;
     await nudgeTurns.loaded;
     const t = nudgeTurns.map.get(threadId);
-    if (t?.phase === "sent") return void (await nudgeTurns.set(threadId, { ...t, phase: "running" })); // the nudge turn itself
-    if (t?.phase === "running") return;
+    if (awaitingReply(t) && t.phase === "sent") return void (await nudgeTurns.set(threadId, { ...t, phase: "running" })); // the nudge turn itself
+    // Anything else (a second active while running, a stale marker, after the reply) is real activity.
     if (t) await nudgeTurns.set(threadId, undefined);
     await clearReason(threadId);
   };
@@ -807,10 +839,16 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     if (!cfg.enabled) return;
     await nudgeTurns.loaded;
     const t = nudgeTurns.map.get(threadId);
-    if (!t || t.phase === "replied") return;
+    if (t === undefined || t.phase === "replied") return;
     await nudgeTurns.set(threadId, { ...t, phase: "replied" });
-    const line = replyLine(text);
-    if (line !== null) await perThread(threadId, () => store.writeThread(threadId, { reason: line }));
+    const line = awaitingReply(t) ? replyLine(text) : null;
+    if (line === null) return;
+    await perThread(threadId, async () => {
+      const cur = await store.readThread(threadId);
+      // A Done check started (or failed) since the nudge owns the reason line.
+      if (cur.verifying !== null || cur.doneCheck?.verdict === "fail") return;
+      await store.writeThread(threadId, { reason: line });
+    });
   };
   const logFail = (what: string) => (e: unknown) => warn(`jira reminders: ${what} failed: ${(e as Error).message}`);
   bb.events.on("thread.active", ({ thread }) => void onActive(thread.id).catch(logFail("activity")));
@@ -820,10 +858,9 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   /** One nudge: only an idle thread gets it; busy or a throw leaves it un-nudged for the next pass. */
   const nudge = async (threadId: string, lastActivityAt: number, unlinked: boolean): Promise<boolean> => {
     const prev = nudgeTurns.map.get(threadId);
-    await nudgeTurns.set(threadId, { phase: "sent", lastActivityAt });
+    await nudgeTurns.set(threadId, { phase: "sent", lastActivityAt, at: Date.now() });
     let r: "sent" | "busy" | "gone" = "busy";
     try {
-      await bb.sdk.threads.markUnread({ threadId }).catch(logFail(`markUnread on ${threadId}`));
       r = await sendIfIdle(bb.sdk.threads as never, threadId, NUDGE_TEXT, { log: warn });
     } catch (e) {
       warn(`jira: nudge on ${threadId} not sent, retrying next pass: ${(e as Error).message}`);
@@ -832,13 +869,20 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       await nudgeTurns.set(threadId, prev);
       return false;
     }
-    await perThread(threadId, () =>
-      store.updateThread(threadId, (cur) => ({
-        nudgedAt: isoNow(),
-        // A reply that already landed (or a Done check started since) keeps its reason.
-        ...(cur.verifying !== null || nudgeTurns.map.get(threadId)?.phase === "replied" ? {} : { reason: unlinked ? "no ticket yet" : "waiting on you" }),
-      })),
-    );
+    // Only after a sent turn: markUnread bumps updatedAt (the marker keeps the pre-nudge clock).
+    await bb.sdk.threads.markUnread({ threadId }).catch(logFail(`markUnread on ${threadId}`));
+    try {
+      await perThread(threadId, () =>
+        store.updateThread(threadId, (cur) => ({
+          nudgedAt: isoNow(),
+          // A reply that already landed (or a Done check started since) keeps its reason.
+          ...(cur.verifying !== null || nudgeTurns.map.get(threadId)?.phase === "replied" ? {} : { reason: unlinked ? "no ticket yet" : "waiting on you" }),
+        })),
+      );
+    } catch (e) {
+      // The marker still counts as nudged (pass input), so no second nudge.
+      warn(`jira: nudgedAt write on ${threadId} failed: ${(e as Error).message}`);
+    }
     return true;
   };
 
@@ -861,6 +905,8 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       const threads: ReminderThread[] = [];
       for (const row of await deps.reminderThreads()) {
         const rec = await store.readThread(row.id);
+        // Never enrolled (a thread new since the enable): enrolled now, so it gets the grace too.
+        if (rec.enrolledAt === null && !row.done) await store.updateThread(row.id, (cur) => (cur.enrolledAt === null ? { enrolledAt: isoNow() } : {}));
         const links = await deps.readLinks(row.id);
         const prs = threadPrsOf({ branch: row.branch }, links, allPrs);
         const missing = links.some((l) => l.tracker === "github" && l.kind === "pull" && !allPrs.some((p) => p.repo === l.repo && p.number === l.issue));
@@ -870,11 +916,13 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         const seen = snoozeSeen.map.get(row.id);
         if (snoozed && seen !== row.snoozeWakeAt) await snoozeSeen.set(row.id, row.snoozeWakeAt!);
         else if (!snoozed && seen !== undefined && seen > now) await snoozeSeen.set(row.id, now); // cleared early
-        const lastActivityAt = nudgeTurns.map.get(row.id)?.lastActivityAt ?? row.updatedAt;
+        const marker = nudgeTurns.map.get(row.id);
+        const lastActivityAt = marker?.lastActivityAt ?? row.updatedAt;
         facts.set(row.id, { rec, prs, missing, lastActivityAt });
         threads.push({
           id: row.id, archived: false, done: row.done, snoozed, status: row.status, verifying: rec.verifying !== null,
-          lastActivityAt, enrolledAt: ms(rec.enrolledAt), nudgedAt: ms(rec.nudgedAt), deepCheckedAt: ms(rec.deepCheckedAt),
+          // A marker is a sent nudge even when its nudgedAt write failed.
+          lastActivityAt, enrolledAt: ms(rec.enrolledAt), nudgedAt: ms(rec.nudgedAt) ?? marker?.at ?? null, deepCheckedAt: ms(rec.deepCheckedAt),
           snoozeWokeAt: snoozed ? null : (snoozeSeen.map.get(row.id) ?? null), linkedChangeAt: changes.length > 0 ? Math.max(...changes) : null,
         });
       }
@@ -985,17 +1033,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       if (!(await enabled())) return { ok: false, error: OFF };
       if (action === "fix") {
         if (kind === undefined) return { ok: false, error: "kind required" };
-        if (kind === "all-done-still-open") {
-          // The Done check (not a direct transition) on every linked thread not yet Done; its pass queues the ticket update.
-          let started = 0;
-          for (const { id } of await deps.liveLinks()) {
-            const rec = await store.readThread(id);
-            if (!rec.links.some((l) => l.key === key) || rec.verifying !== null || (await isDone(id))) continue;
-            await startDoneCheck(id);
-            started++;
-          }
-          return { ok: true, started };
-        }
+        if (kind === "all-done-still-open") return fixAllDone(key);
         if (kind === "stale-unlinked" && confirm !== true) return { ok: false, error: "confirm required" };
         return fixDrift(key, kind);
       }

@@ -11,7 +11,8 @@ import { deepCheckFindings, NUDGE_TEXT, planReminders, quietSince, replyLine, ty
 import { IDLE_JOBS_KEY } from "../lib/jira-idle";
 import { DONE_METADATA_KEY } from "../lib/done-metadata";
 import { sweepCandidatesForIdleColumn } from "../lib/sweep";
-import { buildColumns } from "../components/grouping";
+import { buildColumns, threadState, withNeedsYou } from "../components/grouping";
+import { assembleBoard } from "../components/nesting";
 import type { GhPr, JiraTicket } from "../lib/jira-schema";
 
 const DAY = 86_400_000;
@@ -38,7 +39,7 @@ describe("planReminders", () => {
   });
 
   it("10 eligible with cap 3: the 3 oldest, carried 7; the next pass takes the next 3", () => {
-    const threads = Array.from({ length: 10 }, (_, i) => rt(`t${i}`, { lastActivityAt: NOW - (3 * DAY + i * 60_000), enrolledAt: null }));
+    const threads = Array.from({ length: 10 }, (_, i) => rt(`t${i}`, { lastActivityAt: NOW - (3 * DAY + i * 60_000), enrolledAt: NOW - 30 * DAY }));
     const first = plan(threads, NOW);
     expect(first).toMatchObject({ nudge: ["t9", "t8", "t7"], carried: 7 });
     const after = threads.map((t) => (first.nudge.includes(t.id) ? { ...t, nudgedAt: NOW } : t));
@@ -53,13 +54,17 @@ describe("planReminders", () => {
     expect(plan([woke], NOW + DAY).nudge).toEqual(["a"]);
   });
 
+  it("a never-enrolled thread is not eligible yet (the pass enrolls it)", () => {
+    expect(plan([rt("a", { enrolledAt: null, lastActivityAt: NOW - 30 * DAY })])).toEqual({ nudge: [], deepCheck: [], carried: 0 });
+  });
+
   it("never touches archived, Done or verifying threads", () => {
     expect(plan([rt("a", { archived: true }), rt("b", { done: true }), rt("c", { verifying: true })])).toEqual({ nudge: [], deepCheck: [], carried: 0 });
   });
 
   it("day 5: in deepCheck and not re-nudged; deep-checked once per quiet stretch", () => {
     const start = NOW - 5 * DAY;
-    const t = rt("a", { lastActivityAt: start, enrolledAt: null, nudgedAt: start + 2 * DAY });
+    const t = rt("a", { lastActivityAt: start, enrolledAt: start - DAY, nudgedAt: start + 2 * DAY });
     expect(plan([t])).toEqual({ nudge: [], deepCheck: ["a"], carried: 0 });
     expect(plan([{ ...t, deepCheckedAt: NOW }], NOW + DAY)).toEqual({ nudge: [], deepCheck: [], carried: 0 });
     // New activity starts a new stretch: nudged again 2 days later.
@@ -126,13 +131,32 @@ describe("Needs you lane", () => {
   const ctx = { projects: [], providers: [] };
   const lanes = (needsYou?: ReadonlySet<string>, done: ReadonlySet<string> = new Set()) =>
     Object.fromEntries(
-      buildColumns([th("a"), th("b")], "status", ctx, new Map(), done, NOW, {}, new Map(), new Map(), new Set(), needsYou).map((c) => [c.id, c.threads.map((t) => t.id)]),
+      buildColumns([th("a"), th("b")], "status", ctx, new Map(), done, NOW, {}, new Map(), new Map(), withNeedsYou(new Set(), needsYou)).map((c) => [c.id, c.threads.map((t) => t.id)]),
     );
   it("a reason (not Done) counts as attention; Done stays Done; no set → upstream lanes", () => {
     expect(lanes(new Set(["a"]))).toMatchObject({ attention: ["a"], "idle-earlier": ["b"] });
     expect(lanes(new Set(["a"]), new Set(["a"]))).toMatchObject({ done: ["a"] });
     expect(lanes()).toEqual(lanes(new Set()));
     expect(lanes().attention).toBeUndefined();
+  });
+  it("withNeedsYou: no ids → the same acks object; acks keep their meaning", () => {
+    const acks = new Set(["x"]);
+    expect(withNeedsYou(acks, undefined)).toBe(acks);
+    expect(withNeedsYou(acks, new Set())).toBe(acks);
+    const both = withNeedsYou(acks, new Set(["a"]));
+    expect([...both]).toEqual(["x"]);
+    expect(threadState(th("a"), both)).toBe("attention");
+    expect(threadState(th("b"), both)).toBe("idle");
+  });
+  it("a nested child with a reason leaves the family's rows for Needs you (the family lands there too)", () => {
+    const parent = th("p");
+    const child = { ...th("c"), parentThreadId: "p" } as PluginSidebarThread;
+    const quiet = assembleBoard([parent, child], "status", ctx, new Map(), new Set(), NOW, {});
+    expect(quiet.nestedChildrenByParent.get("p")?.map((t) => t.id)).toEqual(["c"]);
+    expect(quiet.columns.find((c) => c.id === "attention")).toBeUndefined();
+    const flagged = assembleBoard([parent, child], "status", ctx, new Map(), new Set(), NOW, { errorAcks: withNeedsYou(new Set(), new Set(["c"])) });
+    expect(flagged.nestedChildrenByParent.get("p") ?? []).toEqual([]);
+    expect(flagged.columns.find((c) => c.id === "attention")?.threads.map((t) => t.id)).toContain("c");
   });
 });
 
@@ -157,10 +181,15 @@ describe("reminders on a fake host", () => {
   const updatedAt = new Map<string, number>();
   let send: ReturnType<typeof vi.fn>;
   let markUnread: ReturnType<typeof vi.fn>;
+  let failWrite: ((set: Record<string, any> | undefined) => boolean) | null = null;
 
-  async function load(opts: { enabled?: boolean; snapshot?: object | null } = {}) {
+  async function load(opts: { enabled?: boolean; snapshot?: object | null; kv?: Record<string, unknown> } = {}) {
     send = vi.fn(async () => ({}));
-    markUnread = vi.fn(async () => ({}));
+    // The real host bumps updatedAt on markUnread.
+    markUnread = vi.fn(async ({ threadId }: { threadId: string }) => {
+      updatedAt.set(threadId, Date.now());
+      return {};
+    });
     const row = (id: string) =>
       makeThreadResponse({ id, title: `title ${id}`, status: (status.get(id) ?? "idle") as never, updatedAt: updatedAt.get(id) ?? Date.now(), environmentBranchName: null } as never);
     const host = createFakePluginHost({
@@ -174,6 +203,7 @@ describe("reminders on a fake host", () => {
           markUnread,
           getPluginMetadata: async ({ threadId }: { threadId: string }) => metadata.get(threadId) ?? {},
           updatePluginMetadata: async ({ threadId, set, remove }: { threadId: string; set?: Record<string, unknown>; remove?: string[] }) => {
+            if (failWrite?.(set)) throw new Error("metadata write failed");
             const next = { ...(metadata.get(threadId) ?? {}), ...(set ?? {}) };
             for (const k of remove ?? []) delete next[k];
             metadata.set(threadId, next);
@@ -186,11 +216,14 @@ describe("reminders on a fake host", () => {
     bb = host.bb;
     await bb.storage.kv.set("jira:enabled-seen", true);
     if (opts.snapshot !== null) await bb.storage.kv.set("jira:snapshot", opts.snapshot ?? snap());
+    for (const [k, v] of Object.entries(opts.kv ?? {})) await bb.storage.kv.set(k, v);
     await server(bb);
     await flush();
   }
   afterEach(async () => {
     await harness.lifecycle.dispose();
+    vi.useRealTimers();
+    failWrite = null;
     metadata.clear();
     status.clear();
     updatedAt.clear();
@@ -238,6 +271,7 @@ describe("reminders on a fake host", () => {
     send.mockRejectedValueOnce(busy409());
     await tick();
     expect(jiraOf("t1").nudgedAt).toBeNull();
+    expect(markUnread).not.toHaveBeenCalled(); // a running thread is not marked unread (nor its clock restarted)
     expect(((await bb.storage.kv.get(IDLE_JOBS_KEY)) as unknown[] | undefined) ?? []).toEqual([]);
     await tick();
     expect(send).toHaveBeenCalledTimes(2);
@@ -250,7 +284,9 @@ describe("reminders on a fake host", () => {
     send.mockRejectedValueOnce(new Error("boom"));
     await tick();
     expect(jiraOf("t1").nudgedAt).toBeNull();
-    await tick();
+    expect(markUnread).not.toHaveBeenCalled();
+    await tick(); // resent on the very next tick (the quiet clock did not restart)
+    expect(send).toHaveBeenCalledTimes(2);
     expect(jiraOf("t1").nudgedAt).toEqual(expect.any(String));
   });
 
@@ -305,6 +341,9 @@ describe("reminders on a fake host", () => {
     delete metadata.get("t1")!.snooze; // woke (or cleared) now
     await tick();
     expect(send).not.toHaveBeenCalled();
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * DAY + 60_000 }); // wake + nudgeDays
+    await tick();
+    expect(sentTo()).toEqual(["t1"]);
   });
 
   it("day 5: the deep check writes findings plugin-side, no turn; the board gets the next step", async () => {
@@ -348,16 +387,84 @@ describe("reminders on a fake host", () => {
     expect(jiraOf("t1").reason).toBeNull();
   });
 
-  it("drift fix all-done-still-open starts the Done check on linked threads not Done and not verifying", async () => {
-    seed("a", 1);
-    seed("b", 1);
-    seed("c", 1, { verifying: { startedAt: iso(Date.now()) } });
-    metadata.get("b")![DONE_METADATA_KEY] = { doneAt: iso(Date.now()) };
-    status.set("a", "active"); // stays verifying until idle
+  it("a sent nudge at day 2 (markUnread bumps updatedAt): the deep check still comes at day 5, not 7", async () => {
+    seed("t1", 2);
     await load();
-    const r = await harness.behavior.callRpc("jira_column_action", { action: "fix", key: "PT-1", kind: "all-done-still-open" });
-    expect(r).toEqual({ ok: true, started: 1 });
-    expect(jiraOf("a").verifying).toMatchObject({ startedAt: expect.any(String) });
-    expect(jiraOf("b").verifying).toBeNull();
+    await tick();
+    expect(sentTo()).toEqual(["t1"]);
+    expect(updatedAt.get("t1")).toBeGreaterThan(Date.now() - 60_000); // bumped by markUnread
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 3 * DAY + 60_000 });
+    await tick();
+    expect(jiraOf("t1").deepCheckedAt).toEqual(expect.any(String));
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("a reply after a Done check started (or failed) is not written over its reason", async () => {
+    seed("t1", 3);
+    await load();
+    await tick();
+    expect(await harness.behavior.callRpc("jira_card_action", { kind: "run-done-check", threadId: "t1" })).toEqual({ ok: true });
+    expect(jiraOf("t1").verifying).not.toBeNull();
+    await harness.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "t1" }), lastAssistantText: "my nudge reply" });
+    await flush();
+    expect(jiraOf("t1").reason).not.toBe("my nudge reply");
+  });
+
+  it("the nudgedAt write failing after a sent nudge: logged, and no second nudge", async () => {
+    seed("t1", 3);
+    await load();
+    failWrite = (set) => typeof set?.jira?.nudgedAt === "string";
+    await tick();
+    failWrite = null;
+    expect(jiraOf("t1").nudgedAt).toBeNull();
+    await tick();
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("a second thread.active while the nudge runs is real activity: marker gone, reason cleared, no capture", async () => {
+    seed("t1", 3);
+    await load();
+    await tick();
+    await harness.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "t1" }) }); // the nudge turn
+    await flush();
+    await harness.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "t1" }) }); // the operator's turn
+    await flush();
+    expect(jiraOf("t1").reason).toBeNull();
+    await harness.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "t1" }), lastAssistantText: "operator turn output" });
+    await flush();
+    expect(jiraOf("t1").reason).toBeNull();
+    expect(((await bb.storage.kv.get("jira:nudge-turns")) as Record<string, unknown>).t1).toBeUndefined();
+  });
+
+  it("a stale sent marker (over an hour) never captures a reply", async () => {
+    seed("t1", 3, { nudgedAt: iso(Date.now() - 2 * 3_600_000) });
+    await load({ kv: { "jira:nudge-turns": { t1: { phase: "sent", lastActivityAt: Date.now() - 3 * DAY, at: Date.now() - 2 * 3_600_000 } } } });
+    await harness.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "t1" }), lastAssistantText: "some later turn" });
+    await flush();
+    expect(jiraOf("t1").reason).toBeNull();
+  });
+
+  it("a never-enrolled thread is enrolled by the pass and nudged only after the grace", async () => {
+    updatedAt.set("t1", Date.now() - 30 * DAY);
+    metadata.set("t1", {}); // no Jira record at all
+    await load();
+    await tick();
+    expect(send).not.toHaveBeenCalled();
+    expect(jiraOf("t1").enrolledAt).toEqual(expect.any(String));
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * DAY + 60_000 });
+    await tick();
+    expect(sentTo()).toEqual(["t1"]);
+  });
+
+  it("CLI sweep with Jira on: the long-idle arm proposes nothing; Done archiving unchanged", async () => {
+    updatedAt.set("idle", Date.now() - 40 * DAY);
+    metadata.set("idle", {});
+    updatedAt.set("old-done", Date.now() - 40 * DAY);
+    metadata.set("old-done", { [DONE_METADATA_KEY]: { doneAt: iso(Date.now() - 10 * DAY) } });
+    await load();
+    const r = await harness.behavior.runCli(["sweep"]);
+    expect(r.stdout).toContain("old-done");
+    expect(r.stdout).not.toMatch(/\bidle\b.*idle longer/);
+    expect(r.stdout).not.toContain("idle longer than");
   });
 });

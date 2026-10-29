@@ -117,11 +117,35 @@ describe("jira_column_action", () => {
     expect((ops[1] as { body: string }).body).not.toMatch(/[`$|;&]/);
   });
 
-  it("fix refuses drift that is not there; all-done-still-open with no open linked thread starts nothing", async () => {
+  it("fix refuses drift that is not there (all-done-still-open too)", async () => {
     await load({ jiraEnabled: true });
     expect(await act({ action: "fix", key: "PT-3570", kind: "todo-with-prs" })).toEqual({ ok: false, error: "no such drift" });
-    expect(await act({ action: "fix", key: "PT-3570", kind: "all-done-still-open" })).toEqual({ ok: true, started: 0 });
+    expect(await act({ action: "fix", key: "PT-3570", kind: "all-done-still-open" })).toEqual({ ok: false, error: "no such drift" });
     expect(await queue()).toEqual([]);
+  });
+
+  it("fix all-done-still-open: the Done ticket update (summary comment + transition done), queued once", async () => {
+    await load({ jiraEnabled: true });
+    metadata.set("pg", { done: { doneAt: "2026-10-29T10:00:00Z" } });
+    expect(await act({ action: "fix", key: "PT-3879", kind: "all-done-still-open" })).toEqual({ ok: true });
+    const ops = await queue();
+    expect(ops).toEqual([
+      expect.objectContaining({ op: "comment", key: "PT-3879", body: expect.stringMatching(/^Focus Board: thread "Module cleanup follow-up" is Done\./) }),
+      expect.objectContaining({ op: "transition", key: "PT-3879", toCategory: "done" }),
+    ]);
+    expect((ops[0] as { body: string }).body).toContain("https://github.com/growtherapy/infra/pull/42");
+    expect(await act({ action: "fix", key: "PT-3879", kind: "all-done-still-open" })).toEqual({ ok: true, alreadyQueued: true });
+    expect(await queue()).toHaveLength(2);
+  });
+
+  it("fix all-done-still-open on a watched ticket: comment only", async () => {
+    await load({ jiraEnabled: true });
+    metadata.set("pg", { done: { doneAt: "2026-10-29T10:00:00Z" }, jira: {
+      links: [{ key: "PT-3879", role: "watching", source: "agent" }], enrolledAt: null, verifying: null, doneCheck: null,
+      nudgedAt: null, deepCheckedAt: null, reason: null, checkInWith: null,
+    } });
+    expect(await act({ action: "fix", key: "PT-3879", kind: "all-done-still-open" })).toEqual({ ok: true });
+    expect((await queue()).map((o) => o.op)).toEqual(["comment"]);
   });
 
   it("Give back without confirm queues nothing", async () => {

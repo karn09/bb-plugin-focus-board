@@ -48,6 +48,7 @@ import {
   NO_GROUP_BUCKET,
   parseStoredStateFilter,
   threadState,
+  withNeedsYou,
   withJiraColumn,
 } from "./components/grouping";
 import { staleErrorAckIds } from "./lib/error-ack-metadata";
@@ -579,6 +580,17 @@ function BoardPage({ subPath }: { subPath: string }) {
       },
     }),
     [jiraState, jiraRpc, refetchJira],
+  );
+  // Jira on: a card with a reason line (nudge, deeper check, failed Done check)
+  // reads as Needs you. It rides the error-ack set (grouping.ts StateAcks) to
+  // every lane, family, filter and card-state call site; off → errorAckIds itself.
+  const stateAcks = useMemo(
+    () =>
+      withNeedsYou(
+        errorAckIds,
+        jiraState.enabled ? new Set(Object.keys(jiraState.threads).filter((id) => jiraState.threads[id]!.reason !== null)) : undefined,
+      ),
+    [errorAckIds, jiraState.enabled, jiraState.threads],
   );
   // The ack signal mirrors done-changed: every open board refetches the set
   // so a Clear error (menu, or any later surface) converges everywhere.
@@ -1681,9 +1693,9 @@ function BoardPage({ subPath }: { subPath: string }) {
   const familyFiltered = useMemo(
     () =>
       nestChildren || groupBy === "parent"
-        ? filterFamilies(nonHiddenThreads, familyIndex, filter, search.trim(), projectNameFor, ticketRefsFor, groupNameFor, groupsByThread, Date.now(), errorAckIds)
-        : filterIndividually(nonHiddenThreads, filter, search.trim(), projectNameFor, ticketRefsFor, groupNameFor, groupsByThread, Date.now(), errorAckIds),
-    [nestChildren, groupBy, nonHiddenThreads, familyIndex, filter, search, projectNameFor, ticketRefsFor, groupNameFor, groupsByThread, errorAckIds],
+        ? filterFamilies(nonHiddenThreads, familyIndex, filter, search.trim(), projectNameFor, ticketRefsFor, groupNameFor, groupsByThread, Date.now(), stateAcks)
+        : filterIndividually(nonHiddenThreads, filter, search.trim(), projectNameFor, ticketRefsFor, groupNameFor, groupsByThread, Date.now(), stateAcks),
+    [nestChildren, groupBy, nonHiddenThreads, familyIndex, filter, search, projectNameFor, ticketRefsFor, groupNameFor, groupsByThread, stateAcks],
   );
   // The feature-group plan (issue #86's split default): which groups render
   // a box, and each member's box identity. The plan claims NO lane —
@@ -1723,11 +1735,6 @@ function BoardPage({ subPath }: { subPath: string }) {
   const placedDoneIds = useMemo(
     () => boardDoneIds(doneIds, jiraState.enabled, jiraState.threads),
     [doneIds, jiraState.enabled, jiraState.threads],
-  );
-  // Jira on: a card with a reason line (nudge, deeper check, failed Done check) reads as Needs you.
-  const jiraNeedsYou = useMemo(
-    () => (jiraState.enabled ? new Set(Object.keys(jiraState.threads).filter((id) => jiraState.threads[id]!.reason !== null)) : undefined),
-    [jiraState.enabled, jiraState.threads],
   );
   const groupBoxPlan = useMemo(
     () =>
@@ -1774,10 +1781,10 @@ function BoardPage({ subPath }: { subPath: string }) {
     if (paneLaneCapture !== null) laneFreezes.push(paneLaneCapture);
     for (const capture of hoverLaneCapturesRef.current.values()) laneFreezes.push(capture);
     return applyLaneFreezes(
-      buildParentLanes(searched, placedDoneIds, Date.now(), doneTimes, errorAckIds),
+      buildParentLanes(searched, placedDoneIds, Date.now(), doneTimes, stateAcks),
       laneFreezes,
     );
-  }, [isParentGroupBy, searched, placedDoneIds, doneTimes, errorAckIds, paneLaneCapture, hoverRebuildEpoch]);
+  }, [isParentGroupBy, searched, placedDoneIds, doneTimes, stateAcks, paneLaneCapture, hoverRebuildEpoch]);
   const parentLaneChildrenByParent = useMemo(
     () => (isParentGroupBy ? familyIndex.childrenByParent : new Map<string, readonly PluginSidebarThread[]>()),
     [isParentGroupBy, familyIndex],
@@ -1792,10 +1799,9 @@ function BoardPage({ subPath }: { subPath: string }) {
         ...(paneCapture !== null && paneCapture.view === groupBy ? [paneCapture] : []),
         ...[...hoverCapturesRef.current.values()].filter((capture) => capture.view === groupBy),
       ]),
-      errorAcks: errorAckIds,
-      needsYou: jiraNeedsYou,
+      errorAcks: stateAcks,
     });
-  }, [isParentGroupBy, searched, groupBy, groupContext, placedDoneIds, nestChildren, ranks, doneTimes, paneCapture, errorAckIds, hoverRebuildEpoch, jiraNeedsYou]);
+  }, [isParentGroupBy, searched, groupBy, groupContext, placedDoneIds, nestChildren, ranks, doneTimes, paneCapture, stateAcks, hoverRebuildEpoch]);
   const columns = assembly?.columns ?? [];
   // The map that actually renders as nested rows (nesting rules applied, so a
   // promoted, un-nested, or cross-axis child is absent — expanding the card
@@ -2062,7 +2068,7 @@ function BoardPage({ subPath }: { subPath: string }) {
     const parts: string[] = [`pane:${openThreadId ?? "closed"}`];
     const paint = (thread: PluginSidebarThread) => {
       parts.push(
-        `${thread.id}:${threadState(thread, errorAckIds)}${doneIds.has(thread.id) ? ":done" : ""}`,
+        `${thread.id}:${threadState(thread, stateAcks)}${doneIds.has(thread.id) ? ":done" : ""}`,
       );
     };
     for (const column of columns) {
@@ -2088,7 +2094,7 @@ function BoardPage({ subPath }: { subPath: string }) {
       }
     }
     return parts.join(",");
-  }, [visibleRefKey, columns, nestedChildrenByParent, parentLanes, openThreadId, errorAckIds, doneIds, assembly]);
+  }, [visibleRefKey, columns, nestedChildrenByParent, parentLanes, openThreadId, stateAcks, doneIds, assembly]);
   // Text-ref hrefs across visible threads, the tracker_validate batch (the
   // chip rule: a #N/URL in text chips only when the item is confirmed).
   // Sorted-join mirrors visibleRefKey: cheap string equality as the effect
@@ -3502,7 +3508,7 @@ function BoardPage({ subPath }: { subPath: string }) {
             lanes={parentLanes ?? []}
             activeThreadId={openThreadId}
             doneIds={doneIds}
-            errorAckIds={errorAckIds}
+            errorAckIds={stateAcks}
             dimmedIds={dimmedIds}
             childrenByParent={parentLaneChildrenByParent}
             projectNameFor={projectNameFor}
@@ -3551,7 +3557,7 @@ function BoardPage({ subPath }: { subPath: string }) {
             motionPacing={motionPacing}
             laneDirection={laneDirection}
             doneIds={doneIds}
-            errorAckIds={errorAckIds}
+            errorAckIds={stateAcks}
             nestedChildrenByParent={nestedChildrenByParent}
             childCountByParent={assembly?.childCountByParent ?? new Map()}
             doneChildrenByParent={assembly?.doneChildrenByParent ?? new Map()}
