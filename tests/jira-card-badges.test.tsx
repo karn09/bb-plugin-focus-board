@@ -47,4 +47,10 @@ describe("JiraCardBadges", () => {
     render(<JiraCardBadges {...props} pendingOps={[op]} record={rec()} />);
     expect(screen.getByText("pending")).toBeTruthy();
   });
+  it("no stale marker when fresh; no pending marker for another key", () => {
+    const op = { id: "o", createdAt: "", threadId: null, op: "comment" as const, key: "PT-2", body: "x" };
+    render(<JiraCardBadges {...props} pendingOps={[op]} record={rec()} />);
+    expect(screen.queryByText("stale")).toBeNull();
+    expect(screen.queryByText("pending")).toBeNull();
+  });
 });

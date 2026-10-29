@@ -74,6 +74,15 @@ describe("jira_board_state / jira_card_action", () => {
     expect(await harness.behavior.callRpc("jira_card_action", { kind: "find-ticket", threadId: "t1" })).toEqual({ ok: false, error: "not yet" });
   });
 
+  it("card action: off -> error and no write; unknown thread -> error", async () => {
+    await load({ jiraEnabled: false });
+    expect(await harness.behavior.callRpc("jira_card_action", { kind: "clear-check-in", threadId: "t1" })).toEqual({ ok: false, error: expect.stringContaining("Jira is off") });
+    expect((metadata.get("t1")!.jira as { checkInWith: unknown }).checkInWith).toBe("Sam");
+    await harness.behavior.setSettings({ jiraEnabled: true });
+    expect(await harness.behavior.callRpc("jira_card_action", { kind: "clear-check-in", threadId: "nope" })).toEqual({ ok: false, error: "unknown thread" });
+    expect(metadata.has("nope")).toBe(false);
+  });
+
   it("ingest, enqueue, ack and thread writes publish jira-changed", async () => {
     await load({ jiraEnabled: true });
     const changed = () => harness.inspection.realtimeSignals.filter((s) => s.channel === "jira-changed").length;
@@ -82,11 +91,12 @@ describe("jira_board_state / jira_card_action", () => {
     expect(changed()).toBe(before);
     const { createJiraStore } = await import("../lib/jira-store");
     let n = 0;
-    const s = createJiraStore({ get: async () => null, set: async () => {} }, { getPluginMetadata: async () => ({}), updatePluginMetadata: async () => {} }, Date.now, { onChange: () => { n++; } });
+    const kv = new Map<string, unknown>();
+    const s = createJiraStore({ get: async (k) => kv.get(k) ?? null, set: async (k, v) => void kv.set(k, v) }, { getPluginMetadata: async () => ({}), updatePluginMetadata: async () => {} }, Date.now, { onChange: () => { n++; } });
     const op = await s.enqueue({ op: "comment", key: "PT-1", body: "x", threadId: null });
     await s.ingestSnapshot(snap(0));
     await s.writeThread("t1", { reason: "r" });
     await s.ack([{ id: op.id, ok: true, error: null, createdKey: null }]);
-    expect(n).toBe(3); // ack of an op not in this store's kv is a no-op
+    expect(n).toBe(4); // enqueue, ingest, thread write, ack of the queued op
   });
 });

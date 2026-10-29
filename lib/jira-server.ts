@@ -296,7 +296,9 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     },
     // Later tasks (9-11) wire the other kinds; "find-ticket" will go through sendIfIdle.
     jira_card_action: async ({ kind, threadId }) => {
+      if (!(await enabled())) return { ok: false, error: OFF };
       if (kind !== "clear-check-in") return { ok: false, error: "not yet" };
+      if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread" };
       await store.writeThread(threadId, { checkInWith: null });
       return { ok: true };
     },
