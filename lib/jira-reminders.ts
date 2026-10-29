@@ -57,7 +57,7 @@ export type DeepNext = "done-check" | "open-pr" | "snooze";
 
 /** The day-m findings: one reason line and its one-click next step. */
 export function deepCheckFindings(input: {
-  links: { key: string }[];
+  links: { key: string; role: "owner" | "watching" }[];
   snapshot: { stale: boolean; tickets: JiraTicket[] } | null;
   prs: GhPr[];
   mentions: JiraSnapshot["mentions"];
@@ -76,7 +76,9 @@ export function deepCheckFindings(input: {
     const parts = [...(merged ? ["All PRs merged"] : []), ...(resolved ? [`${tickets.map((t) => t.key).join(", ")} resolved`] : [])];
     return { reason: parts.join(" · "), next: "done-check" };
   }
-  const moved = tickets.find((t) => t.statusCategory !== "done" && t.assignee !== null && t.assignee.accountId !== input.me);
+  // A watched ticket is someone else's by design: only an owned one can be "reassigned".
+  const owned = new Set(input.links.filter((l) => l.role === "owner").map((l) => l.key));
+  const moved = tickets.find((t) => owned.has(t.key) && t.statusCategory !== "done" && t.assignee !== null && t.assignee.accountId !== input.me);
   if (moved) return { reason: `${moved.key} reassigned to ${moved.assignee!.displayName}`, next: "snooze" };
   for (const p of live) {
     if (p.state !== "open") continue;

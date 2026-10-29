@@ -87,7 +87,7 @@ const ticket = (over: Partial<JiraTicket> = {}): JiraTicket => ({
 });
 
 describe("deepCheckFindings", () => {
-  const links = [{ key: "PT-9" }];
+  const links = [{ key: "PT-9", role: "owner" as const }];
   const f = (over: Partial<Parameters<typeof deepCheckFindings>[0]> = {}) =>
     deepCheckFindings({ links, snapshot: { stale: false, tickets: [ticket()] }, prs: [], mentions: [], me: "me", ...over });
   it("all PRs merged and the ticket resolved → Run Done check", () => {
@@ -103,6 +103,11 @@ describe("deepCheckFindings", () => {
   });
   it("reassigned", () => {
     expect(f({ snapshot: { stale: false, tickets: [ticket({ assignee: { accountId: "x", displayName: "Ana" }, assignedToMe: false })] } }).reason).toBe("PT-9 reassigned to Ana");
+  });
+  it("reassigned only for owner links: a watched ticket owned by someone else is not news", () => {
+    const other = { stale: false, tickets: [ticket({ assignee: { accountId: "x", displayName: "Ana" }, assignedToMe: false })] };
+    expect(f({ links: [{ key: "PT-9", role: "watching" as const }], snapshot: other }).reason).toBe("No change in linked PRs or tickets");
+    expect(f({ links: [{ key: "PT-9", role: "owner" as const }], snapshot: other }).reason).toBe("PT-9 reassigned to Ana");
   });
   it("changes requested / CI failing → Open PR", () => {
     expect(f({ prs: [pr(4, { reviewDecision: "changes_requested" })] })).toMatchObject({ reason: "PR #4: changes requested", next: "open-pr", prUrl: "https://github.com/o/r/pull/4" });
@@ -363,9 +368,12 @@ describe("reminders on a fake host", () => {
     expect(state.next.t1).toMatchObject({ next: "done-check", reason: "PT-1 resolved" });
   });
 
-  it("a stale snapshot: PR status unavailable, next snooze", async () => {
+  it("a board-linked PR missing from the snapshot: PR status unavailable, next snooze", async () => {
     seed("t1", 6, { nudgedAt: iso(Date.now() - 4 * DAY) });
-    await load({ snapshot: snap({ takenAt: iso(Date.now() - DAY) }) });
+    metadata.get("t1")!.linkedIssues = [
+      { tracker: "github", repo: "o/r", issue: 4, kind: "pull", href: "https://github.com/o/r/pull/4", createdAt: "2026-10-29T00:00:00Z", source: "operator" },
+    ];
+    await load();
     await tick();
     expect(jiraOf("t1").reason).toBe("PR status unavailable");
     const state = (await harness.behavior.callRpc("jira_board_state", null)) as { next: Record<string, { next: string }> };
@@ -503,4 +511,50 @@ describe("reminders on a fake host", () => {
     failWrite = null;
     expect(sentTo()).toEqual(["quiet"]);
   });
+  // ---- final review fix wave ----
+
+  it("re-enabled with a stale enrolledAt: a tick before the enable reset lands nudges nothing and deep-checks nothing", async () => {
+    seed("quiet", 3);
+    seed("deep", 6, { nudgedAt: iso(Date.now() - 4 * DAY) });
+    failWrite = () => true; // the enable apply's enrollment reset fails, so it never completes
+    await load({ kv: { "jira:enabled-seen": false } });
+    failWrite = null;
+    expect(await bb.storage.kv.get("jira:enabled-seen")).toBe(false);
+    await tick();
+    expect(send).not.toHaveBeenCalled();
+    expect(jiraOf("deep").deepCheckedAt).toBeNull();
+  });
+
+  it("a failed Done check whose reason activity cleared rejoins the reminders", async () => {
+    seed("t1", 3, { reason: null, doneCheck: { at: iso(Date.now() - 3 * DAY), verdict: "fail", reasons: ["PR #8 still open"] } });
+    await load();
+    await tick();
+    expect(sentTo()).toEqual(["t1"]);
+    expect(jiraOf("t1").reason).toBe("waiting on you");
+  });
+
+  it("a Done check that starts between the plan and the send: the nudge is skipped", async () => {
+    seed("older", 3.1);
+    seed("t2", 3);
+    await load();
+    send.mockImplementationOnce(async () => {
+      metadata.set("t2", { jira: { ...jiraOf("t2"), verifying: { startedAt: iso(Date.now()) } } });
+      return {};
+    });
+    await tick();
+    expect(sentTo()).toEqual(["older"]);
+    expect(jiraOf("t2").nudgedAt).toBeNull();
+  });
+
+  it("a stale snapshot at day 5: nothing written, the deep check retries on the next pass", async () => {
+    seed("t1", 6, { nudgedAt: iso(Date.now() - 4 * DAY) });
+    await load({ snapshot: snap({ takenAt: iso(Date.now() - DAY) }) });
+    await tick();
+    expect(jiraOf("t1")).toMatchObject({ deepCheckedAt: null, reason: null });
+    expect(send).not.toHaveBeenCalled();
+    await bb.storage.kv.set("jira:snapshot", snap({ tickets: [ticket({ key: "PT-1", statusCategory: "done" })] }));
+    await tick();
+    expect(jiraOf("t1")).toMatchObject({ deepCheckedAt: expect.any(String), reason: "PT-1 resolved" });
+  });
 });
+

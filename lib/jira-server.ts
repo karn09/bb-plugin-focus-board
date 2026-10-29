@@ -848,6 +848,8 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   const snoozeSeen = persisted<number>(SNOOZE_SEEN_KEY);
   const nextSteps = persisted<z.infer<typeof NextStep>>(NEXT_STEPS_KEY);
 
+  /** A failed Done check owns the card while its reason shows; once activity clears the reason, normal reminders resume. */
+  const checkHolds = (r: ThreadJiraRecord) => r.verifying !== null || (r.doneCheck?.verdict === "fail" && r.reason !== null);
   /** New activity or an operator click: the reason line goes (never mid-check). */
   const clearReason = (threadId: string) =>
     perThread(threadId, async () => {
@@ -875,7 +877,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     await perThread(threadId, async () => {
       const cur = await store.readThread(threadId);
       // A Done check started (or failed) since the nudge owns the reason line.
-      if (cur.verifying !== null || cur.doneCheck?.verdict === "fail") return;
+      if (checkHolds(cur)) return;
       await store.writeThread(threadId, { reason: line });
     });
   };
@@ -905,7 +907,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         store.updateThread(threadId, (cur) => ({
           nudgedAt: isoNow(),
           // A reply that already landed (or a Done check started since) keeps its reason.
-          ...(cur.verifying !== null || cur.doneCheck?.verdict === "fail" || nudgeTurns.map.get(threadId)?.phase === "replied"
+          ...(checkHolds(cur) || nudgeTurns.map.get(threadId)?.phase === "replied"
             ? {}
             : { reason: unlinked ? "no ticket yet" : "waiting on you" }),
         })),
@@ -929,6 +931,8 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     try {
       const s = jiraSettings(await deps.settings());
       if (!s.enabled || !deps.reminderThreads) return;
+      // Not until the enable's reconcile (the enrollment reset) has landed: a stale enrolledAt would nudge at once.
+      if ((await bb.storage.kv.get(ENABLED_SEEN_KEY)) !== true) return;
       await Promise.all([nudgeTurns.loaded, snoozeSeen.loaded, nextSteps.loaded]);
       const now = Date.now();
       const { snapshot, stale } = await store.readSnapshot();
@@ -959,7 +963,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         facts.set(row.id, { rec, prs, missing, lastActivityAt });
         threads.push({
           id: row.id, archived: false, done: row.done, snoozed, status: row.status, verifying: rec.verifying !== null,
-          checkFailed: rec.doneCheck?.verdict === "fail",
+          checkFailed: rec.doneCheck?.verdict === "fail" && rec.reason !== null,
           // The later of the record's and the marker's nudge: a marker is a sent nudge even when its nudgedAt write failed.
           lastActivityAt, enrolledAt: ms(rec.enrolledAt), nudgedAt: laterOf(ms(rec.nudgedAt), marker?.at), deepCheckedAt: ms(rec.deepCheckedAt),
           snoozeWokeAt: snoozed ? null : (snoozeSeen.map.get(row.id) ?? null), linkedChangeAt: changes.length > 0 ? Math.max(...changes) : null,
@@ -968,17 +972,19 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       // Uncapped here: the cap counts sent turns, so a busy thread does not use a slot.
       const plan = planReminders({ threads, now, nudgeDays: s.nudgeDays, deepCheckDays: s.deepCheckDays, cap: Number.POSITIVE_INFINITY });
       for (const id of plan.deepCheck) {
+        // Stale or missing ticket data: write nothing, so the check runs again on a later pass.
+        if (snapshot === null || stale) continue;
         const f = facts.get(id)!;
         const found = deepCheckFindings({
           links: f.rec.links,
-          snapshot: snapshot && { stale: stale || f.missing, tickets: snapshot.tickets },
+          snapshot: { stale: f.missing, tickets: snapshot.tickets },
           prs: f.prs,
-          mentions: snapshot?.mentions ?? [],
-          me: snapshot?.me.accountId ?? null,
+          mentions: snapshot.mentions,
+          me: snapshot.me.accountId,
         });
         const wrote = await perThread(id, async () => {
           const cur = await store.readThread(id);
-          if (cur.verifying !== null || cur.doneCheck?.verdict === "fail") return false; // a Done check owns the reason
+          if (checkHolds(cur)) return false; // a Done check owns the reason
           await store.writeThread(id, { deepCheckedAt: isoNow(), reason: found.reason });
           return true;
         });
@@ -988,6 +994,8 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       for (const id of plan.nudge) {
         if (sent >= s.nudgeTurnsPerPass) break;
         const f = facts.get(id)!;
+        // Re-read: a Done check may have started since the plan (the record read above).
+        if (checkHolds(await store.readThread(id))) continue;
         if (await nudge(id, f.lastActivityAt, f.rec.links.length === 0)) sent++;
       }
     } finally {
