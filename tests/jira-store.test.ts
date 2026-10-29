@@ -188,6 +188,13 @@ describe("thread record", () => {
     expect(r.links[0]?.role).toBe("watching");
     expect(await store.readThread("t1")).toEqual(r);
   });
+  it("updateThread computes the patch from the current record inside the lock", async () => {
+    const { store } = setup();
+    // Two concurrent first-writer-wins updates: the second sees the first's value.
+    const stamp = (at: string) => store.updateThread("t1", (cur) => ({ enrolledAt: cur.enrolledAt ?? at }));
+    await Promise.all([stamp("2026-10-29T00:00:00Z"), stamp("2026-10-30T00:00:00Z")]);
+    expect((await store.readThread("t1")).enrolledAt).toBe("2026-10-29T00:00:00Z");
+  });
   it("undefined keeps, null clears", async () => {
     const { store } = setup();
     await store.writeThread("t1", { reason: "keep" });

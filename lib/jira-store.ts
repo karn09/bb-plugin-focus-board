@@ -85,6 +85,23 @@ export function createJiraStore(
     return p.success ? p.data : emptyRecord();
   };
 
+  /** writeThread with the patch computed from the current record, inside the lock. */
+  const updateThread = (
+    threadId: string,
+    makePatch: (cur: ThreadJiraRecord) => Partial<ThreadJiraRecord>,
+  ): Promise<ThreadJiraRecord> =>
+    locked(async () => {
+      const cur = await readThread(threadId);
+      const patch = makePatch(cur);
+      const next: ThreadJiraRecord = {
+        ...cur,
+        ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)),
+        links: dedupeLinks([...cur.links, ...(patch.links ?? [])]),
+      };
+      await threads.updatePluginMetadata({ threadId, set: { [THREAD_JIRA_KEY]: next } });
+      return next;
+    });
+
   return {
     async ingestSnapshot(raw: unknown): Promise<{ ok: true } | { ok: false; error: string }> {
       const parsed = JiraSnapshot.safeParse(raw);
@@ -169,17 +186,10 @@ export function createJiraStore(
     readThread,
 
     writeThread(threadId: string, patch: Partial<ThreadJiraRecord>): Promise<ThreadJiraRecord> {
-      return locked(async () => {
-        const cur = await readThread(threadId);
-        const next: ThreadJiraRecord = {
-          ...cur,
-          ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)),
-          links: dedupeLinks([...cur.links, ...(patch.links ?? [])]),
-        };
-        await threads.updatePluginMetadata({ threadId, set: { [THREAD_JIRA_KEY]: next } });
-        return next;
-      });
+      return updateThread(threadId, () => patch);
     },
+
+    updateThread,
   };
 }
 

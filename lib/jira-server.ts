@@ -35,11 +35,17 @@ const PLAN_KEY = "jira:reconcile-plan";
 const ENABLED_SEEN_KEY = "jira:enabled-seen";
 export const JIRA_RECONCILE_CHANGED = "jira-reconcile-changed";
 
+const AppliedPlan = StoredReconcilePlan.extend({
+  /** Threads skipped because a write failed; the rest applied. */
+  failed: z.array(z.object({ threadId: z.string(), error: z.string() })),
+});
+type AppliedPlan = z.infer<typeof AppliedPlan>;
+
 export const jiraRpcContract = defineRpcContract({
   /** The stored plan from the last apply, else a fresh dry plan (nothing written). */
   jira_reconcile_plan: { input: z.null(), output: StoredReconcilePlan },
   /** Plan, apply (links + enrolledAt only) and store the plan. */
-  jira_reconcile_apply: { input: z.null(), output: StoredReconcilePlan },
+  jira_reconcile_apply: { input: z.null(), output: AppliedPlan },
 });
 
 const PLACEHOLDER_REPO = "<path-to-bb-plugin-focus-board>";
@@ -180,31 +186,37 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   };
   // Serialized so the start check and a settings flip never apply twice at once.
   let applying: Promise<unknown> = Promise.resolve();
-  const reconcileApply = (): Promise<StoredReconcilePlan> => {
+  const reconcileApply = (opts?: { resetEnrollment?: boolean }): Promise<AppliedPlan> => {
     const run = applying.then(async () => {
       const plan = await freshPlan();
-      await applyReconcile(plan, store, linkWriter, Date.parse(plan.generatedAt));
+      const { failed } = await applyReconcile(plan, store, linkWriter, Date.parse(plan.generatedAt), opts);
+      for (const f of failed) bb.log.warn(`jira reconcile: skipped thread ${f.threadId}: ${f.error}`);
       await bb.storage.kv.set(PLAN_KEY, plan);
       bb.realtime.publish(JIRA_RECONCILE_CHANGED, { generatedAt: plan.generatedAt });
-      return plan;
+      return { ...plan, failed };
     });
     applying = run.catch(() => undefined);
     return run;
   };
+  // An operator-requested apply (CLI --confirm, RPC) needs the feature on:
+  // enrolling while it is off would make the later enable nudge at once.
+  const OFF = "Jira is off — enable it first; the dry run works without it";
+  const enabled = async () => jiraSettings(await deps.settings()).enabled;
 
   // Once per false→true flip of jiraEnabled: checked at load (a flip while
-  // unloaded) and on every settings change. Turning it off re-arms.
+  // unloaded) and on every settings change. Turning it off re-arms. A flip
+  // re-enrolls every thread at now, so time spent off never counts.
   let checking: Promise<unknown> = Promise.resolve();
   const checkFirstEnable = (): Promise<unknown> =>
     (checking = checking.then(async () => {
-      const on = jiraSettings(await deps.settings()).enabled;
+      const on = await enabled();
       const seen = (await bb.storage.kv.get(ENABLED_SEEN_KEY)) === true;
       if (!on) {
         if (seen) await bb.storage.kv.set(ENABLED_SEEN_KEY, false);
         return;
       }
       if (seen) return;
-      await reconcileApply();
+      await reconcileApply({ resetEnrollment: true });
       await bb.storage.kv.set(ENABLED_SEEN_KEY, true);
     }).catch((e) => bb.log.warn(`jira reconcile on enable failed: ${(e as Error).message}`)));
   checkFirstEnable().catch(() => undefined);
@@ -215,17 +227,28 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   bb.rpc.register(jiraRpcContract, {
     jira_reconcile_plan: async () => {
       const stored = StoredReconcilePlan.safeParse(await bb.storage.kv.get(PLAN_KEY));
-      return stored.success ? stored.data : freshPlan();
+      if (!stored.success) return freshPlan();
+      // A newer snapshot than the stored plan: refresh the dry plan (no apply).
+      const { snapshot } = await store.readSnapshot();
+      if (snapshot === null || !(Date.parse(snapshot.takenAt) > Date.parse(stored.data.generatedAt))) return stored.data;
+      const plan = await freshPlan();
+      await bb.storage.kv.set(PLAN_KEY, plan);
+      return plan;
     },
-    jira_reconcile_apply: () => reconcileApply(),
+    jira_reconcile_apply: async () => {
+      if (!(await enabled())) throw new Error(OFF);
+      return reconcileApply();
+    },
   });
 
   const reconcile = cliCommand({
     summary: "Print the reconcile plan for existing threads; --confirm applies it (links + enrollment only)",
-    options: { confirm: { type: "boolean", description: "Apply the plan" } },
+    options: { confirm: { type: "boolean", description: "Apply the plan (needs jiraEnabled)" } },
     async run(input) {
-      const plan = input.options.confirm === true ? await reconcileApply() : await freshPlan();
-      return out({ applied: input.options.confirm === true, pendingOps: (await store.pendingOps()).length, plan });
+      const confirm = input.options.confirm === true;
+      if (confirm && !(await enabled())) return fail(OFF);
+      const plan = confirm ? await reconcileApply() : await freshPlan();
+      return out({ applied: confirm, pendingOps: (await store.pendingOps()).length, plan });
     },
   });
 

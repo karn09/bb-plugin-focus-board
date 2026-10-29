@@ -76,6 +76,10 @@ describe("parseLinkedIssues", () => {
 });
 
 describe("stampLinkedIssues", () => {
+  it("append puts a new link last and keeps the existing primary", () => {
+    expect(stampLinkedIssues([OTHER], LINK, { append: true }).map((l) => (l as GitHubItemLink).issue)).toEqual([9, 12]);
+  });
+
   it("puts the new link first (primary), preserving older entries", () => {
     const next = stampLinkedIssues([OTHER], LINK);
     expect(next[0].issue).toBe(12);

@@ -1388,9 +1388,9 @@ export default async function plugin(bb: BbPluginApi) {
     bb.realtime.publish(LINK_CHANGED, { threadIds });
   }
 
-  /** link_set's write: stamp one link as primary, then tell the board. */
-  async function stampLink(threadId: string, link: ThreadLink): Promise<void> {
-    await writeLinkedIssues(threadId, stampLinkedIssues(await readLinkedIssues(threadId), link));
+  /** link_set's write: stamp one link (primary, or last with append), then tell the board. */
+  async function stampLink(threadId: string, link: ThreadLink, opts?: { append?: boolean }): Promise<void> {
+    await writeLinkedIssues(threadId, stampLinkedIssues(await readLinkedIssues(threadId), link, opts));
     await publishLinksChanged([threadId]);
   }
 
@@ -3989,7 +3989,7 @@ export default async function plugin(bb: BbPluginApi) {
       );
     },
     readLinks: async (threadId) => (await readLinkedIssues(threadId)) ?? [],
-    addLink: stampLink,
+    addLink: (threadId, link) => stampLink(threadId, link, { append: true }),
     onSettingsChange: (listener) => settings.onChange(listener),
   });
   bb.onDispose(() => jira.dispose());

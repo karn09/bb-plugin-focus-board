@@ -220,8 +220,11 @@ function sameItem(a: ThreadLink, b: ThreadLink): boolean {
 export function stampLinkedIssues(
   existing: ThreadLink[] | null,
   link: ThreadLink,
+  opts?: { append?: boolean },
 ): ThreadLink[] {
-  return [link, ...(existing ?? []).filter((entry) => !sameItem(entry, link))];
+  const rest = (existing ?? []).filter((entry) => !sameItem(entry, link));
+  // append: an auto-detected link never takes over the primary chip.
+  return opts?.append === true ? [...rest, link] : [link, ...rest];
 }
 
 /**

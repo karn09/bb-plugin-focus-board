@@ -51,8 +51,9 @@ export function planReconcile(input: {
 }): ReconcilePlan {
   const { snapshot, projects } = input;
   const known = snapshot ? new Set(snapshot.tickets.map((t) => t.key)) : null;
-  // Branch names are usually lowercase (pt-3879-fix); keys are matched upper.
-  const keysIn = (s: string | null | undefined) => (s ? extractJiraKeys(s.toUpperCase(), projects) : []);
+  const keysIn = (s: string | null | undefined) => (s ? extractJiraKeys(s, projects) : []);
+  // Branch names are usually lowercase (pt-3879-fix); only branches are upper-cased.
+  const branchKeys = (s: string | null | undefined) => keysIn(s?.toUpperCase());
   const plan: ReconcilePlan = { autoLinks: [], suggestions: [], drift: [], enroll: [], skippedDone: [] };
   const threadPrs = new Map<string, GhPr[]>();
 
@@ -62,7 +63,7 @@ export function planReconcile(input: {
     if (t.done) plan.skippedDone.push(t.id);
     const links = input.links[t.id] ?? [];
     const existing = links.flatMap((l) => externalJiraKey(l) ?? []).filter((k) => projects.includes(k.split("-")[0]!));
-    const auto = [...new Set([...keysIn(t.title), ...keysIn(t.branch), ...existing])].filter((k) => !known || known.has(k));
+    const auto = [...new Set([...keysIn(t.title), ...branchKeys(t.branch), ...existing])].filter((k) => !known || known.has(k));
     for (const key of auto) plan.autoLinks.push({ threadId: t.id, key });
 
     const prs = input.prs.filter(
@@ -74,7 +75,7 @@ export function planReconcile(input: {
     if (t.done) continue; // Done threads get links and enrollment only.
     const taken = new Set(auto);
     for (const p of prs) {
-      for (const key of [...keysIn(p.body), ...keysIn(p.title), ...keysIn(p.headRef)]) {
+      for (const key of [...keysIn(p.body), ...keysIn(p.title), ...branchKeys(p.headRef)]) {
         if (taken.has(key)) continue;
         taken.add(key);
         plan.suggestions.push({ threadId: t.id, key, why: "pr-body" });
@@ -112,25 +113,38 @@ export function planReconcile(input: {
 /** Board link write for one auto-link (server.ts's link_set path). */
 export type LinkWriter = (threadId: string, key: string) => Promise<void>;
 
+export type ApplyResult = { failed: { threadId: string; error: string }[] };
+
+/**
+ * resetEnrollment (set only by the jiraEnabled false→true trigger): every
+ * planned thread is enrolled at `now`, so time spent with the feature off
+ * never counts toward a nudge. Otherwise the first enrolledAt is kept.
+ * A thread whose writes fail is skipped and reported; the rest still apply.
+ */
 export async function applyReconcile(
   plan: ReconcilePlan,
-  store: Pick<JiraStore, "readThread" | "writeThread">,
+  store: Pick<JiraStore, "updateThread">,
   linkWriter: LinkWriter,
   now: number,
-): Promise<void> {
+  opts?: { resetEnrollment?: boolean },
+): Promise<ApplyResult> {
   const at = new Date(now).toISOString();
   const byThread = new Map<string, string[]>(plan.enroll.map((id) => [id, []]));
-  for (const { threadId, key } of plan.autoLinks) {
-    await linkWriter(threadId, key);
-    byThread.set(threadId, [...(byThread.get(threadId) ?? []), key]);
-  }
+  for (const { threadId, key } of plan.autoLinks) byThread.set(threadId, [...(byThread.get(threadId) ?? []), key]);
+  const failed: ApplyResult["failed"] = [];
   for (const [threadId, keys] of byThread) {
-    const cur = await store.readThread(threadId);
-    const have = new Set(cur.links.map((l) => l.key));
-    await store.writeThread(threadId, {
-      links: keys.filter((k) => !have.has(k)).map((key) => ({ key, role: "owner" as const, source: "auto" as const })),
-      // Re-running keeps the first enrollment.
-      enrolledAt: cur.enrolledAt ?? at,
-    });
+    try {
+      for (const key of keys) await linkWriter(threadId, key);
+      await store.updateThread(threadId, (cur) => {
+        const have = new Set(cur.links.map((l) => l.key));
+        return {
+          links: keys.filter((k) => !have.has(k)).map((key) => ({ key, role: "owner" as const, source: "auto" as const })),
+          enrolledAt: opts?.resetEnrollment === true ? at : (cur.enrolledAt ?? at),
+        };
+      });
+    } catch (e) {
+      failed.push({ threadId, error: (e as Error).message });
+    }
   }
+  return { failed };
 }

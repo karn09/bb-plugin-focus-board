@@ -126,6 +126,15 @@ describe("planReconcile", () => {
     expect(p.autoLinks).toEqual([{ threadId: "x", key: "PT-3570" }, { threadId: "y", key: "PT-3878" }]);
   });
 
+  it("title keys are exact: lowercase sre-12 and look-alikes GLM-5 / INC-340 / UTF-8 give nothing", () => {
+    const t = [th("l", "sre-12 fix"), th("g", "GLM-5 eval"), th("i", "INC-340 follow-up"), th("u", "UTF-8 cleanup")];
+    for (const snap of [snapshot, null]) {
+      const p = planReconcile({ ...input, threads: t, snapshot: snap });
+      expect(p.autoLinks).toEqual([]);
+      expect(p.suggestions).toEqual([]);
+    }
+  });
+
   it("fuzzy: an assigned ticket sharing 3+ title tokens is suggested", () => {
     const p = planReconcile({ ...input, threads: [th("z", "Automated Atlantis plan review tweaks")] });
     expect(p.suggestions).toEqual([{ threadId: "z", key: "PT-3570", why: "fuzzy" }]);
@@ -165,6 +174,34 @@ describe("applyReconcile", () => {
     expect(enqueue).not.toHaveBeenCalled();
   });
 
+  it("resetEnrollment (the flip) re-enrolls at now; without it the first enrolledAt stays", async () => {
+    const { store } = memStore();
+    await applyReconcile(planReconcile(input), store, async () => {}, NOW);
+    const later = NOW + 30 * 86_400_000;
+    await applyReconcile(planReconcile(input), store, async () => {}, later, { resetEnrollment: true });
+    expect((await store.readThread("run")).enrolledAt).toBe(new Date(later).toISOString());
+    await applyReconcile(planReconcile(input), store, async () => {}, later + 1000);
+    expect((await store.readThread("run")).enrolledAt).toBe(new Date(later).toISOString());
+  });
+
+  it("a thread whose writes throw is skipped and reported; the others still apply", async () => {
+    const { store } = memStore();
+    const orig = store.updateThread;
+    vi.spyOn(store, "updateThread").mockImplementation((id, fn) =>
+      id === "waf" ? Promise.reject(new Error("metadata write failed")) : orig(id, fn),
+    );
+    const writer = async (id: string) => {
+      if (id === "bc") throw new Error("link write failed");
+    };
+    const r = await applyReconcile(planReconcile(input), store, writer, NOW);
+    expect(r.failed).toEqual([
+      { threadId: "bc", error: "link write failed" },
+      { threadId: "waf", error: "metadata write failed" },
+    ]);
+    expect((await orig("utf", () => ({}))).enrolledAt).toBe(new Date(NOW).toISOString());
+    expect((await store.readThread("e")).links).toHaveLength(1);
+  });
+
   it("keeps an existing agent link's role/source instead of overwriting it", async () => {
     const { store } = memStore();
     await store.writeThread("run", { links: [{ key: "PT-3570", role: "watching", source: "agent" }] });
@@ -178,16 +215,23 @@ describe("reconcile wiring (fake host)", () => {
   let host: ReturnType<typeof createFakePluginHost>;
   const metadata = new Map<string, Record<string, unknown>>();
   const send = vi.fn(async () => ({}));
+  let failWrites = new Set<string>();
   const rows = () => [
     makeThreadResponse({ id: "a", title: "PT-3878 A: plan the cutover" }),
     { ...makeThreadResponse({ id: "run", title: "PT-3570 wire up reviewer", status: "active" }), environmentBranchName: null },
     { ...makeThreadResponse({ id: "pg", title: "Module cleanup follow-up" }), environmentBranchName: "pt-3879-g" },
     makeThreadResponse({ id: "utf", title: "UTF-8 cleanup" }),
   ];
+  const enrolledAt = (id: string) => (metadata.get(id)?.jira as { enrolledAt?: string } | undefined)?.enrolledAt;
+  let clock = NOW;
 
-  async function load(settings: Record<string, unknown> = {}) {
+  /** seen: pre-mark the flip as already handled, so load with Jira on runs nothing. */
+  async function load(settings: Record<string, unknown> = {}, opts: { seen?: boolean } = {}) {
     metadata.clear();
     send.mockClear();
+    failWrites = new Set();
+    clock = NOW;
+    vi.spyOn(Date, "now").mockImplementation(() => clock);
     host = createFakePluginHost({
       pluginId: "focus-board",
       settings: settings as never,
@@ -197,6 +241,7 @@ describe("reconcile wiring (fake host)", () => {
           send,
           getPluginMetadata: async ({ threadId }: { threadId: string }) => metadata.get(threadId) ?? {},
           updatePluginMetadata: async ({ threadId, set, remove }: { threadId: string; set?: Record<string, unknown>; remove?: string[] }) => {
+            if (failWrites.has(threadId)) throw new Error(`write failed for ${threadId}`);
             const next = { ...(metadata.get(threadId) ?? {}), ...(set ?? {}) };
             for (const k of remove ?? []) delete next[k];
             metadata.set(threadId, next);
@@ -207,15 +252,21 @@ describe("reconcile wiring (fake host)", () => {
     });
     harness = host.harness;
     await host.bb.storage.kv.set("jira:snapshot", snapshot);
+    if (opts.seen) await host.bb.storage.kv.set("jira:enabled-seen", true);
     await server(host.bb);
   }
   afterEach(async () => {
     await harness.lifecycle.dispose();
+    vi.restoreAllMocks();
   });
   const settle = () => new Promise((r) => setTimeout(r, 20));
+  const flip = async (on: boolean) => {
+    await harness.behavior.setSettings({ jiraEnabled: on });
+    await settle();
+  };
 
   it("CLI dry run prints the plan and writes nothing; --confirm applies via link_set path", async () => {
-    await load();
+    await load({ jiraEnabled: true }, { seen: true });
     const dry = await harness.behavior.runCli(["jira", "reconcile"]);
     expect(dry.exitCode).toBe(0);
     const out = JSON.parse(dry.stdout);
@@ -231,7 +282,7 @@ describe("reconcile wiring (fake host)", () => {
     expect(metadata.get("run")?.linkedIssues).toEqual([
       expect.objectContaining({ tracker: "external", url: "https://growtherapy.atlassian.net/browse/PT-3570", label: "PT-3570", jira: { key: "PT-3570" }, source: "auto" }),
     ]);
-    expect((metadata.get("utf")?.jira as { enrolledAt: string }).enrolledAt).toBeTruthy();
+    expect(enrolledAt("utf")).toBeTruthy();
     expect(send).not.toHaveBeenCalled();
     expect(await host.bb.storage.kv.get("jira:queue")).toBeUndefined();
     expect(await host.bb.storage.kv.get("jira:reconcile-plan")).toEqual(expect.objectContaining({ generatedAt: expect.any(String) }));
@@ -241,12 +292,40 @@ describe("reconcile wiring (fake host)", () => {
     expect(metadata.get("run")?.linkedIssues).toHaveLength(1);
   });
 
-  it("an operator's existing Jira link for the key is kept as-is (no second chip)", async () => {
+  it("CLI --confirm and RPC apply refuse while Jira is off; dry runs still work", async () => {
     await load();
+    const r = await harness.behavior.runCli(["jira", "reconcile", "--confirm"]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("Jira is off — enable it first; the dry run works without it");
+    await expect(harness.behavior.callRpc("jira_reconcile_apply", null)).rejects.toThrow(/Jira is off/);
+    expect((await harness.behavior.runCli(["jira", "reconcile"])).exitCode).toBe(0);
+    expect(((await harness.behavior.callRpc("jira_reconcile_plan", null)) as { autoLinks: unknown[] }).autoLinks.length).toBeGreaterThan(0);
+    expect(metadata.size).toBe(0);
+  });
+
+  it("an auto Jira link is appended after the thread's existing links (never the primary chip)", async () => {
+    await load({ jiraEnabled: true }, { seen: true });
+    const gh = { tracker: "github", repo: "o/r", issue: 7, kind: "pull", href: "https://github.com/o/r/pull/7", createdAt: "2026-10-01T00:00:00.000Z", source: "agent" };
+    metadata.set("run", { linkedIssues: [gh] });
+    await harness.behavior.runCli(["jira", "reconcile", "--confirm"]);
+    expect(metadata.get("run")?.linkedIssues).toEqual([gh, expect.objectContaining({ jira: { key: "PT-3570" } })]);
+  });
+
+  it("an operator's existing Jira link for the key is kept as-is (no second chip)", async () => {
+    await load({ jiraEnabled: true }, { seen: true });
     const mine = { tracker: "external", url: "https://growtherapy.atlassian.net/browse/PT-3570?focus=1", hostname: "growtherapy.atlassian.net", label: "review", createdAt: "2026-10-01T00:00:00.000Z", source: "operator" };
     metadata.set("run", { linkedIssues: [mine] });
     await harness.behavior.runCli(["jira", "reconcile", "--confirm"]);
     expect(metadata.get("run")?.linkedIssues).toEqual([mine]);
+  });
+
+  it("a thread whose metadata write throws is skipped and reported; others apply", async () => {
+    await load({ jiraEnabled: true }, { seen: true });
+    failWrites.add("pg");
+    const r = (await harness.behavior.callRpc("jira_reconcile_apply", null)) as { failed: { threadId: string }[] };
+    expect(r.failed.map((f) => f.threadId)).toEqual(["pg"]);
+    expect(enrolledAt("utf")).toBeTruthy();
+    expect(enrolledAt("a")).toBeTruthy();
   });
 
   it("does nothing while jiraEnabled is off (upstream behavior)", async () => {
@@ -256,22 +335,29 @@ describe("reconcile wiring (fake host)", () => {
     expect(await host.bb.storage.kv.get("jira:reconcile-plan")).toBeUndefined();
   });
 
-  it("false->true flip applies once; re-flip after off applies again; never sends", async () => {
+  it("flip on enrolls at now; non-flip changes do nothing; off a month then on again re-enrolls at the new now; never sends", async () => {
     await load();
-    await harness.behavior.setSettings({ jiraEnabled: true });
-    await settle();
+    await flip(true);
     expect(await host.bb.storage.kv.get("jira:enabled-seen")).toBe(true);
-    const first = (metadata.get("a")?.jira as { enrolledAt: string }).enrolledAt;
-    expect(first).toBeTruthy();
+    expect(enrolledAt("a")).toBe(new Date(NOW).toISOString());
     const plan1 = await host.bb.storage.kv.get("jira:reconcile-plan");
 
+    clock = NOW + 1000;
     await harness.behavior.setSettings({ jiraRefreshMinutes: 3 }); // not a flip
     await settle();
     expect(await host.bb.storage.kv.get("jira:reconcile-plan")).toEqual(plan1);
 
-    await harness.behavior.setSettings({ jiraEnabled: false });
-    await settle();
+    // A plain rerun while on keeps enrolledAt.
+    await harness.behavior.runCli(["jira", "reconcile", "--confirm"]);
+    expect(enrolledAt("a")).toBe(new Date(NOW).toISOString());
+
+    await flip(false);
     expect(await host.bb.storage.kv.get("jira:enabled-seen")).toBe(false);
+    clock = NOW + 30 * 86_400_000;
+    await flip(true);
+    expect(await host.bb.storage.kv.get("jira:enabled-seen")).toBe(true);
+    expect(enrolledAt("a")).toBe(new Date(clock).toISOString());
+    expect(enrolledAt("utf")).toBe(new Date(clock).toISOString());
     expect(send).not.toHaveBeenCalled();
   });
 
@@ -283,13 +369,32 @@ describe("reconcile wiring (fake host)", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it("RPCs: plan returns a dry plan, apply stores it", async () => {
-    await load();
+  it("restart with seen=true does not re-run or re-enroll", async () => {
+    await load({ jiraEnabled: true }, { seen: true });
+    await settle();
+    expect(metadata.size).toBe(0);
+  });
+
+  it("RPCs: plan returns a dry plan, apply stores it, a newer snapshot refreshes the stored dry plan", async () => {
+    await load({ jiraEnabled: true }, { seen: true });
     const dry = (await harness.behavior.callRpc("jira_reconcile_plan", null)) as { autoLinks: unknown[] };
     expect(dry.autoLinks.length).toBeGreaterThan(0);
     expect(metadata.get("a")).toBeUndefined();
-    const applied = (await harness.behavior.callRpc("jira_reconcile_apply", null)) as { generatedAt: string };
-    expect(applied.generatedAt).toBeTruthy();
+    const { failed, ...applied } = (await harness.behavior.callRpc("jira_reconcile_apply", null)) as { failed: unknown[]; generatedAt: string };
+    expect(failed).toEqual([]);
     expect(await harness.behavior.callRpc("jira_reconcile_plan", null)).toEqual(applied);
+
+    // New snapshot after the plan: PT-3570 drops out of Jira data, so the dry plan changes.
+    clock = NOW + 60_000;
+    await host.bb.storage.kv.set("jira:snapshot", {
+      ...snapshot,
+      takenAt: new Date(NOW + 30_000).toISOString(),
+      tickets: snapshot.tickets.filter((t) => t.key !== "PT-3570"),
+    });
+    const fresh = (await harness.behavior.callRpc("jira_reconcile_plan", null)) as { generatedAt: string; autoLinks: { key: string }[] };
+    expect(fresh.generatedAt).toBe(new Date(clock).toISOString());
+    expect(fresh.autoLinks.map((l) => l.key)).not.toContain("PT-3570");
+    expect(await host.bb.storage.kv.get("jira:reconcile-plan")).toEqual(fresh);
+    expect(enrolledAt("a")).toBe(new Date(NOW).toISOString()); // no apply happened
   });
 });
