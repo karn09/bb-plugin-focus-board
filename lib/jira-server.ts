@@ -876,7 +876,9 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         store.updateThread(threadId, (cur) => ({
           nudgedAt: isoNow(),
           // A reply that already landed (or a Done check started since) keeps its reason.
-          ...(cur.verifying !== null || nudgeTurns.map.get(threadId)?.phase === "replied" ? {} : { reason: unlinked ? "no ticket yet" : "waiting on you" }),
+          ...(cur.verifying !== null || cur.doneCheck?.verdict === "fail" || nudgeTurns.map.get(threadId)?.phase === "replied"
+            ? {}
+            : { reason: unlinked ? "no ticket yet" : "waiting on you" }),
         })),
       );
     } catch (e) {
@@ -890,6 +892,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     const v = iso === null ? NaN : Date.parse(iso);
     return Number.isNaN(v) ? null : v;
   };
+  const laterOf = (a: number | null, b: number | undefined) => (a === null && b === undefined ? null : Math.max(a ?? -Infinity, b ?? -Infinity));
   let passing = false; // one pass at a time: an overlapping tick is skipped
   const reminderPass = async () => {
     if (passing) return;
@@ -906,7 +909,13 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       for (const row of await deps.reminderThreads()) {
         const rec = await store.readThread(row.id);
         // Never enrolled (a thread new since the enable): enrolled now, so it gets the grace too.
-        if (rec.enrolledAt === null && !row.done) await store.updateThread(row.id, (cur) => (cur.enrolledAt === null ? { enrolledAt: isoNow() } : {}));
+        if (rec.enrolledAt === null && !row.done) {
+          try {
+            await store.updateThread(row.id, (cur) => (cur.enrolledAt === null ? { enrolledAt: isoNow() } : {}));
+          } catch (e) {
+            warn(`jira reminders: enrolling ${row.id} failed, retrying next pass: ${(e as Error).message}`);
+          }
+        }
         const links = await deps.readLinks(row.id);
         const prs = threadPrsOf({ branch: row.branch }, links, allPrs);
         const missing = links.some((l) => l.tracker === "github" && l.kind === "pull" && !allPrs.some((p) => p.repo === l.repo && p.number === l.issue));
@@ -921,8 +930,9 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         facts.set(row.id, { rec, prs, missing, lastActivityAt });
         threads.push({
           id: row.id, archived: false, done: row.done, snoozed, status: row.status, verifying: rec.verifying !== null,
-          // A marker is a sent nudge even when its nudgedAt write failed.
-          lastActivityAt, enrolledAt: ms(rec.enrolledAt), nudgedAt: ms(rec.nudgedAt) ?? marker?.at ?? null, deepCheckedAt: ms(rec.deepCheckedAt),
+          checkFailed: rec.doneCheck?.verdict === "fail",
+          // The later of the record's and the marker's nudge: a marker is a sent nudge even when its nudgedAt write failed.
+          lastActivityAt, enrolledAt: ms(rec.enrolledAt), nudgedAt: laterOf(ms(rec.nudgedAt), marker?.at), deepCheckedAt: ms(rec.deepCheckedAt),
           snoozeWokeAt: snoozed ? null : (snoozeSeen.map.get(row.id) ?? null), linkedChangeAt: changes.length > 0 ? Math.max(...changes) : null,
         });
       }
@@ -938,7 +948,8 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
           me: snapshot?.me.accountId ?? null,
         });
         const wrote = await perThread(id, async () => {
-          if ((await store.readThread(id)).verifying !== null) return false;
+          const cur = await store.readThread(id);
+          if (cur.verifying !== null || cur.doneCheck?.verdict === "fail") return false; // a Done check owns the reason
           await store.writeThread(id, { deepCheckedAt: isoNow(), reason: found.reason });
           return true;
         });

@@ -58,6 +58,12 @@ describe("planReminders", () => {
     expect(plan([rt("a", { enrolledAt: null, lastActivityAt: NOW - 30 * DAY })])).toEqual({ nudge: [], deepCheck: [], carried: 0 });
   });
 
+  it("a failed Done check is never nudged (its card already sits in Needs you with the checklist)", () => {
+    const quiet = { lastActivityAt: NOW - 3 * DAY, enrolledAt: NOW - 3 * DAY };
+    expect(plan([rt("a", quiet)]).nudge).toEqual(["a"]);
+    expect(plan([rt("a", { ...quiet, checkFailed: true })])).toEqual({ nudge: [], deepCheck: [], carried: 0 });
+  });
+
   it("never touches archived, Done or verifying threads", () => {
     expect(plan([rt("a", { archived: true }), rt("b", { done: true }), rt("c", { verifying: true })])).toEqual({ nudge: [], deepCheck: [], carried: 0 });
   });
@@ -466,5 +472,35 @@ describe("reminders on a fake host", () => {
     expect(r.stdout).toContain("old-done");
     expect(r.stdout).not.toMatch(/\bidle\b.*idle longer/);
     expect(r.stdout).not.toContain("idle longer than");
+  });
+
+  it("a stale earlier-stretch nudgedAt plus a failed write: the later marker wins, no double nudge", async () => {
+    seed("t1", 3, { nudgedAt: iso(Date.now() - 10 * DAY) }); // stretch 1's nudge, before the activity 3 days ago
+    await load();
+    failWrite = (set) => typeof set?.jira?.nudgedAt === "string" && set.jira.nudgedAt > iso(Date.now() - DAY);
+    await tick();
+    failWrite = null;
+    expect(sentTo()).toEqual(["t1"]);
+    await tick();
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failed Done check is not nudged and keeps its reason", async () => {
+    seed("t1", 3, { reason: "PR #8 still open", doneCheck: { at: iso(Date.now() - 3 * DAY), verdict: "fail", reasons: ["PR #8 still open"] } });
+    await load();
+    await tick();
+    expect(send).not.toHaveBeenCalled();
+    expect(jiraOf("t1").reason).toBe("PR #8 still open");
+  });
+
+  it("one failing enrollment write is logged; the rest of the pass still runs", async () => {
+    updatedAt.set("new", Date.now() - 30 * DAY);
+    metadata.set("new", {});
+    seed("quiet", 3);
+    await load();
+    failWrite = (set) => set?.jira?.enrolledAt !== undefined && set.jira.links?.length === 0 && set.jira.nudgedAt === null && metadata.get("new")?.jira === undefined;
+    await tick();
+    failWrite = null;
+    expect(sentTo()).toEqual(["quiet"]);
   });
 });
