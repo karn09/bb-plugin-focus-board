@@ -10,7 +10,7 @@ import type { KvLike } from "./jira-store";
 
 export const IDLE_JOBS_KEY = "jira:idle-jobs";
 
-export type JobKind = "done-check" | "verify-turn" | "nudge-turn" | "find-ticket" | "promote-epic";
+export type JobKind = "done-check" | "verify-turn" | "nudge-turn" | "find-ticket" | "promote-epic" | "spin-off";
 export type IdleHandler = (threadId: string, payload: JsonValue | undefined) => Promise<void>;
 
 /** The slice of bb.sdk.threads this module uses. */
@@ -22,7 +22,7 @@ type Log = (msg: string) => void;
 
 const Job = z.object({
   threadId: z.string(),
-  kind: z.enum(["done-check", "verify-turn", "nudge-turn", "find-ticket", "promote-epic"]),
+  kind: z.enum(["done-check", "verify-turn", "nudge-turn", "find-ticket", "promote-epic", "spin-off"]),
   payload: z.unknown().optional(),
   queuedAt: z.string(),
 });
@@ -140,14 +140,19 @@ export function createIdleWaiters(
   }
 
   return {
-    async waitFor(threadId: string, kind: JobKind, payload?: JsonValue): Promise<void> {
+    /** nextIdle: only on the next idle event (or restart), never at once: a retry after a send that threw. */
+    async waitFor(threadId: string, kind: JobKind, payload?: JsonValue, opts?: { nextIdle?: boolean }): Promise<void> {
       const job: Job = { threadId, kind, ...(payload === undefined ? {} : { payload }), queuedAt: new Date().toISOString() };
       await update((jobs) => [...jobs.filter((j) => !(j.threadId === threadId && j.kind === kind)), job]);
       // The thread may have gone idle before the job was stored; its idle
       // event would then be missed.
-      if ((await state(threadId)) === "idle") await onIdle(threadId);
+      if (opts?.nextIdle !== true && (await state(threadId)) === "idle") await onIdle(threadId);
     },
     onIdle,
+    /** Whether a job of one of these kinds is queued for the thread. */
+    async queued(threadId: string, kinds: JobKind[]): Promise<boolean> {
+      return (await read()).some((j) => j.threadId === threadId && kinds.includes(j.kind));
+    },
     /** Drop every queued job of a thread (archived), logging each. */
     drop: (threadId: string) => drop(threadId, "thread archived"),
     resume: () => sweep(),

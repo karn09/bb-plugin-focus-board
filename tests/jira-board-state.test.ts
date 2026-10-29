@@ -65,13 +65,13 @@ describe("jira_board_state / jira_card_action", () => {
     expect((await state()).stale).toBe(true);
   });
 
-  it("clear-check-in clears checkInWith, publishes jira-changed; other kinds are not yet", async () => {
+  it("clear-check-in clears checkInWith, publishes jira-changed; confirm-done with nothing pending is refused", async () => {
     await load({ jiraEnabled: true });
     const r = await harness.behavior.callRpc("jira_card_action", { kind: "clear-check-in", threadId: "t1" });
     expect(r).toEqual({ ok: true });
     expect((metadata.get("t1")!.jira as { checkInWith: unknown }).checkInWith).toBeNull();
     expect(harness.inspection.realtimeSignals.some((s) => s.channel === "jira-changed")).toBe(true);
-    expect(await harness.behavior.callRpc("jira_card_action", { kind: "confirm-done", threadId: "t1" })).toEqual({ ok: false, error: "not yet" });
+    expect(await harness.behavior.callRpc("jira_card_action", { kind: "confirm-done", threadId: "t1" })).toEqual({ ok: false, error: "nothing to confirm" });
   });
 
   it("card action: off -> error and no write; unknown thread -> error", async () => {

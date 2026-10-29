@@ -102,16 +102,18 @@ describe("jira agent side", () => {
     expect(c.instructions).toBeNull();
   });
 
-  it("configure selects every registered tool; the Jira ones only while on", async () => {
+  it("configure selects every registered tool; the Jira ones only while on (the verdict tool only while verifying)", async () => {
     await load({ jiraEnabled: false });
-    const jiraTools = ["focus_board_jira_link", "focus_board_spawn_child"];
+    const jiraTools = ["focus_board_jira_link", "focus_board_spawn_child", "focus_board_done_verdict"];
     const all = harness.inspection.registrations.agentTools.map((t) => t.name).sort();
     expect(all).toEqual(expect.arrayContaining(jiraTools));
-    const names = async () => (await configure()).tools.map((t) => t.name).sort();
+    const names = async (meta: Record<string, unknown> = {}) => (await configure(meta)).tools.map((t) => t.name).sort();
     expect(await names()).toEqual(all.filter((n) => !jiraTools.includes(n)));
+    expect(await names({ jira: rec({ verifying: { startedAt: "x" } }) })).toEqual(all.filter((n) => !jiraTools.includes(n)));
     await harness.behavior.setSettings({ jiraEnabled: true });
     await flush();
-    expect(await names()).toEqual(all);
+    expect(await names()).toEqual(all.filter((n) => n !== "focus_board_done_verdict"));
+    expect(await names({ jira: rec({ verifying: { startedAt: "x" } }) })).toEqual(all);
   });
 
   // registerJira alone, its settings reads held open so the test orders them.

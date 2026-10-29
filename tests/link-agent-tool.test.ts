@@ -64,6 +64,7 @@ describe("focus_board_link_issue registration", () => {
     const tools = registered(host);
     // The Jira tools are registered always; configure selects them only while jiraEnabled.
     expect(tools.map((tool) => tool.name).sort()).toEqual([
+      "focus_board_done_verdict",
       "focus_board_group_set",
       "focus_board_jira_link",
       "focus_board_link_issue",

@@ -25,6 +25,7 @@ import { FocusBoardAppIcon } from "./components/ui/icon";
 import type { rpcContract } from "./server";
 import type { jiraRpcContract } from "./lib/jira-server";
 import { JiraBoardContext, type JiraBoardValue } from "./components/jira-card-badges";
+import { boardDoneIds } from "./lib/jira-done-check";
 import { jiraThreadsByKey } from "./components/jira-column";
 import { Board } from "./components/board";
 import { BoardToolbar } from "./components/board-toolbar";
@@ -569,8 +570,8 @@ function BoardPage({ subPath }: { subPath: string }) {
       ticketByKey: jiraState.tickets,
       threads: jiraState.threads,
       pendingOps: jiraState.pending,
-      onAction: (kind, threadId) => {
-        jiraRpc.call("jira_card_action", { kind, threadId }).then(refetchJira, () => {});
+      onAction: (kind, threadId, index) => {
+        jiraRpc.call("jira_card_action", { kind, threadId, ...(index === undefined ? {} : { index }) }).then(refetchJira, () => {});
       },
     }),
     [jiraState, jiraRpc, refetchJira],
@@ -1713,6 +1714,12 @@ function BoardPage({ subPath }: { subPath: string }) {
     }),
     [projects, providers, groupsByThread, groupRegistry],
   );
+  // Column placement only (the sweep reads the stamps): a Jira Done check in
+  // flight keeps its card in Done.
+  const placedDoneIds = useMemo(
+    () => boardDoneIds(doneIds, jiraState.enabled, jiraState.threads),
+    [doneIds, jiraState.enabled, jiraState.threads],
+  );
   const groupBoxPlan = useMemo(
     () =>
       planGroupBoxes(
@@ -1721,10 +1728,10 @@ function BoardPage({ subPath }: { subPath: string }) {
         groupContext.groupNames,
         groupBy,
         groupContext,
-        doneIds,
+        placedDoneIds,
         Date.now(),
       ),
-    [liveThreads, groupsByThread, groupContext, groupBy, doneIds],
+    [liveThreads, groupsByThread, groupContext, groupBy, placedDoneIds],
   );
   // ONE keep pass: the family filter is the board's only filter rule. The
   // retired group-box pass re-gated its input and dropped dimmed family
@@ -1758,17 +1765,17 @@ function BoardPage({ subPath }: { subPath: string }) {
     if (paneLaneCapture !== null) laneFreezes.push(paneLaneCapture);
     for (const capture of hoverLaneCapturesRef.current.values()) laneFreezes.push(capture);
     return applyLaneFreezes(
-      buildParentLanes(searched, doneIds, Date.now(), doneTimes, errorAckIds),
+      buildParentLanes(searched, placedDoneIds, Date.now(), doneTimes, errorAckIds),
       laneFreezes,
     );
-  }, [isParentGroupBy, searched, doneIds, doneTimes, errorAckIds, paneLaneCapture, hoverRebuildEpoch]);
+  }, [isParentGroupBy, searched, placedDoneIds, doneTimes, errorAckIds, paneLaneCapture, hoverRebuildEpoch]);
   const parentLaneChildrenByParent = useMemo(
     () => (isParentGroupBy ? familyIndex.childrenByParent : new Map<string, readonly PluginSidebarThread[]>()),
     [isParentGroupBy, familyIndex],
   );
   const assembly = useMemo(() => {
     if (isParentGroupBy) return null;
-    return assembleBoard(searched, groupBy, groupContext, EMPTY_FROZEN_COLUMNS, doneIds, Date.now(), {
+    return assembleBoard(searched, groupBy, groupContext, EMPTY_FROZEN_COLUMNS, placedDoneIds, Date.now(), {
       nestingEnabled: nestChildren,
       ranks,
       doneTimes,
@@ -1778,7 +1785,7 @@ function BoardPage({ subPath }: { subPath: string }) {
       ]),
       errorAcks: errorAckIds,
     });
-  }, [isParentGroupBy, searched, groupBy, groupContext, doneIds, nestChildren, ranks, doneTimes, paneCapture, errorAckIds, hoverRebuildEpoch]);
+  }, [isParentGroupBy, searched, groupBy, groupContext, placedDoneIds, nestChildren, ranks, doneTimes, paneCapture, errorAckIds, hoverRebuildEpoch]);
   const columns = assembly?.columns ?? [];
   // The map that actually renders as nested rows (nesting rules applied, so a
   // promoted, un-nested, or cross-axis child is absent — expanding the card

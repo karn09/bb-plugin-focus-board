@@ -64,4 +64,32 @@ describe("JiraCardBadges", () => {
     expect(screen.queryByText("stale")).toBeNull();
     expect(screen.queryByText("pending")).toBeNull();
   });
+  it("failed Done check: a checklist with Spin off / Keep working / Not needed per reason, rendered as text", () => {
+    const onAction = vi.fn();
+    const reasons = ["PR #7 still open", "<b>x</b>"];
+    render(<JiraCardBadges {...props} onAction={onAction} record={rec({ reason: reasons.join("; "), doneCheck: { at: "x", verdict: "fail", reasons } })} />);
+    expect(screen.getByText("<b>x</b>")).toBeTruthy();
+    expect(document.querySelector("b")).toBeNull();
+    expect(screen.queryByText(reasons.join("; "))).toBeNull(); // the checklist replaces the reason line
+    fireEvent.click(screen.getAllByText("Spin off")[1]!);
+    expect(onAction).toHaveBeenCalledWith("spin-off", "t1", 1);
+    fireEvent.click(screen.getAllByText("Not needed")[0]!);
+    expect(onAction).toHaveBeenCalledWith("not-needed", "t1", 0);
+    fireEvent.click(screen.getAllByText("Keep working")[0]!);
+    expect(onAction).toHaveBeenCalledWith("keep-working", "t1", 0);
+    fireEvent.click(screen.getByText("Mark done anyway"));
+    expect(onAction).toHaveBeenCalledWith("skip-done", "t1");
+  });
+  it("pending confirm: a Confirm done button; Mark done anyway sits one click deep", () => {
+    const onAction = vi.fn();
+    render(<JiraCardBadges {...props} onAction={onAction} record={rec({ doneCheck: { at: "x", verdict: "pending-confirm", reasons: [] } })} />);
+    fireEvent.click(screen.getByText("Confirm done"));
+    expect(onAction).toHaveBeenCalledWith("confirm-done", "t1");
+    expect(screen.getByText("Mark done anyway").closest("details")).toBeTruthy();
+  });
+  it("no Done buttons after a pass", () => {
+    render(<JiraCardBadges {...props} record={rec({ doneCheck: { at: "x", verdict: "pass", reasons: [] } })} />);
+    expect(screen.queryByText("Confirm done")).toBeNull();
+    expect(screen.queryByText("Mark done anyway")).toBeNull();
+  });
 });

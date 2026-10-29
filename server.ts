@@ -2247,6 +2247,8 @@ export default async function plugin(bb: BbPluginApi) {
       // Consume any legacy KV state before the first metadata write, or a
       // later import could resurrect state this write just changed.
       await importLegacyDone();
+      // Jira on: a Done drop is a request (lib/jira-server startDoneCheck).
+      if (done && (await jira.enabled())) return { done: (await jira.startDoneCheck(threadId)) === "done" };
       await writeDoneRecord(threadId, done);
       bb.realtime.publish(DONE_CHANGED, { threadId, done });
       return { done };
@@ -2839,14 +2841,21 @@ export default async function plugin(bb: BbPluginApi) {
     async run(input) {
       await importLegacyDone();
       const marked: string[] = [];
+      // Jira on: each mark is a Done check request; unfinished ones are "checking".
+      const checking: string[] = [];
+      const viaCheck = await jira.enabled();
       for (const threadId of input.positionals["thread-id"]) {
+        if (viaCheck) {
+          ((await jira.startDoneCheck(threadId)) === "done" ? marked : checking).push(threadId);
+          continue;
+        }
         await writeDoneRecord(threadId, true);
         bb.realtime.publish(DONE_CHANGED, { threadId, done: true });
         marked.push(threadId);
       }
       const stdout = input.options.json
-        ? JSON.stringify({ marked }, null, 2) + "\n"
-        : marked.map((id) => `marked ${id}`).join("\n") + "\n";
+        ? JSON.stringify(viaCheck ? { marked, checking } : { marked }, null, 2) + "\n"
+        : [...marked.map((id) => `marked ${id}`), ...checking.map((id) => `checking ${id} (Done check)`)].join("\n") + "\n";
       return { exitCode: 0, stdout };
     },
   });
@@ -3997,6 +4006,12 @@ export default async function plugin(bb: BbPluginApi) {
     addLink: (threadId, link) => stampLink(threadId, link, { append: true }),
     onSettingsChange: (listener) => settings.onChange(listener),
     agentTools: agentToolNames,
+    isDone: async (threadId) => (await readDoneRecord(threadId)) !== null,
+    markDone: async (threadId) => {
+      await writeDoneRecord(threadId, true);
+      bb.realtime.publish(DONE_CHANGED, { threadId, done: true });
+    },
+    notDone: (threadId) => bb.realtime.publish(DONE_CHANGED, { threadId, done: false }),
   });
   bb.onDispose(() => jira.dispose());
 

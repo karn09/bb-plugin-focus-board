@@ -324,14 +324,15 @@ describe("registerJira wiring (production path only)", () => {
     const { makeThreadResponse } = await import("@get-bb/plugin-sdk/testing");
     const rows = { t1: makeThreadResponse({ id: "t1", status: "active" }), t2: makeThreadResponse({ id: "t2", status: "idle" }) };
     const { host, jira, send } = await boot(rows, [
-      { threadId: "t1", kind: "done-check", payload: "a", queuedAt },
-      { threadId: "t2", kind: "done-check", payload: "b", queuedAt },
+      { threadId: "t1", kind: "nudge-turn", payload: "a", queuedAt },
+      { threadId: "t2", kind: "nudge-turn", payload: "b", queuedAt },
     ]);
+    // nudge-turn: a kind registerJira leaves unregistered (done-check now has a handler).
     // Let the startup resume finish first: it runs with no handlers, so only
     // register's own sweep can run the idle thread's job.
     await new Promise((r) => setTimeout(r, 20));
     const h = vi.fn(async () => {});
-    jira.idle.register("done-check", h);
+    jira.idle.register("nudge-turn", h);
     await vi.waitFor(() => expect(h).toHaveBeenCalledWith("t2", "b"));
     expect(h).not.toHaveBeenCalledWith("t1", "a");
     const { errors } = await host.harness.emitThreadEvent("thread.idle", { thread: rows.t1, lastAssistantText: null });

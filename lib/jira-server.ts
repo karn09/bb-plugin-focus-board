@@ -6,7 +6,9 @@
 // (jira_column_action): Link / dismiss a suggestion, drift fixes, Start thread.
 // And the agent side (lib/jira-agent.ts): the one bb.agents.configure, the
 // focus_board_jira_link / focus_board_spawn_child tools, and the find-ticket /
-// promote-epic card turns.
+// promote-epic card turns. And the Done check (lib/jira-done-check.ts):
+// startDoneCheck, the focus_board_done_verdict tool, jira_done_confirm and
+// the Done card actions.
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { cliCommand, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
@@ -14,10 +16,11 @@ import { createIdleWaiters, sendIfIdle, type JobKind } from "./jira-idle";
 import { findTicketText, JIRA_AGENT_TOOLS, JIRA_LINK_TOOL, JIRA_SPAWN_TOOL, jiraConfigure, JiraLinkParams, promoteEpicText, SpawnChildParams, titleWithKey, trackedRegisterTool } from "./jira-agent";
 import { jiraBrowseUrl } from "./jira-keys";
 import { fixQueued, livePrs, prUrl } from "./jira-drift";
+import { capReasons, doneSummary, evaluateMechanical, JIRA_VERDICT_TOOL, spinOffText, ticketUpdate, verifyTurnText } from "./jira-done-check";
 import { applyReconcile, externalJiraKey, planReconcile, StoredReconcilePlan, threadPrsOf, type ReconThread } from "./jira-reconcile";
 import { DriftItem, JiraTicket, OpResult, QueueOp, ThreadJiraRecord } from "./jira-schema";
 import { jiraSettings } from "./jira-settings";
-import { createJiraStore, type JiraStore } from "./jira-store";
+import { createJiraStore, type JiraStore, type NewQueueOp } from "./jira-store";
 import { makeExternalLink, type ThreadLink } from "./link-metadata";
 import { BB_PERSONAL_PROJECT_ID } from "./new-thread-seed";
 
@@ -38,6 +41,12 @@ export type JiraDeps = {
   onSettingsChange?: (listener: () => void) => void;
   /** Names of every agent tool the plugin registers (filled through `tracked`); Jira's are added here too. */
   agentTools?: string[];
+  /** Whether the thread carries a Done stamp (server.ts readDoneRecord). */
+  isDone?: (threadId: string) => Promise<boolean>;
+  /** Stamp Done the upstream way (server.ts writeDoneRecord + done-changed). */
+  markDone?: (threadId: string) => Promise<void>;
+  /** Publish done-changed { done: false }: a check ended without a stamp, so boards drop their optimistic Done. */
+  notDone?: (threadId: string) => void;
 };
 
 const PLAN_KEY = "jira:reconcile-plan";
@@ -76,7 +85,17 @@ export const jiraRpcContract = defineRpcContract({
   },
   /** A card button press; kinds whose behavior lands later answer "not yet". */
   jira_card_action: {
-    input: z.object({ kind: z.enum(JIRA_CARD_ACTIONS), threadId: z.string() }),
+    input: z.object({
+      kind: z.enum(JIRA_CARD_ACTIONS),
+      threadId: z.string(),
+      /** spin-off / not-needed: which doneCheck reason. */
+      index: z.number().int().min(0).optional(),
+    }),
+    output: z.object({ ok: z.boolean(), error: z.string().optional() }),
+  },
+  /** Confirm done (skip: "Mark done anyway", comment only, never a transition). */
+  jira_done_confirm: {
+    input: z.object({ threadId: z.string(), skip: z.boolean().optional() }),
     output: z.object({ ok: z.boolean(), error: z.string().optional() }),
   },
   /** A Jira column press. "started" follows a Start-thread spawn. */
@@ -137,8 +156,11 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   const registerTool = trackedRegisterTool(bb.agents, toolNames);
   bb.agents.configure((context) => {
     const j = jiraConfigure(cfg.enabled, cfg, context.pluginMetadata as Record<string, unknown>);
-    const others = toolNames.filter((n) => !JIRA_AGENT_TOOLS.includes(n));
-    return { tools: [...others, ...j.tools], skills: [], ...(j.instructions ? { instructions: j.instructions } : {}) };
+    const others = toolNames.filter((n) => !JIRA_AGENT_TOOLS.includes(n) && n !== JIRA_VERDICT_TOOL);
+    // The verdict tool only while a Done check is running on this thread.
+    const verifying = cfg.enabled && ThreadJiraRecord.safeParse((context.pluginMetadata as Record<string, unknown>).jira).data?.verifying != null;
+    const tools = [...others, ...j.tools, ...(verifying ? [JIRA_VERDICT_TOOL] : [])];
+    return { tools, skills: [], ...(j.instructions ? { instructions: j.instructions } : {}) };
   });
 
   /** One card turn: sent now, or queued for the thread's next idle. A throw is "not sent". */
@@ -353,15 +375,15 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   // a fix once; the second press sees the first's ops still pending.
   type ColumnResult = { ok: boolean; error?: string; alreadyQueued?: true };
   let queueing: Promise<unknown> = Promise.resolve();
-  const onceQueued = (key: string, kind: DriftItem["kind"], task: () => Promise<ColumnResult>): Promise<ColumnResult> => {
-    const run = queueing.then(async () => (fixQueued(await store.pendingOps(), key, kind) ? { ok: true, alreadyQueued: true as const } : task()));
+  const onceQueued = (isQueued: (ops: QueueOp[]) => boolean, task: () => Promise<ColumnResult>): Promise<ColumnResult> => {
+    const run = queueing.then(async () => (isQueued(await store.pendingOps()) ? { ok: true, alreadyQueued: true as const } : task()));
     queueing = run.catch(() => undefined);
     return run;
   };
 
   // Drift fixes re-derive the drift server-side: a stale board cannot queue a write.
   const fixDrift = (key: string, kind: DriftItem["kind"]): Promise<ColumnResult> =>
-    onceQueued(key, kind, async () => {
+    onceQueued((ops) => fixQueued(ops, key, kind), async () => {
       const { plan, s, links, threads, prs } = await planWithInputs();
       if (!plan.drift.some((d) => d.key === key && d.kind === kind)) return { ok: false, error: "no such drift" };
       if (kind === "todo-with-prs") {
@@ -469,6 +491,155 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     },
   });
 
+  // ---- The Done check: a Done drop (or `done mark`) while on is a request. ----
+  const isoNow = () => new Date().toISOString();
+  const isDone = deps.isDone ?? (async () => false);
+  const markDone = deps.markDone ?? (async () => {});
+  const notDone = (threadId: string) => deps.notDone?.(threadId);
+
+  /** What the check and the ticket comment read about one thread. */
+  const doneFacts = async (threadId: string) => {
+    const rows = await bb.sdk.threads.list({});
+    const listed = rows.find((r) => r.id === threadId);
+    const row = listed ?? (await bb.sdk.threads.get({ threadId }));
+    const links = await deps.readLinks(threadId);
+    const { snapshot, stale } = await store.readSnapshot();
+    const all = snapshot?.prs ?? [];
+    const prs = threadPrsOf({ branch: listed?.environmentBranchName ?? null }, links, all);
+    // A board-linked PR the snapshot lacks is missing data, never "no PRs".
+    const missing = links.some((l) => l.tracker === "github" && l.kind === "pull" && !all.some((p) => p.repo === l.repo && p.number === l.issue));
+    const kids = rows.filter((r) => r.parentThreadId === threadId && r.archivedAt === null);
+    const children = await Promise.all(
+      kids.map(async (r) => ({ id: r.id, title: r.title ?? r.titleFallback ?? r.id, keys: (await store.readThread(r.id)).links.map((l) => l.key) })),
+    );
+    return { rows, title: row.title ?? row.titleFallback ?? threadId, prs, stale: stale || missing, snapshot, children };
+  };
+
+  const failCheck = async (threadId: string, reasons: string[]) => {
+    await store.updateThread(threadId, () => ({ verifying: null, doneCheck: { at: isoNow(), verdict: "fail", reasons }, reason: reasons.join("; ") }));
+    notDone(threadId);
+  };
+
+  // Comment (and maybe transition) on every linked ticket, once: a second
+  // Done while the first's ops are un-acked queues nothing.
+  const queueTicketUpdate = (threadId: string, skipped: boolean) =>
+    onceQueued(
+      (ops) => ops.some((o) => o.threadId === threadId && (o.op === "comment" || (o.op === "transition" && o.toCategory === "done"))),
+      async () => {
+        const rec = await store.readThread(threadId);
+        if (rec.links.length === 0) return { ok: true };
+        const f = await doneFacts(threadId);
+        const summary = doneSummary({
+          title: f.title,
+          prUrls: f.prs.filter((p) => p.state !== "closed").map(prUrl),
+          childKeys: f.children.flatMap((c) => c.keys),
+          skipped,
+        });
+        const live = f.rows.filter((r) => r.archivedAt === null);
+        for (const l of rec.links) {
+          // Unknown or stale ticket data: comment only, never a blind transition.
+          const t = f.stale ? undefined : f.snapshot?.tickets.find((x) => x.key === l.key);
+          let ops: NewQueueOp[] = [{ op: "comment", key: l.key, body: summary, threadId: null }];
+          if (t) {
+            const linkedThreadsDone: boolean[] = [];
+            for (const r of live) if ((await store.readThread(r.id)).links.some((x) => x.key === l.key)) linkedThreadsDone.push(await isDone(r.id));
+            ops = ticketUpdate({ ticket: t, linkedThreadsDone, role: l.role, skipped, summary });
+          }
+          for (const op of ops) await store.enqueue({ ...op, threadId });
+        }
+        return { ok: true };
+      },
+    );
+
+  /** The final Done: stamp, record the verdict, queue the ticket update. */
+  const finishDone = async (threadId: string, skipped: boolean) => {
+    await markDone(threadId);
+    await store.updateThread(threadId, () => ({
+      verifying: null,
+      reason: null,
+      doneCheck: { at: isoNow(), verdict: "pass", reasons: [], ...(skipped ? { skipped: true as const } : {}) },
+    }));
+    await queueTicketUpdate(threadId, skipped);
+  };
+
+  // A send that throws keeps `verifying` and retries on the next idle (not at once: no loop).
+  const verifyTurn = async (threadId: string) => {
+    if (!(await enabled()) || !(await store.readThread(threadId)).verifying) return;
+    try {
+      await turnOrWait(threadId, "verify-turn", verifyTurnText());
+    } catch (e) {
+      bb.log.warn(`jira: verify turn on ${threadId} not sent, retrying on next idle: ${(e as Error).message}`);
+      await idle.waitFor(threadId, "verify-turn", undefined, { nextIdle: true });
+    }
+  };
+
+  const runCheck = async (threadId: string) => {
+    if (!(await enabled()) || !(await store.readThread(threadId)).verifying) return;
+    const f = await doneFacts(threadId);
+    const m = evaluateMechanical({ prs: f.prs, children: f.children.map((c) => ({ id: c.id, title: c.title, linked: c.keys.length > 0 })), snapshotStale: f.stale });
+    if (m.verdict === "pass") return finishDone(threadId, false);
+    if (m.verdict === "needs-agent") return verifyTurn(threadId);
+    return failCheck(threadId, m.reasons);
+  };
+  void idle.register("done-check", runCheck);
+  void idle.register("verify-turn", verifyTurn);
+  void idle.register("spin-off", async (threadId, payload) => {
+    if (typeof payload === "string" && (await enabled())) await turnOrWait(threadId, "spin-off", spinOffText(payload), payload);
+  });
+
+  /** done=true while on. An already-Done thread re-stamps as upstream (never checked). */
+  const startDoneCheck = async (threadId: string): Promise<"done" | "checking"> => {
+    if (await isDone(threadId)) {
+      await markDone(threadId);
+      return "done";
+    }
+    await store.updateThread(threadId, () => ({ verifying: { startedAt: isoNow() }, doneCheck: null, reason: null }));
+    await idle.waitFor(threadId, "done-check"); // runs now when idle, else on the next idle
+    return (await isDone(threadId)) ? "done" : "checking";
+  };
+
+  // Jobs are taken before their handler runs, so a restart mid-check can
+  // leave `verifying` with no job: re-queue those.
+  const resumeChecks = async () => {
+    if (!(await enabled())) return;
+    for (const { id } of await deps.liveLinks()) {
+      if ((await store.readThread(id)).verifying && !(await idle.queued(id, ["done-check", "verify-turn"]))) await idle.waitFor(id, "done-check");
+    }
+  };
+  resumeChecks().catch((e) => bb.log.warn(`jira: resuming Done checks failed: ${(e as Error).message}`));
+
+  const confirmDone = async (threadId: string, skip: boolean): Promise<{ ok: boolean; error?: string }> => {
+    if (!skip && (await store.readThread(threadId)).doneCheck?.verdict !== "pending-confirm") return { ok: false, error: "nothing to confirm" };
+    await finishDone(threadId, skip);
+    return { ok: true };
+  };
+
+  /** Drop one fail reason; none left means the operator can confirm. */
+  const dropReason = (threadId: string, index: number) =>
+    store.updateThread(threadId, (cur) => {
+      const left = (cur.doneCheck?.reasons ?? []).filter((_, i) => i !== index);
+      if (left.length === 0) return { reason: null, doneCheck: { at: isoNow(), verdict: "pending-confirm", reasons: [] } };
+      return { reason: left.join("; "), doneCheck: { ...cur.doneCheck!, reasons: left } };
+    });
+
+  registerTool({
+    name: JIRA_VERDICT_TOOL,
+    description:
+      "Report the Done check for this thread: verdict \"pass\" when the work it set out to do is finished, \"fail\" with what is left in remaining. Offered only while a Done check runs.",
+    parameters: z.object({ verdict: z.enum(["pass", "fail"]), remaining: z.array(z.string()) }),
+    execute: async ({ verdict, remaining }, ctx) => {
+      if (!(await enabled())) return toolText(TOOL_OFF, true);
+      if (!(await store.readThread(ctx.threadId)).verifying) return toolText("No Done check is running on this thread; nothing was written.", true);
+      if (verdict === "pass") {
+        await store.updateThread(ctx.threadId, () => ({ verifying: null, doneCheck: { at: isoNow(), verdict: "pending-confirm", reasons: [] } }));
+        return toolText("Recorded. The operator confirms Done on the board; nothing else to do.");
+      }
+      const reasons = capReasons(remaining);
+      await failCheck(ctx.threadId, reasons.length > 0 ? reasons : ["the agent reported work left"]);
+      return toolText("Recorded. The thread stays open with those items for the operator.");
+    },
+  });
+
   bb.rpc.register(jiraRpcContract, {
     jira_reconcile_plan: () =>
       serial(async () => {
@@ -500,13 +671,30 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         pending: Object.fromEntries((await store.pendingOps()).map((o) => [o.id, o])),
       };
     },
-    // Later tasks (10-11) wire the other kinds.
-    jira_card_action: async ({ kind, threadId }) => {
+    jira_card_action: async ({ kind, threadId, index }) => {
       if (!(await enabled())) return { ok: false, error: OFF };
-      if (kind !== "clear-check-in" && kind !== "find-ticket" && kind !== "promote-epic") return { ok: false, error: "not yet" };
       if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread" };
       if (kind === "clear-check-in") {
         await store.writeThread(threadId, { checkInWith: null });
+        return { ok: true };
+      }
+      if (kind === "confirm-done" || kind === "skip-done") return confirmDone(threadId, kind === "skip-done");
+      if (kind === "keep-working") {
+        await store.writeThread(threadId, { verifying: null, reason: null, doneCheck: null });
+        notDone(threadId);
+        return { ok: true };
+      }
+      if (kind === "not-needed" || kind === "spin-off") {
+        const reason = index === undefined ? undefined : (await store.readThread(threadId)).doneCheck?.reasons[index];
+        if (reason === undefined) return { ok: false, error: "no such reason" };
+        if (kind === "spin-off") {
+          try {
+            if ((await turnOrWait(threadId, "spin-off", spinOffText(reason), reason)) === "gone") return { ok: false, error: "thread gone" };
+          } catch (e) {
+            return { ok: false, error: `not sent: ${(e as Error).message}` };
+          }
+        }
+        await dropReason(threadId, index!);
         return { ok: true };
       }
       try {
@@ -526,6 +714,11 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         return { ok: false, error: `not sent: ${(e as Error).message}` };
       }
     },
+    jira_done_confirm: async ({ threadId, skip }) => {
+      if (!(await enabled())) return { ok: false, error: OFF };
+      if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread" };
+      return confirmDone(threadId, skip === true);
+    },
     jira_column_action: async ({ action, key, threadId, kind, confirm }) => {
       if (!(await enabled())) return { ok: false, error: OFF };
       if (action === "fix") {
@@ -538,7 +731,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread" };
       if (action === "started") {
         await operatorLink(threadId, key);
-        return onceQueued(key, "todo-with-prs", async () => {
+        return onceQueued((ops) => fixQueued(ops, key, "todo-with-prs"), async () => {
           const t = (await store.readSnapshot()).snapshot?.tickets.find((x) => x.key === key);
           if (t?.statusCategory === "new" && !t.isEpic) await store.enqueue({ op: "transition", key, toCategory: "indeterminate", threadId });
           return { ok: true };
@@ -565,6 +758,9 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     commands: { "jira reconcile": reconcile, "jira ingest": ingest, "jira wanted": wanted, "jira queue": queue, "jira ack": ack, "jira status": status, "jira setup": setup },
     store,
     idle,
+    /** Whether jiraEnabled is on (done_set / done mark route through the check only then). */
+    enabled,
+    startDoneCheck,
     dispose() {},
   };
 }

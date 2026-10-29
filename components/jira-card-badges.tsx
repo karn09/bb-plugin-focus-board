@@ -26,12 +26,15 @@ export type JiraCardBadgesProps = {
   record: ThreadJiraRecord | undefined;
   ticketByKey: Record<string, JiraTicket>;
   pendingOps: readonly QueueOp[];
-  onAction: (kind: JiraCardKind, threadId: string) => void;
+  /** index: which Done-check reason (spin-off / keep-working / not-needed). */
+  onAction: (kind: JiraCardKind, threadId: string, index?: number) => void;
 };
 
 export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, pendingOps, onAction }: JiraCardBadgesProps) {
   if (!enabled) return null;
   const links = record?.links ?? [];
+  const failed = record?.doneCheck?.verdict === "fail" ? record.doneCheck.reasons : [];
+  const checkOpen = record?.verifying != null || record?.doneCheck?.verdict === "fail" || record?.doneCheck?.verdict === "pending-confirm";
   const pendingKeys = new Set(pendingOps.filter((o) => "key" in o).map((o) => (o as { key: string }).key));
   return (
     <div className="mt-1 flex flex-wrap items-center gap-1 px-3 pb-2 pl-1.5" data-jira-badges="">
@@ -76,7 +79,33 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
           </button>
         </span>
       ) : null}
-      {record?.reason ? <span className="w-full truncate text-[10px] text-muted-foreground">{record.reason}</span> : null}
+      {record?.doneCheck?.verdict === "pending-confirm" ? (
+        <button type="button" className={cn(chip, "underline")} onClick={() => onAction("confirm-done", threadId)}>
+          Confirm done
+        </button>
+      ) : null}
+      {failed.length > 0 ? (
+        <ul className="w-full text-[10px] text-muted-foreground" data-jira-reasons="">
+          {failed.map((r, i) => (
+            <li key={i} className="flex flex-wrap items-center gap-1">
+              <span className="truncate">{r}</span>
+              <button type="button" className="underline" onClick={() => onAction("spin-off", threadId, i)}>Spin off</button>
+              <button type="button" className="underline" onClick={() => onAction("keep-working", threadId, i)}>Keep working</button>
+              <button type="button" className="underline" onClick={() => onAction("not-needed", threadId, i)}>Not needed</button>
+            </li>
+          ))}
+        </ul>
+      ) : record?.reason ? (
+        <span className="w-full truncate text-[10px] text-muted-foreground">{record.reason}</span>
+      ) : null}
+      {checkOpen ? (
+        <details className="text-[10px] text-muted-foreground">
+          <summary className="cursor-pointer">More</summary>
+          <button type="button" className="underline" onClick={() => onAction("skip-done", threadId)}>
+            Mark done anyway
+          </button>
+        </details>
+      ) : null}
     </div>
   );
 }
