@@ -48,7 +48,7 @@ export function createJiraStore(
   kv: KvLike,
   threads: MetadataLike,
   now: () => number,
-  opts?: { refreshMinutes?: () => number | Promise<number>; log?: (msg: string) => void },
+  opts?: { refreshMinutes?: () => number | Promise<number>; log?: (msg: string) => void; onChange?: () => void },
 ) {
   // One in-process chain serializes every read-modify-write (rows and
   // thread records alike), like the board's withKvWriteLock.
@@ -60,6 +60,14 @@ export function createJiraStore(
   };
 
   const log = opts?.log ?? (() => {});
+  // Fired after every write (ingest, enqueue, ack, thread record) so the board refreshes.
+  const changed = () => {
+    try {
+      opts?.onChange?.();
+    } catch (e) {
+      log(`jira onChange failed: ${(e as Error).message}`);
+    }
+  };
   // Raw stored entries; unparseable ones are kept untouched in storage.
   const rawQueue = async (): Promise<unknown[]> => {
     const raw = await kv.get(QUEUE_KEY);
@@ -99,6 +107,7 @@ export function createJiraStore(
         links: dedupeLinks([...cur.links, ...(patch.links ?? [])]),
       };
       await threads.updatePluginMetadata({ threadId, set: { [THREAD_JIRA_KEY]: next } });
+      changed();
       return next;
     });
 
@@ -111,6 +120,7 @@ export function createJiraStore(
           await kv.set(SNAPSHOT_KEY, parsed.data);
           await kv.set(SNAPSHOT_FAILURE_KEY, null);
         });
+        changed();
         return { ok: true };
       }
       if (parsed.success) failure = parsed.data.error ?? "snapshot not ok";
@@ -123,6 +133,7 @@ export function createJiraStore(
       if (failure === null) return { ok: false, error: parsed.error?.message ?? "invalid snapshot" };
       // A failed refresh keeps the prior good snapshot; it only marks it stale.
       await locked(() => kv.set(SNAPSHOT_FAILURE_KEY, failure));
+      changed();
       return { ok: true };
     },
 
@@ -147,6 +158,7 @@ export function createJiraStore(
       return locked(async () => {
         const full = { ...op, id: crypto.randomUUID(), createdAt: new Date(now()).toISOString() } as QueueOp;
         await kv.set(QUEUE_KEY, [...(await rawQueue()), full]);
+        changed();
         return full;
       });
     },
@@ -172,6 +184,7 @@ export function createJiraStore(
             return !(p.success && done.has(p.data.id));
           }),
         );
+        changed();
       });
     },
 

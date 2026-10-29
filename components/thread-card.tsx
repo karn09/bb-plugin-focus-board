@@ -26,6 +26,7 @@ import { usePaneCoversBoard } from "./pane-sheet-coverage";
 import { ThreadCardMenu, type CardMenuAction } from "./thread-card-menu";
 import { useTicketChipFit } from "./use-ticket-chip-fit";
 import { useWallpaperActive } from "./wallpaper-contrast";
+import { JiraCardSlot } from "./jira-card-badges";
 
 /**
  * The chip placement contract (issue #104): the issues block is held to the
@@ -1803,6 +1804,7 @@ export function ThreadCardImpl({
               {branch === "" ? null : <span className="text-muted-foreground/40"> · {branch}</span>}
             </p>
           </a>
+          {compact ? null : <JiraCardSlot threadId={thread.id} />}
           {hasChips ? (
             // Issue #104's chip area: three regions on a wrapping flex line.
             // The issues region keeps a lone row-anchor per provider; the

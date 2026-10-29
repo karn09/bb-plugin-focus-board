@@ -9,7 +9,7 @@ import { cliCommand, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-
 import { createIdleWaiters } from "./jira-idle";
 import { jiraBrowseUrl } from "./jira-keys";
 import { applyReconcile, externalJiraKey, planReconcile, StoredReconcilePlan, type ReconThread } from "./jira-reconcile";
-import { OpResult } from "./jira-schema";
+import { JiraTicket, OpResult, QueueOp, ThreadJiraRecord } from "./jira-schema";
 import { jiraSettings } from "./jira-settings";
 import { createJiraStore, type JiraStore } from "./jira-store";
 import { makeExternalLink, type ThreadLink } from "./link-metadata";
@@ -35,6 +35,9 @@ export type JiraDeps = {
 const PLAN_KEY = "jira:reconcile-plan";
 const ENABLED_SEEN_KEY = "jira:enabled-seen";
 export const JIRA_RECONCILE_CHANGED = "jira-reconcile-changed";
+export const JIRA_CHANGED = "jira-changed";
+
+export const JIRA_CARD_ACTIONS = ["find-ticket", "confirm-done", "skip-done", "spin-off", "keep-working", "not-needed", "clear-check-in", "promote-epic"] as const;
 
 const AppliedPlan = StoredReconcilePlan.extend({
   /** Threads skipped because a write failed; the rest applied. */
@@ -47,6 +50,24 @@ export const jiraRpcContract = defineRpcContract({
   jira_reconcile_plan: { input: z.null(), output: StoredReconcilePlan },
   /** Plan, apply (links + enrolledAt only) and store the plan. */
   jira_reconcile_apply: { input: z.null(), output: AppliedPlan },
+  /** Everything the board's Jira chips need in one read. */
+  jira_board_state: {
+    input: z.null(),
+    output: z.object({
+      enabled: z.boolean(),
+      snapshotAge: z.number().nullable(),
+      stale: z.boolean(),
+      error: z.string().nullable(),
+      tickets: z.array(JiraTicket),
+      threads: z.record(z.string(), ThreadJiraRecord),
+      pending: z.record(z.string(), QueueOp),
+    }),
+  },
+  /** A card button press; kinds whose behavior lands later answer "not yet". */
+  jira_card_action: {
+    input: z.object({ kind: z.enum(JIRA_CARD_ACTIONS), threadId: z.string() }),
+    output: z.object({ ok: z.boolean(), error: z.string().optional() }),
+  },
 });
 
 const PLACEHOLDER_REPO = "<path-to-bb-plugin-focus-board>";
@@ -64,6 +85,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   const store: JiraStore = createJiraStore(bb.storage.kv as never, bb.sdk.threads as never, Date.now, {
     refreshMinutes: async () => jiraSettings(await deps.settings()).refreshMinutes,
     log: (m) => bb.log.warn(m),
+    onChange: () => bb.realtime.publish(JIRA_CHANGED, {}),
   });
   // Queued idle-gated work (lib/jira-idle.ts). No handlers yet: later
   // features register them (register re-sweeps queued jobs of its kind), so
@@ -256,6 +278,27 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     jira_reconcile_apply: async () => {
       if (!(await enabled())) throw new Error(OFF);
       return reconcileApply();
+    },
+    jira_board_state: async () => {
+      if (!(await enabled())) return { enabled: false, snapshotAge: null, stale: false, error: null, tickets: [], threads: {}, pending: {} };
+      const { snapshot, ageMs, stale, error } = await store.readSnapshot();
+      const threads: Record<string, ThreadJiraRecord> = {};
+      for (const { id } of await deps.liveLinks()) threads[id] = await store.readThread(id);
+      return {
+        enabled: true,
+        snapshotAge: ageMs,
+        stale,
+        error,
+        tickets: snapshot?.tickets ?? [],
+        threads,
+        pending: Object.fromEntries((await store.pendingOps()).map((o) => [o.id, o])),
+      };
+    },
+    // Later tasks (9-11) wire the other kinds; "find-ticket" will go through sendIfIdle.
+    jira_card_action: async ({ kind, threadId }) => {
+      if (kind !== "clear-check-in") return { ok: false, error: "not yet" };
+      await store.writeThread(threadId, { checkInWith: null });
+      return { ok: true };
     },
   });
 

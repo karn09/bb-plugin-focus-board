@@ -23,6 +23,8 @@ import type { JsonValue } from "@get-bb/plugin-sdk";
 import { installHostLinkGlue } from "./components/host-link-glue";
 import { FocusBoardAppIcon } from "./components/ui/icon";
 import type { rpcContract } from "./server";
+import type { jiraRpcContract } from "./lib/jira-server";
+import { JiraBoardContext, type JiraBoardValue } from "./components/jira-card-badges";
 import { Board } from "./components/board";
 import { BoardToolbar } from "./components/board-toolbar";
 import { ThreadPane } from "./components/thread-pane";
@@ -520,6 +522,42 @@ function BoardPage({ subPath }: { subPath: string }) {
   useRealtime("link-changed", () => {
     refetchScheduler.schedule("links", refetchLinks);
   });
+  // Jira chips: one board-state read, refetched on the server's jira-changed.
+  const jiraRpc = useRpc<typeof jiraRpcContract>();
+  const [jiraState, setJiraState] = useState<{
+    enabled: boolean; stale: boolean; tickets: JiraBoardValue["ticketByKey"];
+    threads: JiraBoardValue["threads"]; pending: JiraBoardValue["pendingOps"];
+  }>({ enabled: false, stale: false, tickets: {}, threads: {}, pending: [] });
+  const refetchJira = useCallback(() => {
+    jiraRpc.call("jira_board_state", null).then(
+      (r) =>
+        setJiraState({
+          enabled: r.enabled,
+          stale: r.stale,
+          tickets: Object.fromEntries(r.tickets.map((t) => [t.key, t])),
+          threads: r.threads,
+          pending: Object.values(r.pending),
+        }),
+      () => {}, // Jira is optional state; the board works without it.
+    );
+  }, [jiraRpc]);
+  useEffect(() => refetchJira(), [refetchJira]);
+  useRealtime("jira-changed", () => {
+    refetchScheduler.schedule("jira", refetchJira);
+  });
+  const jiraValue = useMemo<JiraBoardValue>(
+    () => ({
+      enabled: jiraState.enabled,
+      stale: jiraState.stale,
+      ticketByKey: jiraState.tickets,
+      threads: jiraState.threads,
+      pendingOps: jiraState.pending,
+      onAction: (kind, threadId) => {
+        jiraRpc.call("jira_card_action", { kind, threadId }).then(refetchJira, () => {});
+      },
+    }),
+    [jiraState, jiraRpc, refetchJira],
+  );
   // The ack signal mirrors done-changed: every open board refetches the set
   // so a Clear error (menu, or any later surface) converges everywhere.
   useRealtime("error-ack-changed", () => {
@@ -3311,6 +3349,7 @@ function BoardPage({ subPath }: { subPath: string }) {
 
   const activeWallpaper = wallpaperLayerOf(wallpaper);
   return (
+    <JiraBoardContext.Provider value={jiraValue}>
     <WallpaperActiveProvider active={activeWallpaper !== null}>
     {/* Publishes whether the compact pane covers the board, so the board can
         skip the card spotlight's whole-board recede while it cannot be seen
@@ -3823,6 +3862,7 @@ function BoardPage({ subPath }: { subPath: string }) {
     </div>
     </PaneSheetCoverageProvider>
     </WallpaperActiveProvider>
+    </JiraBoardContext.Provider>
   );
 }
 

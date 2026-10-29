@@ -97,6 +97,9 @@ describe("bb focus-board jira CLI", () => {
     await load();
     const old = fixture({ takenAt: new Date(Date.now() - 5 * 60_000).toISOString() });
     await harness.behavior.runCli(["jira", "ingest", "--file", file("o.json", old)]);
+    await harness.behavior.setSettings({ jiraRefreshMinutes: 10 });
+    expect((await harness.behavior.runCli(["jira", "status"])).stdout).not.toContain("(stale)");
+    await harness.behavior.setSettings({ jiraRefreshMinutes: 2 });
     expect((await harness.behavior.runCli(["jira", "status"])).stdout).toContain("(stale)");
   });
 
