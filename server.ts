@@ -12,6 +12,7 @@
 // done-changed publish stays.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { createThreadPulseTracker } from "./lib/thread-pulse";
+import { registerJira } from "./lib/jira-server";
 import {
   PluginCliError,
   cliCommand,
@@ -3960,6 +3961,18 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  const jira = registerJira(bb, {
+    settings: () => settings.get(),
+    liveLinks: async () => {
+      const { rows } = await listCandidateThreads();
+      const live = rows.filter((row) => row.archivedAt === null);
+      return Promise.all(
+        live.map(async (row) => ({ id: row.id, links: (await readLinkedIssues(row.id)) ?? [] })),
+      );
+    },
+  });
+  bb.onDispose(() => jira.dispose());
+
   bb.cli.register(
     defineCli({
       name: "focus-board",
@@ -3987,6 +4000,7 @@ export default async function plugin(bb: BbPluginApi) {
         "autotitle prompt": autotitlePrompt,
         "autotitle probe": autotitleProbe,
         sweep,
+        ...jira.commands,
       },
     }),
   );

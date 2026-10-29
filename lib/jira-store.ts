@@ -155,6 +155,10 @@ export function createJiraStore(
       return (await readResults()).find((r) => r.id === opId) ?? null;
     },
 
+    async recentResults(n: number): Promise<OpResult[]> {
+      return (await readResults()).slice(-n);
+    },
+
     readThread,
 
     writeThread(threadId: string, patch: Partial<ThreadJiraRecord>): Promise<ThreadJiraRecord> {
