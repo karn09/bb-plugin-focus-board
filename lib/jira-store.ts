@@ -154,7 +154,7 @@ export function createJiraStore(
       return { snapshot: p.data, ageMs, stale: failure != null || ageMs === null || ageMs > 2 * refresh * 60_000, error };
     },
 
-    enqueue(op: Omit<QueueOp, "id" | "createdAt">): Promise<QueueOp> {
+    enqueue(op: NewQueueOp): Promise<QueueOp> {
       return locked(async () => {
         const full = { ...op, id: crypto.randomUUID(), createdAt: new Date(now()).toISOString() } as QueueOp;
         await kv.set(QUEUE_KEY, [...(await rawQueue()), full]);
@@ -207,3 +207,6 @@ export function createJiraStore(
 }
 
 export type JiraStore = ReturnType<typeof createJiraStore>;
+/** A QueueOp before the store stamps id/createdAt (Omit per union member, so `key` stays). */
+export type NewQueueOp = Unstamped<QueueOp>;
+type Unstamped<T> = T extends unknown ? Omit<T, "id" | "createdAt"> : never;

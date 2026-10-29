@@ -413,4 +413,12 @@ describe("the child preset's group inheritance (New child thread… from a group
     renderModal({ parentThreadId: "thr_p", parentThreadTitle: "Auth rework", parentGroupName: "Auth rework" });
     expect(document.querySelector('[data-new-child-hint=""]')).not.toBeNull();
   });
+  it("a Jira seed prefills the prompt and rides pluginMetadata into the spawn", async () => {
+    const pluginMetadata = { jira: { links: [{ key: "PT-1", role: "owner", source: "operator" }] } };
+    render(createElement(NewThreadModal, { open: true, onOpenChange, onSpawned, initialPrompt: "PT-1: s", pluginMetadata }));
+    expect(lastComposerProps?.initialPrompt).toBe("PT-1: s");
+    fireEvent.click(submitButton());
+    await lastSubmitPromise;
+    expect(spawn).toHaveBeenCalledWith({ ...REQUEST, pluginMetadata });
+  });
 });

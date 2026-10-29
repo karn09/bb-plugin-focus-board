@@ -3,6 +3,7 @@
 // never sends a turn and never touches doneCheck: its store parameter is
 // typed to readThread/writeThread alone, so it cannot.
 import { z } from "zod";
+import { detectDrift } from "./jira-drift";
 import { extractJiraKeys } from "./jira-keys";
 import { DriftItem, type GhPr, type JiraSnapshot } from "./jira-schema";
 import type { JiraStore } from "./jira-store";
@@ -41,6 +42,15 @@ const STOP = new Set(
 const tokens = (s: string) =>
   new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 1 && !STOP.has(t) && !/^\d+$/.test(t)));
 
+/** A thread's PRs: its branch's head PR, plus board-linked GitHub pulls. */
+export function threadPrsOf(t: Pick<ReconThread, "branch">, links: readonly ThreadLink[], prs: readonly GhPr[]): GhPr[] {
+  return prs.filter(
+    (p) =>
+      (t.branch !== null && p.headRef === t.branch) ||
+      links.some((l) => l.tracker === "github" && l.kind === "pull" && l.repo === p.repo && l.issue === p.number),
+  );
+}
+
 export function planReconcile(input: {
   threads: ReconThread[];
   links: Record<string, ThreadLink[]>;
@@ -48,6 +58,8 @@ export function planReconcile(input: {
   snapshot: JiraSnapshot | null;
   projects: string[];
   now: number;
+  /** jiraStaleTicketDays; the setting's default when absent. */
+  staleTicketDays?: number;
 }): ReconcilePlan {
   const { snapshot, projects } = input;
   const known = snapshot ? new Set(snapshot.tickets.map((t) => t.key)) : null;
@@ -66,11 +78,7 @@ export function planReconcile(input: {
     const auto = [...new Set([...keysIn(t.title), ...branchKeys(t.branch), ...existing])].filter((k) => !known || known.has(k));
     for (const key of auto) plan.autoLinks.push({ threadId: t.id, key });
 
-    const prs = input.prs.filter(
-      (p) =>
-        (t.branch !== null && p.headRef === t.branch) ||
-        links.some((l) => l.tracker === "github" && l.kind === "pull" && l.repo === p.repo && l.issue === p.number),
-    );
+    const prs = threadPrsOf(t, links, input.prs);
     threadPrs.set(t.id, prs);
     if (t.done) continue; // Done threads get links and enrollment only.
     const taken = new Set(auto);
@@ -94,18 +102,12 @@ export function planReconcile(input: {
     }
   }
 
+  const doneIds = new Set(input.threads.filter((t) => t.done).map((t) => t.id));
   for (const tk of snapshot?.tickets ?? []) {
-    if (tk.statusCategory !== "new") continue;
-    const ids = plan.autoLinks.filter((l) => l.key === tk.key).map((l) => l.threadId);
-    const prs = new Map<string, GhPr>();
-    for (const id of ids) for (const p of threadPrs.get(id) ?? []) if (p.state !== "closed") prs.set(`${p.repo}#${p.number}`, p);
-    if (prs.size > 0) {
-      plan.drift.push({
-        key: tk.key,
-        kind: "todo-with-prs",
-        detail: `${tk.status} in Jira, but ${prs.size} open or merged PR(s) across ${ids.length} linked thread(s)`,
-      });
-    }
+    const linked = plan.autoLinks
+      .filter((l) => l.key === tk.key)
+      .map(({ threadId: id }) => ({ id, done: doneIds.has(id), prs: threadPrs.get(id) ?? [] }));
+    plan.drift.push(...detectDrift(tk, linked, input.now, input.staleTicketDays ?? 30));
   }
   return plan;
 }

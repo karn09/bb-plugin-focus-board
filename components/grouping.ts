@@ -681,6 +681,19 @@ export function buildColumns(
   return columns;
 }
 
+/** The Jira column's id (components/jira-column.tsx renders it). */
+export const JIRA_COLUMN_ID = "jira";
+
+/**
+ * Prepends the Jira column on the Attention view while Jira is on. It holds
+ * no threads, has no rank key and is never a drop target; with Jira off the
+ * columns come back untouched (same array).
+ */
+export function withJiraColumn(columns: BoardColumn[], groupBy: GroupBy, jiraEnabled: boolean): BoardColumn[] {
+  if (groupBy !== "status" || !jiraEnabled) return columns;
+  return [{ id: JIRA_COLUMN_ID, label: "Jira", threads: [] }, ...columns];
+}
+
 // RETIRED 2026-10-01: `withSweepGather` (selected cards sorted to the top
 // while a sweep is armed) is gone. With manual click-to-toggle selection,
 // re-sorting on every toggle made cards jump around the column — deselecting

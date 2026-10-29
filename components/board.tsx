@@ -8,7 +8,8 @@ import {
 } from "react";
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import type { BoardColumn, GroupBy, LaneHideOutcome } from "./grouping";
-import { THREAD_STATE_LABELS, threadState } from "./grouping";
+import { JIRA_COLUMN_ID, THREAD_STATE_LABELS, threadState } from "./grouping";
+import { JiraColumnSlot } from "./jira-column";
 import {
   sweepColumnKind,
   sweepDestination,
@@ -2358,6 +2359,8 @@ export function Board({
           )}
         >
         {columns.map((column) => {
+          // Not a thread lane: no drop, rank, sweep or cards (withJiraColumn).
+          if (column.id === JIRA_COLUMN_ID) return <JiraColumnSlot key={column.id} />;
           const dropHandler = dropHandlerFor(column.id);
           const isDropTarget = dropHandler !== null;
           const sweepKind = sweepColumnKind(column.id);

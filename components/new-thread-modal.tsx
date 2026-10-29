@@ -14,6 +14,9 @@ import {
 import { Icon } from "@/components/ui/icon";
 import type { ThreadPaneThread } from "@/components/thread-pane";
 
+/** `threads.spawn`'s pluginMetadata (the SDK does not export its JsonObject). */
+export type SpawnPluginMetadata = Parameters<ReturnType<typeof useSdk>["threads"]["spawn"]>[0]["pluginMetadata"];
+
 /**
  * The fields of `threads.spawn`'s thread record that the board consumes for
  * the provisional pane row while the sidebar cache has not caught up yet.
@@ -56,6 +59,8 @@ export function NewThreadModal({
   onMaximize,
   rememberProjectId,
   rememberEnvironment,
+  initialPrompt,
+  pluginMetadata,
   onSpawned,
 }: {
   open: boolean;
@@ -133,6 +138,10 @@ export function NewThreadModal({
     projectId: string,
     environment: NewThreadRequest["environment"],
   ) => void;
+  /** Seeds an empty draft (the Jira column's Start thread). */
+  initialPrompt?: string;
+  /** Rides into `threads.spawn` (the Jira column's ticket-link seed). */
+  pluginMetadata?: SpawnPluginMetadata;
   onSpawned: (thread: SpawnedThread) => void;
 }) {
   const sdk = useSdk();
@@ -153,9 +162,10 @@ export function NewThreadModal({
       // verbatim request — the one field `CreateThreadRequest` takes that
       // makes the spawned thread a child. No parent preset: the request
       // forwards verbatim, byte-for-byte the plain new-thread flow.
-      const spawnArgs = parentThreadId !== undefined
+      const withParent = parentThreadId !== undefined
         ? { ...request, parentThreadId }
         : request;
+      const spawnArgs = pluginMetadata !== undefined ? { ...withParent, pluginMetadata } : withParent;
       try {
         const thread = await sdk.threads.spawn(spawnArgs);
         rememberProjectId?.(thread.projectId);
@@ -167,7 +177,7 @@ export function NewThreadModal({
         throw error;
       }
     },
-    [sdk, onOpenChange, onSpawned, rememberProjectId, rememberEnvironment, parentThreadId],
+    [sdk, onOpenChange, onSpawned, rememberProjectId, rememberEnvironment, parentThreadId, pluginMetadata],
   );
 
   return (
@@ -267,6 +277,7 @@ export function NewThreadModal({
           {...(defaultProviderId !== undefined ? { defaultProviderId } : {})}
           {...(defaultModel !== undefined ? { defaultModel } : {})}
           focusRequest={focusRequest}
+          {...(initialPrompt !== undefined ? { initialPrompt } : {})}
           onSubmit={handleSubmit}
         />
       </DialogContent>

@@ -2,14 +2,16 @@
 // the companion script (scripts/jira-sync.mjs) talks to. The commands work
 // whether or not jiraEnabled is set, and change no board behavior.
 // Also: reconciliation (`jira reconcile`, the jira_reconcile_* RPCs, and the
-// one-time run when jiraEnabled flips on).
+// one-time run when jiraEnabled flips on). And the Jira column's writes
+// (jira_column_action): Link / dismiss a suggestion, drift fixes, Start thread.
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { cliCommand, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { createIdleWaiters } from "./jira-idle";
 import { jiraBrowseUrl } from "./jira-keys";
-import { applyReconcile, externalJiraKey, planReconcile, StoredReconcilePlan, type ReconThread } from "./jira-reconcile";
-import { JiraTicket, OpResult, QueueOp, ThreadJiraRecord } from "./jira-schema";
+import { livePrs, prUrl } from "./jira-drift";
+import { applyReconcile, externalJiraKey, planReconcile, StoredReconcilePlan, threadPrsOf, type ReconThread } from "./jira-reconcile";
+import { DriftItem, JiraTicket, OpResult, QueueOp, ThreadJiraRecord } from "./jira-schema";
 import { jiraSettings } from "./jira-settings";
 import { createJiraStore, type JiraStore } from "./jira-store";
 import { makeExternalLink, type ThreadLink } from "./link-metadata";
@@ -34,6 +36,9 @@ export type JiraDeps = {
 
 const PLAN_KEY = "jira:reconcile-plan";
 const ENABLED_SEEN_KEY = "jira:enabled-seen";
+/** `${threadId} ${key}` suggestions the operator dismissed; never re-suggested. */
+// ponytail: grows by one entry per dismissal, never pruned; prune archived threads if it ever matters.
+const DISMISSED_KEY = "jira:dismissed-suggestions";
 export const JIRA_RECONCILE_CHANGED = "jira-reconcile-changed";
 export const JIRA_CHANGED = "jira-changed";
 
@@ -66,6 +71,16 @@ export const jiraRpcContract = defineRpcContract({
   /** A card button press; kinds whose behavior lands later answer "not yet". */
   jira_card_action: {
     input: z.object({ kind: z.enum(JIRA_CARD_ACTIONS), threadId: z.string() }),
+    output: z.object({ ok: z.boolean(), error: z.string().optional() }),
+  },
+  /** A Jira column press. "started" follows a Start-thread spawn. */
+  jira_column_action: {
+    input: z.object({
+      action: z.enum(["link", "dismiss-suggestion", "fix", "started"]),
+      key: JiraTicket.shape.key,
+      threadId: z.string().optional(),
+      kind: DriftItem.shape.kind.optional(),
+    }),
     output: z.object({ ok: z.boolean(), error: z.string().optional() }),
   },
 });
@@ -200,20 +215,34 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     },
   });
 
-  async function freshPlan(): Promise<StoredReconcilePlan> {
+  const dismissed = async () => {
+    const raw = await bb.storage.kv.get(DISMISSED_KEY);
+    return new Set(Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string") : []);
+  };
+  async function planWithInputs() {
     const s = jiraSettings(await deps.settings());
     const { snapshot } = await store.readSnapshot();
     const links = Object.fromEntries((await deps.liveLinks()).map((t) => [t.id, t.links]));
+    const threads = await deps.reconThreads();
     const now = Date.now();
-    const plan = planReconcile({ threads: await deps.reconThreads(), links, prs: snapshot?.prs ?? [], snapshot, projects: s.projects, now });
-    return { ...plan, generatedAt: new Date(now).toISOString() };
+    const prs = snapshot?.prs ?? [];
+    const plan = planReconcile({ threads, links, prs, snapshot, projects: s.projects, now, staleTicketDays: s.staleTicketDays });
+    const gone = await dismissed();
+    plan.suggestions = plan.suggestions.filter((x) => !gone.has(`${x.threadId} ${x.key}`));
+    return { plan: { ...plan, generatedAt: new Date(now).toISOString() } as StoredReconcilePlan, s, snapshot, links, threads, prs };
   }
+  const freshPlan = async (): Promise<StoredReconcilePlan> => (await planWithInputs()).plan;
   // Board links go through server.ts's link_set path; a key the thread
   // already links (any external link for it) is left as the operator set it.
-  const linkWriter = async (threadId: string, key: string) => {
+  const linkWriter = async (threadId: string, key: string, source: ThreadLink["source"] = "auto") => {
     if ((await deps.readLinks(threadId)).some((l) => externalJiraKey(l) === key)) return;
-    const link = makeExternalLink(jiraBrowseUrl(key), key, "auto", new Date());
+    const link = makeExternalLink(jiraBrowseUrl(key), key, source, new Date());
     await deps.addLink(threadId, { ...link, jira: { key } });
+  };
+  /** The operator's link: board chip plus an appended record link. */
+  const operatorLink = async (threadId: string, key: string) => {
+    await linkWriter(threadId, key, "operator");
+    await store.updateThread(threadId, () => ({ links: [{ key, role: "owner", source: "operator" }] }));
   };
   // Every PLAN_KEY write (apply, plan refresh) runs on one chain, so the
   // start check, a settings flip and an RPC never interleave.
@@ -259,6 +288,37 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       await bb.storage.kv.set(ENABLED_SEEN_KEY, true);
     }).catch((e) => bb.log.warn(`jira reconcile on enable failed: ${(e as Error).message}`)));
   checkFirstEnable().catch(() => undefined);
+
+  /** Link or dismiss: the suggestion leaves the stored plan (dismissals also stick in DISMISSED_KEY). */
+  const dropSuggestion = (threadId: string, key: string, remember: boolean) =>
+    serial(async () => {
+      if (remember) await bb.storage.kv.set(DISMISSED_KEY, [...(await dismissed()), `${threadId} ${key}`]);
+      const stored = StoredReconcilePlan.safeParse(await bb.storage.kv.get(PLAN_KEY));
+      if (!stored.success) return;
+      const suggestions = stored.data.suggestions.filter((x) => !(x.threadId === threadId && x.key === key));
+      await bb.storage.kv.set(PLAN_KEY, { ...stored.data, suggestions });
+      bb.realtime.publish(JIRA_RECONCILE_CHANGED, { generatedAt: stored.data.generatedAt });
+    });
+
+  // Drift fixes re-derive the drift server-side: a stale board cannot queue a write.
+  async function fixDrift(key: string, kind: DriftItem["kind"]): Promise<{ ok: boolean; error?: string }> {
+    if (kind === "all-done-still-open") return { ok: false, error: "not yet" }; // Task 10: the Done check.
+    const { plan, s, links, threads, prs } = await planWithInputs();
+    if (!plan.drift.some((d) => d.key === key && d.kind === kind)) return { ok: false, error: "no such drift" };
+    if (kind === "todo-with-prs") {
+      const ids = new Set(plan.autoLinks.filter((l) => l.key === key).map((l) => l.threadId));
+      const linked = threads.filter((t) => ids.has(t.id)).map((t) => ({ id: t.id, done: t.done, prs: threadPrsOf(t, links[t.id] ?? [], prs) }));
+      await store.enqueue({ op: "transition", key, toCategory: "indeterminate", threadId: null });
+      const body = ["Focus Board: moving this to In Progress. Linked threads already have these pull requests:", ...livePrs(linked).map(prUrl)].join("\n");
+      await store.enqueue({ op: "comment", key, body, threadId: null });
+    } else {
+      const body = `Focus Board: giving this ticket back. It had no Jira activity for ${s.staleTicketDays} days or more and no linked work, so I am unassigning myself.`;
+      await store.enqueue({ op: "comment", key, body, threadId: null });
+      await store.enqueue({ op: "assign", key, to: "none", threadId: null });
+    }
+    return { ok: true };
+  }
+
   deps.onSettingsChange?.(() => {
     checkFirstEnable().catch(() => undefined);
   });
@@ -300,6 +360,22 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       if (kind !== "clear-check-in") return { ok: false, error: "not yet" };
       if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread" };
       await store.writeThread(threadId, { checkInWith: null });
+      return { ok: true };
+    },
+    jira_column_action: async ({ action, key, threadId, kind }) => {
+      if (!(await enabled())) return { ok: false, error: OFF };
+      if (action === "fix") return kind ? fixDrift(key, kind) : { ok: false, error: "kind required" };
+      if (threadId === undefined) return { ok: false, error: "threadId required" };
+      if (action === "started") {
+        // The spawn seeded the record; a just-spawned thread may not be listed yet, so no live check.
+        await operatorLink(threadId, key);
+        const t = (await store.readSnapshot()).snapshot?.tickets.find((x) => x.key === key);
+        if (t?.statusCategory === "new" && !t.isEpic) await store.enqueue({ op: "transition", key, toCategory: "indeterminate", threadId });
+        return { ok: true };
+      }
+      if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread" };
+      if (action === "link") await operatorLink(threadId, key);
+      await dropSuggestion(threadId, key, action === "dismiss-suggestion");
       return { ok: true };
     },
   });

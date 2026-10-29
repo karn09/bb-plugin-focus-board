@@ -44,6 +44,7 @@
  * `parentThreadId` (the preset is about the parent, not the project).
  */
 import type { NewThreadRequest } from "@get-bb/plugin-sdk/app";
+import type { JiraTicket, ThreadJiraRecord } from "./jira-schema";
 export function newThreadSeedProjectId({
   parentProjectId,
   filterProjectId,
@@ -325,4 +326,31 @@ export function newThreadSeedEnvironmentForProject({
     return rememberedEnvironment;
   }
   return undefined;
+}
+/**
+ * The Jira column's Start thread seed: the composer's prompt and the
+ * pluginMetadata that links the ticket from the first turn. The record is
+ * complete so lib/jira-store reads it (a partial record parses as empty).
+ * The snapshot carries no description, so that paragraph is dropped when empty.
+ */
+export function jiraStartThreadSeed(
+  ticket: Pick<JiraTicket, "key" | "summary" | "url"> & { description?: string },
+  now: number,
+): { prompt: string; pluginMetadata: { jira: ThreadJiraRecord } } {
+  const parts = [`${ticket.key}: ${ticket.summary}`, ticket.url, ticket.description?.trim() ?? ""].filter((p) => p !== "");
+  return {
+    prompt: parts.join("\n\n"),
+    pluginMetadata: {
+      jira: {
+        links: [{ key: ticket.key, role: "owner", source: "operator" }],
+        enrolledAt: new Date(now).toISOString(),
+        verifying: null,
+        doneCheck: null,
+        nudgedAt: null,
+        deepCheckedAt: null,
+        reason: null,
+        checkInWith: null,
+      },
+    },
+  };
 }

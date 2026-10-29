@@ -33,7 +33,7 @@ import { useSearchFocusOnSlash } from "./hooks/use-search-focus";
 import { useNewThreadComposerShortcut } from "./hooks/use-new-thread-shortcut";
 import { useTicketStatuses } from "./hooks/use-ticket-statuses";
 import { usePulseRates } from "./hooks/use-pulse-rates";
-import { NewThreadModal } from "./components/new-thread-modal";
+import { NewThreadModal, type SpawnPluginMetadata } from "./components/new-thread-modal";
 import type { SpawnedThread } from "./components/new-thread-modal";
 import type { CardMenuAction } from "./components/thread-card-menu";
 import { cardMenuActions } from "./lib/card-menu";
@@ -46,6 +46,7 @@ import {
   NO_GROUP_BUCKET,
   parseStoredStateFilter,
   threadState,
+  withJiraColumn,
 } from "./components/grouping";
 import { staleErrorAckIds } from "./lib/error-ack-metadata";
 import {
@@ -91,7 +92,9 @@ import {
   rememberedProjectStorageKey,
   rememberedProjectStoredValue,
   type NewThreadEnvironmentArgs,
+  jiraStartThreadSeed,
 } from "./lib/new-thread-seed";
+import type { DriftItem, JiraTicket } from "./lib/jira-schema";
 import { majorityGroupSpawnSeed, type GroupSpawnSeed } from "./lib/group-spawn-seed";
 import { spawnInheritedGroupId } from "./lib/group-inheritance";
 import { maximizeComposerToMainView } from "./lib/compose-maximize";
@@ -527,22 +530,34 @@ function BoardPage({ subPath }: { subPath: string }) {
   const [jiraState, setJiraState] = useState<{
     enabled: boolean; stale: boolean; tickets: JiraBoardValue["ticketByKey"];
     threads: JiraBoardValue["threads"]; pending: JiraBoardValue["pendingOps"];
-  }>({ enabled: false, stale: false, tickets: {}, threads: {}, pending: [] });
+    snapshotAge: number | null; error: string | null;
+    suggestions: { threadId: string; key: string }[]; drift: DriftItem[];
+  }>({ enabled: false, stale: false, tickets: {}, threads: {}, pending: [], snapshotAge: null, error: null, suggestions: [], drift: [] });
   const refetchJira = useCallback(() => {
     jiraRpc.call("jira_board_state", null).then(
-      (r) =>
+      async (r) => {
+        // The Jira column's suggestions and drift ride the stored reconcile plan.
+        const plan = r.enabled ? await jiraRpc.call("jira_reconcile_plan", null).catch(() => null) : null;
         setJiraState({
           enabled: r.enabled,
           stale: r.stale,
           tickets: Object.fromEntries(r.tickets.map((t) => [t.key, t])),
           threads: r.threads,
           pending: Object.values(r.pending),
-        }),
+          snapshotAge: r.snapshotAge,
+          error: r.error,
+          suggestions: plan?.suggestions ?? [],
+          drift: plan?.drift ?? [],
+        });
+      },
       () => {}, // Jira is optional state; the board works without it.
     );
   }, [jiraRpc]);
   useEffect(() => refetchJira(), [refetchJira]);
   useRealtime("jira-changed", () => {
+    refetchScheduler.schedule("jira", refetchJira);
+  });
+  useRealtime("jira-reconcile-changed", () => {
     refetchScheduler.schedule("jira", refetchJira);
   });
   const jiraValue = useMemo<JiraBoardValue>(
@@ -2161,6 +2176,21 @@ function BoardPage({ subPath }: { subPath: string }) {
   // most common project and provider/model pair, resolved by the effect
   // below. Undefined while loading or when no member voted.
   const [newThreadGroupSeed, setNewThreadGroupSeed] = useState<GroupSpawnSeed | undefined>(undefined);
+  // The Jira column's Start thread preset (lib/new-thread-seed jiraStartThreadSeed):
+  // prompt + pluginMetadata for the composer; cleared when the composer closes.
+  const [newThreadJira, setNewThreadJira] = useState<{ key: string; prompt: string; pluginMetadata: SpawnPluginMetadata } | null>(null);
+  const startJiraThread = useCallback((ticket: JiraTicket) => {
+    setComposerFocusRequest((nonce) => nonce + 1);
+    setNewThreadParentId(null);
+    setNewThreadGroupId(null);
+    setNewThreadGroupSeed(undefined);
+    setNewThreadJira({ key: ticket.key, ...jiraStartThreadSeed(ticket, Date.now()) });
+    setNewThreadOpen(true);
+  }, []);
+  const onNewThreadOpenChange = useCallback((open: boolean) => {
+    setNewThreadOpen(open);
+    if (!open) setNewThreadJira(null);
+  }, []);
   const openNewThread = useCallback(() => {
     setComposerFocusRequest((nonce) => nonce + 1);
     setNewThreadParentId(null);
@@ -2580,6 +2610,39 @@ function BoardPage({ subPath }: { subPath: string }) {
       handleSpawnedThread,
     ],
   );
+
+  // The Jira column's data, on top of the chips' value (unchanged while Jira is off).
+  const jiraBoardValue = useMemo<JiraBoardValue>(() => {
+    if (!jiraState.enabled) return jiraValue;
+    const titleOf = new Map(threads.map((t) => [t.id, t.displayTitle]));
+    const threadsByKey: Record<string, { id: string; title: string }[]> = {};
+    for (const [id, rec] of Object.entries(jiraState.threads)) {
+      for (const l of rec.links) (threadsByKey[l.key] ??= []).push({ id, title: titleOf.get(id) ?? id });
+    }
+    const suggestions: Record<string, { threadId: string; title: string }[]> = {};
+    for (const x of jiraState.suggestions) (suggestions[x.key] ??= []).push({ threadId: x.threadId, title: titleOf.get(x.threadId) ?? x.threadId });
+    const act = (input: Parameters<typeof jiraRpc.call<"jira_column_action">>[1]) => {
+      jiraRpc.call("jira_column_action", input).then(refetchJira, () => {});
+    };
+    return {
+      ...jiraValue,
+      column: {
+        tickets: Object.values(jiraState.tickets).filter((t) => t.assignedToMe && t.statusCategory !== "done"),
+        threadsByKey,
+        suggestions,
+        drift: jiraState.drift,
+        stale: jiraState.stale,
+        snapshotAgeMs: jiraState.snapshotAge,
+        error: jiraState.error,
+        onStartThread: startJiraThread,
+        onLink: (key, threadId) => act({ action: "link", key, threadId }),
+        onDismiss: (key, threadId) => act({ action: "dismiss-suggestion", key, threadId }),
+        onFix: (d) => act({ action: "fix", key: d.key, kind: d.kind }),
+        onOpenThread: openThreadCard,
+      },
+    };
+  }, [jiraValue, jiraState, threads, jiraRpc, refetchJira, startJiraThread, openThreadCard]);
+  const boardColumns = useMemo(() => withJiraColumn(columns, groupBy, jiraState.enabled), [columns, groupBy, jiraState.enabled]);
 
   const closeThreadPane = useCallback(() => {
     pushedThreadIdRef.current = null;
@@ -3349,7 +3412,7 @@ function BoardPage({ subPath }: { subPath: string }) {
 
   const activeWallpaper = wallpaperLayerOf(wallpaper);
   return (
-    <JiraBoardContext.Provider value={jiraValue}>
+    <JiraBoardContext.Provider value={jiraBoardValue}>
     <WallpaperActiveProvider active={activeWallpaper !== null}>
     {/* Publishes whether the compact pane covers the board, so the board can
         skip the card spotlight's whole-board recede while it cannot be seen
@@ -3462,7 +3525,7 @@ function BoardPage({ subPath }: { subPath: string }) {
           </div>
         ) : (
           <Board
-            columns={columns}
+            columns={boardColumns}
             groupBy={groupBy}
             activeThreadId={openThreadId}
             cardTransport={cardTransport}
@@ -3748,7 +3811,7 @@ function BoardPage({ subPath }: { subPath: string }) {
       )}
       <NewThreadModal
         open={newThreadOpen}
-        onOpenChange={setNewThreadOpen}
+        onOpenChange={onNewThreadOpenChange}
         defaultProjectId={newThreadProjectId}
         defaultEnvironment={newThreadEnvironmentSeed}
         defaultProviderId={newThreadGroupSeed?.providerId}
@@ -3774,10 +3837,22 @@ function BoardPage({ subPath }: { subPath: string }) {
         // view spawns the thread but the group tag write would be lost —
         // the promise the dialog made ("Will be tagged into…") breaks.
         onMaximize={
-          newThreadParentId === null && newThreadGroupId === null ? maximizeNewThread : undefined
+          newThreadParentId === null && newThreadGroupId === null && newThreadJira === null ? maximizeNewThread : undefined
         }
         rememberEnvironment={rememberSpawnEnvironment}
-        onSpawned={handleComposerSpawnedThread}
+        initialPrompt={newThreadJira?.prompt}
+        pluginMetadata={newThreadJira?.pluginMetadata}
+        onSpawned={
+          newThreadJira === null
+            ? handleComposerSpawnedThread
+            : (thread) => {
+                // Links the board chip and moves a To Do ticket to In Progress.
+                jiraRpc
+                  .call("jira_column_action", { action: "started", key: newThreadJira.key, threadId: thread.id })
+                  .then(refetchJira, () => {});
+                handleComposerSpawnedThread(thread);
+              }
+        }
       />
       <SettingsModal
         open={settingsOpen}

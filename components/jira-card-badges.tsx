@@ -5,6 +5,7 @@ import { createContext, useContext } from "react";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import type { JiraTicket, QueueOp, ThreadJiraRecord } from "../lib/jira-schema";
+import type { JiraColumnData } from "./jira-column";
 
 export type JiraCardKind =
   | "find-ticket" | "confirm-done" | "skip-done" | "spin-off"
@@ -75,6 +76,8 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
 
 export type JiraBoardValue = Omit<JiraCardBadgesProps, "threadId" | "record"> & {
   threads: Record<string, ThreadJiraRecord>;
+  /** The Jira column's data (components/jira-column.tsx); absent renders no column. */
+  column?: JiraColumnData;
 };
 export const JiraBoardContext = createContext<JiraBoardValue | null>(null);
 
