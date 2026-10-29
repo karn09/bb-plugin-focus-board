@@ -6,6 +6,7 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { cliCommand, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { createIdleWaiters } from "./jira-idle";
 import { jiraBrowseUrl } from "./jira-keys";
 import { applyReconcile, externalJiraKey, planReconcile, StoredReconcilePlan, type ReconThread } from "./jira-reconcile";
 import { OpResult } from "./jira-schema";
@@ -64,6 +65,11 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     refreshMinutes: async () => jiraSettings(await deps.settings()).refreshMinutes,
     log: (m) => bb.log.warn(m),
   });
+  // Queued idle-gated work (lib/jira-idle.ts). No handlers yet: later
+  // features register them, so with nothing registered no job ever runs.
+  const idle = createIdleWaiters(bb.storage.kv as never, {}, { threads: bb.sdk.threads as never, log: (m) => bb.log.warn(m) });
+  bb.events.on("thread.idle", ({ thread }) => idle.onIdle(thread.id));
+  idle.resume().catch((e) => bb.log.warn(`jira idle resume failed: ${(e as Error).message}`));
   const fileOpt = {
     file: { type: "string" as const, required: true as const, description: "JSON file path" },
   };
@@ -264,6 +270,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   return {
     commands: { "jira reconcile": reconcile, "jira ingest": ingest, "jira wanted": wanted, "jira queue": queue, "jira ack": ack, "jira status": status, "jira setup": setup },
     store,
+    idle,
     dispose() {},
   };
 }
