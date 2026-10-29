@@ -76,7 +76,7 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
           </button>
         </span>
       ) : null}
-      {record?.reason ?<span className="w-full truncate text-[10px] text-muted-foreground">{record.reason}</span> : null}
+      {record?.reason ? <span className="w-full truncate text-[10px] text-muted-foreground">{record.reason}</span> : null}
     </div>
   );
 }

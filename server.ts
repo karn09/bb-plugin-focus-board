@@ -13,6 +13,7 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { createThreadPulseTracker } from "./lib/thread-pulse";
 import { registerJira } from "./lib/jira-server";
+import { trackedRegisterTool } from "./lib/jira-agent";
 import {
   PluginCliError,
   cliCommand,
@@ -3791,8 +3792,12 @@ export default async function plugin(bb: BbPluginApi) {
   // `instructions` nudge — the AGENTS.md-style push — rides with the tool's
   // presence in the session's tool set, so any thread's agent learns to link
   // what it files or turns up, without text pasted into every repo's AGENTS.md.
+  // Every agent tool's name, recorded as it registers: lib/jira-server's
+  // configure (the plugin's only one) selects them all.
+  const agentToolNames: string[] = [];
+  const registerTool = trackedRegisterTool(bb.agents, agentToolNames);
   const LINK_AGENT_TOOL = "focus_board_link_issue";
-  bb.agents.registerTool({
+  registerTool({
     name: LINK_AGENT_TOOL,
     description:
       "Link this bb thread to a tracker item so the Focus Board card shows a chip: a GitHub issue or pull request (live status dot), or any other https URL the conversation turns up (external tracker, chip reads the label or hostname). Call it right after you open or file the item, passing its URL.",
@@ -3904,7 +3909,7 @@ export default async function plugin(bb: BbPluginApi) {
   // or its id, and assigning replaces any current group with the move
   // reported, so the agent sees what it changed.
   const GROUP_AGENT_TOOL = "focus_board_group_set";
-  bb.agents.registerTool({
+  registerTool({
     name: GROUP_AGENT_TOOL,
     description:
       "Assign a Focus Board feature group (family box) to this bb thread, or to another thread id, so the card joins that group on the board's Group view. Pass the group's exact name, or its id. Assigning replaces any previous group.",
@@ -3991,7 +3996,7 @@ export default async function plugin(bb: BbPluginApi) {
     readLinks: async (threadId) => (await readLinkedIssues(threadId)) ?? [],
     addLink: (threadId, link) => stampLink(threadId, link, { append: true }),
     onSettingsChange: (listener) => settings.onChange(listener),
-    agentTools: [LINK_AGENT_TOOL, GROUP_AGENT_TOOL],
+    agentTools: agentToolNames,
   });
   bb.onDispose(() => jira.dispose());
 

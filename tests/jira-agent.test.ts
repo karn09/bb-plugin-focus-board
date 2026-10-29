@@ -4,6 +4,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import type { FakePluginHarness } from "@get-bb/plugin-sdk/testing";
+import { z } from "zod";
 import server from "../server";
 
 const ticket = (key: string, isEpic = false) => ({
@@ -24,7 +25,7 @@ describe("jira agent side", () => {
   let update: ReturnType<typeof vi.fn>;
   let send: ReturnType<typeof vi.fn>;
 
-  async function load(settings: Record<string, unknown>, tickets: object[] = []) {
+  async function load(settings: Record<string, unknown>, tickets: object[] = [], opts: { noFlush?: boolean } = {}) {
     metadata.clear();
     titles.clear();
     children.length = 0;
@@ -66,7 +67,7 @@ describe("jira agent side", () => {
     await host.bb.storage.kv.set("jira:snapshot", snap(tickets));
     titles.set("t1", "Investigate slack thread");
     await server(host.bb);
-    await flush();
+    if (!opts.noFlush) await flush();
   }
   afterEach(async () => {
     await harness.lifecycle.dispose();
@@ -99,6 +100,75 @@ describe("jira agent side", () => {
     const c = await configure();
     expect(c.tools.map((t) => t.name).sort()).toEqual(["focus_board_group_set", "focus_board_link_issue"]);
     expect(c.instructions).toBeNull();
+  });
+
+  it("configure selects every registered tool; the Jira ones only while on", async () => {
+    await load({ jiraEnabled: false });
+    const jiraTools = ["focus_board_jira_link", "focus_board_spawn_child"];
+    const all = harness.inspection.registrations.agentTools.map((t) => t.name).sort();
+    expect(all).toEqual(expect.arrayContaining(jiraTools));
+    const names = async () => (await configure()).tools.map((t) => t.name).sort();
+    expect(await names()).toEqual(all.filter((n) => !jiraTools.includes(n)));
+    await harness.behavior.setSettings({ jiraEnabled: true });
+    await flush();
+    expect(await names()).toEqual(all);
+  });
+
+  // registerJira alone, its settings reads held open so the test orders them.
+  async function bootHeld() {
+    const { registerJira } = await import("../lib/jira-server");
+    const { trackedRegisterTool } = await import("../lib/jira-agent");
+    const host = createFakePluginHost({ pluginId: "focus-board" });
+    harness = host.harness;
+    const tools: string[] = [];
+    trackedRegisterTool(host.bb.agents, tools)({ name: "upstream_tool", description: "u", parameters: z.object({}), execute: async () => "ok" });
+    const reads: ((v: Record<string, unknown>) => void)[] = [];
+    let onChange = () => {};
+    registerJira(host.bb, {
+      settings: () => new Promise((r) => reads.push(r)),
+      liveLinks: async () => [],
+      reconThreads: async () => [],
+      readLinks: async () => [],
+      addLink: async () => {},
+      onSettingsChange: (l) => void (onChange = l),
+      agentTools: tools,
+    });
+    return { reads, change: () => onChange() };
+  }
+
+  it("configure before the first settings read lands: the upstream tools, no Jira", async () => {
+    const { reads } = await bootHeld();
+    const c = await configure();
+    expect(c.tools.map((t) => t.name)).toEqual(["upstream_tool"]);
+    expect(c.instructions).toBeNull();
+    for (const r of reads) r({ jiraEnabled: true });
+    await flush();
+    expect((await configure()).tools.map((t) => t.name)).toContain("focus_board_jira_link");
+  });
+
+  it("settings reads resolving out of order: the latest read wins", async () => {
+    const { reads, change } = await bootHeld();
+    const onChange = change;
+    const names = async () => (await configure()).tools.map((t) => t.name);
+    const before = reads.length;
+    onChange(); // read A (stale: on)
+    onChange(); // read B (latest: off)
+    const [a, b] = reads.slice(before);
+    b!({ jiraEnabled: false });
+    a!({ jiraEnabled: true });
+    await flush();
+    expect(await names()).not.toContain("focus_board_jira_link");
+  });
+
+  it("a queued find-ticket on a thread linked before idle is skipped", async () => {
+    await load({ jiraEnabled: true });
+    status.set("t1", "active");
+    expect(await harness.behavior.callRpc("jira_card_action", { kind: "find-ticket", threadId: "t1" })).toEqual({ ok: true });
+    metadata.set("t1", { jira: rec({ links: [{ key: "PT-9", role: "owner", source: "agent" }] }) });
+    status.set("t1", "idle");
+    await harness.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "t1" }), lastAssistantText: null });
+    await vi.waitFor(() => expect(harness.inspection.logEntries.some((e) => /find-ticket/.test(e.message) && /linked/.test(e.message))).toBe(true));
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("configure follows a settings flip", async () => {

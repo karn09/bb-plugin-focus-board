@@ -11,7 +11,7 @@ import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { cliCommand, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { createIdleWaiters, sendIfIdle, type JobKind } from "./jira-idle";
-import { findTicketText, JIRA_LINK_TOOL, JIRA_SPAWN_TOOL, jiraConfigure, JiraLinkParams, promoteEpicText, SpawnChildParams, titleWithKey } from "./jira-agent";
+import { findTicketText, JIRA_AGENT_TOOLS, JIRA_LINK_TOOL, JIRA_SPAWN_TOOL, jiraConfigure, JiraLinkParams, promoteEpicText, SpawnChildParams, titleWithKey, trackedRegisterTool } from "./jira-agent";
 import { jiraBrowseUrl } from "./jira-keys";
 import { fixQueued, livePrs, prUrl } from "./jira-drift";
 import { applyReconcile, externalJiraKey, planReconcile, StoredReconcilePlan, threadPrsOf, type ReconThread } from "./jira-reconcile";
@@ -36,7 +36,7 @@ export type JiraDeps = {
   addLink: (threadId: string, link: ThreadLink) => Promise<void>;
   /** Subscribe to plugin settings changes (settings.onChange). */
   onSettingsChange?: (listener: () => void) => void;
-  /** The plugin's other agent tools: the one configure must keep selecting them. */
+  /** Names of every agent tool the plugin registers (filled through `tracked`); Jira's are added here too. */
   agentTools?: string[];
 };
 
@@ -122,17 +122,23 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   // configure is synchronous, so it reads a settings copy refreshed at load
   // and on every change (off until the first read lands).
   let cfg = jiraSettings({});
-  const refreshCfg = () =>
-    deps.settings().then((v) => {
-      cfg = jiraSettings(v);
+  let cfgSeq = 0; // reads can resolve out of order: only the latest one lands
+  const refreshCfg = () => {
+    const seq = ++cfgSeq;
+    return deps.settings().then((v) => {
+      if (seq === cfgSeq) cfg = jiraSettings(v);
     });
+  };
   const cfgFailed = (e: unknown) => bb.log.warn(`jira settings read failed: ${(e as Error).message}`);
   refreshCfg().catch(cfgFailed);
   // The plugin's only configure: with one registered, unselected tools are off,
-  // so the board's own tools are always selected; Jira's only while enabled.
+  // so every registered tool is selected, Jira's only while enabled.
+  const toolNames = deps.agentTools ?? [];
+  const registerTool = trackedRegisterTool(bb.agents, toolNames);
   bb.agents.configure((context) => {
     const j = jiraConfigure(cfg.enabled, cfg, context.pluginMetadata as Record<string, unknown>);
-    return { tools: [...(deps.agentTools ?? []), ...j.tools], skills: [], ...(j.instructions ? { instructions: j.instructions } : {}) };
+    const others = toolNames.filter((n) => !JIRA_AGENT_TOOLS.includes(n));
+    return { tools: [...others, ...j.tools], skills: [], ...(j.instructions ? { instructions: j.instructions } : {}) };
   });
 
   /** One card turn: sent now, or queued for the thread's next idle. A throw is "not sent". */
@@ -143,7 +149,12 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   };
   void idle.register("find-ticket", async (threadId) => {
     const s = jiraSettings(await deps.settings());
-    if (s.enabled) await turnOrWait(threadId, "find-ticket", findTicketText(s));
+    if (!s.enabled) return;
+    if ((await store.readThread(threadId)).links.length > 0) {
+      bb.log.info(`jira: skipped queued find-ticket on ${threadId}: already linked`);
+      return;
+    }
+    await turnOrWait(threadId, "find-ticket", findTicketText(s));
   });
   void idle.register("promote-epic", async (threadId, payload) => {
     if (typeof payload === "string" && (await enabled())) await turnOrWait(threadId, "promote-epic", promoteEpicText(payload), payload);
@@ -385,7 +396,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     }
   };
 
-  bb.agents.registerTool({
+  registerTool({
     name: JIRA_LINK_TOOL,
     description:
       "Link this bb thread to its Jira ticket once the operator chose it. role \"owner\" when the operator works it (claimed: whether you assigned it to the operator), \"watching\" when someone else owns it (pass ownerName). Prefixes the thread title with the key.",
@@ -418,7 +429,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     if (kids.length >= 2) await store.updateThread(parentId, () => ({ epicSuggested: true }));
   };
 
-  bb.agents.registerTool({
+  registerTool({
     name: JIRA_SPAWN_TOOL,
     description:
       "Spawn a child bb thread under this one, already linked to its Jira ticket. Create the child's ticket with acli first (after the operator confirmed it) and pass its key as ticketKey.",

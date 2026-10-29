@@ -4,6 +4,7 @@
 // schemas. Pure: no host, no SDK. Every ticket or record value put into text
 // is JSON.stringify-quoted (it is untrusted metadata, not directions).
 import { z } from "zod";
+import type { PluginAgents } from "@get-bb/plugin-sdk";
 import { JiraTicket, ThreadJiraRecord } from "./jira-schema";
 import type { JiraSettings } from "./jira-settings";
 import { extractJiraKeys } from "./jira-keys";
@@ -13,6 +14,14 @@ export const JIRA_SPAWN_TOOL = "focus_board_spawn_child";
 export const JIRA_AGENT_TOOLS = [JIRA_LINK_TOOL, JIRA_SPAWN_TOOL];
 
 const Key = JiraTicket.shape.key;
+
+/** bb.agents.registerTool that also records each name: the plugin's one configure selects every recorded tool. */
+export function trackedRegisterTool(agents: PluginAgents, names: string[]): PluginAgents["registerTool"] {
+  return ((tool: { name: string }) => {
+    names.push(tool.name);
+    agents.registerTool(tool as never);
+  }) as PluginAgents["registerTool"];
+}
 
 export const JiraLinkParams = z
   .object({
