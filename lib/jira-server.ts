@@ -66,9 +66,12 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     log: (m) => bb.log.warn(m),
   });
   // Queued idle-gated work (lib/jira-idle.ts). No handlers yet: later
-  // features register them, so with nothing registered no job ever runs.
+  // features register them (register re-sweeps queued jobs of its kind), so
+  // with nothing registered no job ever runs.
   const idle = createIdleWaiters(bb.storage.kv as never, {}, { threads: bb.sdk.threads as never, log: (m) => bb.log.warn(m) });
   bb.events.on("thread.idle", ({ thread }) => idle.onIdle(thread.id));
+  bb.events.on("thread.failed", ({ thread }) => idle.onIdle(thread.id)); // error is at rest
+  bb.events.on("thread.archived", ({ thread }) => idle.drop(thread.id));
   idle.resume().catch((e) => bb.log.warn(`jira idle resume failed: ${(e as Error).message}`));
   const fileOpt = {
     file: { type: "string" as const, required: true as const, description: "JSON file path" },

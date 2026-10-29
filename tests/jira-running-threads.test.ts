@@ -15,6 +15,12 @@ function fakeSdk(...rows: (Row | Error)[]) {
 }
 const idle: Row = { status: "idle", archivedAt: null };
 const active: Row = { status: "active", archivedAt: null };
+// Mirrors the SDK's BbHttpError (status, code, body from the server's ApiError).
+function httpError(status: number, code: string, details?: object) {
+  return Object.assign(new Error(`HTTP ${status}: ${code}`), {
+    name: "BbHttpError", status, code, body: { code, message: code, ...(details ? { details } : {}) },
+  });
+}
 
 function memKv() {
   const m = new Map<string, unknown>();
@@ -32,7 +38,7 @@ describe("sendIfIdle", () => {
     const sdk = fakeSdk(idle);
     expect(await sendIfIdle(sdk, "t1", "hi")).toBe("sent");
     expect(sdk.get).toHaveBeenCalledWith({ threadId: "t1" });
-    expect(sdk.send).toHaveBeenCalledWith({ threadId: "t1", mode: "auto", input: [{ type: "text", text: "hi" }] });
+    expect(sdk.send).toHaveBeenCalledWith({ threadId: "t1", mode: "start", input: [{ type: "text", text: "hi" }] });
   });
 
   it("re-reads status before every send (idle, then active)", async () => {
@@ -51,12 +57,33 @@ describe("sendIfIdle", () => {
     }
   });
 
-  it("returns gone for an archived, missing or unreadable thread", async () => {
-    for (const row of [{ status: "idle", archivedAt: 123 }, null, new Error("404")]) {
+  it("returns gone for an archived, null or 404 thread_not_found thread", async () => {
+    for (const row of [{ status: "idle", archivedAt: 123 }, null, httpError(404, "thread_not_found")]) {
       const sdk = fakeSdk(row);
       expect(await sendIfIdle(sdk, "t1", "x")).toBe("gone");
       expect(sdk.send).not.toHaveBeenCalled();
     }
+  });
+
+  it("any other read failure is busy (not gone) and logged", async () => {
+    const sdk = fakeSdk(new Error("ECONNRESET"));
+    const log = vi.fn();
+    expect(await sendIfIdle(sdk, "t1", "x", { log })).toBe("busy");
+    expect(sdk.send).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("ECONNRESET"));
+  });
+
+  it("a thread that went active between read and send: server 409 thread_not_writable is busy", async () => {
+    const sdk = fakeSdk(idle);
+    sdk.send.mockRejectedValueOnce(httpError(409, "thread_not_writable", { reason: "already_active" }));
+    expect(await sendIfIdle(sdk, "t1", "x")).toBe("busy");
+    expect(sdk.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("any other send error is rethrown (caller treats it as not sent)", async () => {
+    const sdk = fakeSdk(idle);
+    sdk.send.mockRejectedValueOnce(httpError(500, "internal_error"));
+    await expect(sendIfIdle(sdk, "t1", "x")).rejects.toMatchObject({ status: 500 });
   });
 });
 
@@ -150,13 +177,56 @@ describe("createIdleWaiters", () => {
     const rows: Record<string, Row> = { idle, busy: active, gone: { status: "idle", archivedAt: 1 } };
     const threads = { get: async ({ threadId }: { threadId: string }) => rows[threadId] ?? null, send: vi.fn() };
     const h = vi.fn(async () => {});
-    const w = createIdleWaiters(kv, { "done-check": h }, { threads });
+    const log = vi.fn();
+    const w = createIdleWaiters(kv, { "done-check": h }, { threads, log });
     await w.resume();
     expect(h).toHaveBeenCalledTimes(1);
     expect(h).toHaveBeenCalledWith("idle", 1);
     expect(kv.m.get(IDLE_JOBS_KEY)).toEqual([{ threadId: "busy", kind: "done-check", payload: 2, queuedAt }]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("dropped done-check job on gone"));
     await w.onIdle("busy");
     expect(h).toHaveBeenCalledWith("busy", 2);
+  });
+
+  it("resume keeps jobs when a thread read fails transiently", async () => {
+    const kv = memKv();
+    const queuedAt = "2026-10-29T00:00:00.000Z";
+    kv.m.set(IDLE_JOBS_KEY, [{ threadId: "t1", kind: "done-check", payload: 1, queuedAt }]);
+    const h = vi.fn(async () => {});
+    const w = createIdleWaiters(kv, { "done-check": h }, { threads: fakeSdk(new Error("timeout")), log: vi.fn() });
+    await w.resume();
+    expect(h).not.toHaveBeenCalled();
+    expect(kv.m.get(IDLE_JOBS_KEY)).toHaveLength(1);
+  });
+
+  it("register sweeps queued jobs of its kind on idle threads; busy ones keep waiting", async () => {
+    const kv = memKv();
+    const queuedAt = "2026-10-29T00:00:00.000Z";
+    kv.m.set(IDLE_JOBS_KEY, [
+      { threadId: "idle", kind: "done-check", payload: 1, queuedAt },
+      { threadId: "busy", kind: "done-check", payload: 2, queuedAt },
+      { threadId: "idle", kind: "nudge-turn", payload: 3, queuedAt },
+    ]);
+    const rows: Record<string, Row> = { idle, busy: active };
+    const threads = { get: async ({ threadId }: { threadId: string }) => rows[threadId] ?? null, send: vi.fn() };
+    const w = createIdleWaiters(kv, {}, { threads });
+    const h = vi.fn(async () => {});
+    await w.register("done-check", h);
+    expect(h).toHaveBeenCalledTimes(1);
+    expect(h).toHaveBeenCalledWith("idle", 1);
+    expect((kv.m.get(IDLE_JOBS_KEY) as { threadId: string; kind: string }[]).map((j) => `${j.threadId}/${j.kind}`)).toEqual(["busy/done-check", "idle/nudge-turn"]);
+  });
+
+  it("drop removes and logs every job of a thread", async () => {
+    const kv = memKv();
+    const log = vi.fn();
+    const w = createIdleWaiters(kv, {}, { threads: fakeSdk(active), log });
+    await w.waitFor("t1", "done-check");
+    await w.waitFor("t1", "nudge-turn");
+    await w.waitFor("t2", "nudge-turn");
+    await w.drop("t1");
+    expect((kv.m.get(IDLE_JOBS_KEY) as { threadId: string }[]).map((j) => j.threadId)).toEqual(["t2"]);
+    expect(log).toHaveBeenCalledTimes(2);
   });
 
   it("ignores a corrupt KV value", async () => {
@@ -179,45 +249,66 @@ describe("createIdleWaiters", () => {
 });
 
 // The only door: every thread send for the Jira feature goes through
-// lib/jira-idle.ts sendIfIdle. In jira files any `.send(` outside jira-idle
-// fails (catches an aliased `threads` object too). server.ts has no
-// threads.send from upstream, so it is covered as well, by the narrower
-// threads/queuedMessages pattern (an unrelated `.send(` there stays legal).
+// lib/jira-idle.ts sendIfIdle. In jira files (other than jira-idle.ts) any
+// send-shaped call, a "send" string key, destructured send, retry or
+// editMessage fails. server.ts has no threads.send from upstream, so it is
+// covered too, by a narrower set (threads/queuedMessages .send across
+// whitespace/newlines, and a "send" string key). Files are scanned whole so
+// a split across lines is still caught.
+const JIRA_FORBIDDEN = [
+  /\bsend\s*\(/,
+  /\.\s*send\b/,
+  /["'`]send["'`]/,
+  /\{[^}]*\bsend\b[^}]*\}\s*=/,
+  /\.\s*retry\s*\(/,
+  /editMessage/,
+];
+const SERVER_FORBIDDEN = [/(threads|queuedMessages)\s*\.\s*send\b/, /["'`]send["'`]/];
+const hits = (text: string, patterns: RegExp[]) => patterns.filter((p) => p.test(text)).map(String);
+
 describe("only door to a thread", () => {
-  it("no threads.send outside lib/jira-idle.ts", () => {
+  it("the guard catches each evasion", () => {
+    for (const evasion of [
+      "bb.sdk.threads.send({ threadId })",
+      "bb.sdk.threads\n  .send({ threadId })",
+      "const t = bb.sdk.threads; t.send(args)",
+      'bb.sdk.threads["send"](args)',
+      "const { send } = bb.sdk.threads;",
+      "const {\n  get,\n  send,\n} = bb.sdk.threads;",
+      "send({ threadId })",
+      "bb.sdk.threads.retry({ threadId })",
+      "bb.sdk.threads.editMessage({ threadId })",
+      "bb.sdk.threads.queuedMessages.send(args)",
+    ]) {
+      expect(hits(evasion, JIRA_FORBIDDEN), evasion).not.toEqual([]);
+    }
+    for (const evasion of ["bb.sdk.threads.send(x)", "bb.sdk.threads\n.send(x)", "queuedMessages . send(x)", "threads['send'](x)"]) {
+      expect(hits(evasion, SERVER_FORBIDDEN), evasion).not.toEqual([]);
+    }
+    expect(hits("await sendIfIdle(threads, id, text); // retry on next start", JIRA_FORBIDDEN)).toEqual([]);
+  });
+
+  it("no thread send outside lib/jira-idle.ts", () => {
     const jiraFiles = readdirSync("lib").filter((f) => /^jira-.*\.ts$/.test(f) && f !== "jira-idle.ts");
     expect(jiraFiles).toContain("jira-server.ts");
-    const offenders: string[] = [];
-    for (const f of jiraFiles) {
-      readFileSync(`lib/${f}`, "utf8").split("\n").forEach((line, i) => {
-        if (/\.\s*send\s*\(|threads\s*\.\s*send\b/.test(line)) offenders.push(`lib/${f}:${i + 1}: ${line.trim()}`);
-      });
-    }
-    readFileSync("server.ts", "utf8").split("\n").forEach((line, i) => {
-      if (/(threads|queuedMessages)\s*\.\s*send\b/.test(line)) offenders.push(`server.ts:${i + 1}: ${line.trim()}`);
-    });
+    const offenders = [
+      ...jiraFiles.flatMap((f) => hits(readFileSync(`lib/${f}`, "utf8"), JIRA_FORBIDDEN).map((p) => `lib/${f}: ${p}`)),
+      ...hits(readFileSync("server.ts", "utf8"), SERVER_FORBIDDEN).map((p) => `server.ts: ${p}`),
+    ];
     expect(offenders).toEqual([]);
   });
 });
 
-describe("registerJira wiring", () => {
-  it("thread.idle reaches onIdle; resume runs persisted jobs on start; no send when nothing is registered", async () => {
-    const { createFakePluginHost, makeThreadResponse } = await import("@get-bb/plugin-sdk/testing");
+describe("registerJira wiring (production path only)", () => {
+  async function boot(rows: Record<string, ReturnType<typeof import("@get-bb/plugin-sdk/testing").makeThreadResponse>>, jobs: object[]) {
+    const { createFakePluginHost } = await import("@get-bb/plugin-sdk/testing");
     const { registerJira } = await import("../lib/jira-server");
     const send = vi.fn(async () => ({}));
-    const rows: Record<string, ReturnType<typeof makeThreadResponse>> = {
-      t1: makeThreadResponse({ id: "t1", status: "active" }),
-      t2: makeThreadResponse({ id: "t2", status: "idle" }),
-    };
     const host = createFakePluginHost({
       pluginId: "focus-board",
-      sdk: { threads: { get: async ({ threadId }: { threadId: string }) => rows[threadId], send } },
+      sdk: { threads: { get: async ({ threadId }: { threadId: string }) => rows[threadId] ?? null, send } },
     });
-    const queuedAt = "2026-10-29T00:00:00.000Z";
-    await host.bb.storage.kv.set(IDLE_JOBS_KEY, [
-      { threadId: "t1", kind: "done-check", payload: "a", queuedAt },
-      { threadId: "t2", kind: "done-check", payload: "b", queuedAt },
-    ]);
+    await host.bb.storage.kv.set(IDLE_JOBS_KEY, jobs);
     const jira = registerJira(host.bb, {
       settings: async () => ({}),
       liveLinks: async () => [],
@@ -225,16 +316,52 @@ describe("registerJira wiring", () => {
       readLinks: async () => [],
       addLink: async () => {},
     });
+    return { host, jira, send };
+  }
+  const queuedAt = "2026-10-29T00:00:00.000Z";
+
+  it("register after start runs persisted jobs of idle threads; thread.idle runs the busy one; nothing sends", async () => {
+    const { makeThreadResponse } = await import("@get-bb/plugin-sdk/testing");
+    const rows = { t1: makeThreadResponse({ id: "t1", status: "active" }), t2: makeThreadResponse({ id: "t2", status: "idle" }) };
+    const { host, jira, send } = await boot(rows, [
+      { threadId: "t1", kind: "done-check", payload: "a", queuedAt },
+      { threadId: "t2", kind: "done-check", payload: "b", queuedAt },
+    ]);
+    // Let the startup resume finish first: it runs with no handlers, so only
+    // register's own sweep can run the idle thread's job.
+    await new Promise((r) => setTimeout(r, 20));
     const h = vi.fn(async () => {});
     jira.idle.register("done-check", h);
-    await jira.idle.resume();
-    expect(h).toHaveBeenCalledWith("t2", "b");
+    await vi.waitFor(() => expect(h).toHaveBeenCalledWith("t2", "b"));
     expect(h).not.toHaveBeenCalledWith("t1", "a");
     const { errors } = await host.harness.emitThreadEvent("thread.idle", { thread: rows.t1, lastAssistantText: null });
     expect(errors).toEqual([]);
     await vi.waitFor(() => expect(h).toHaveBeenCalledWith("t1", "a"));
     expect(h).toHaveBeenCalledTimes(2);
     expect(send).not.toHaveBeenCalled();
+    await host.harness.lifecycle.dispose();
+  });
+
+  it("thread.failed runs the thread's jobs (error is at rest)", async () => {
+    const { makeThreadResponse } = await import("@get-bb/plugin-sdk/testing");
+    const rows = { t1: makeThreadResponse({ id: "t1", status: "active" }) };
+    const { host, jira } = await boot(rows, [{ threadId: "t1", kind: "nudge-turn", payload: 1, queuedAt }]);
+    const h = vi.fn(async () => {});
+    await jira.idle.register("nudge-turn", h);
+    expect(h).not.toHaveBeenCalled();
+    rows.t1 = makeThreadResponse({ id: "t1", status: "error" });
+    await host.harness.emitThreadEvent("thread.failed", { thread: rows.t1, error: "boom" });
+    await vi.waitFor(() => expect(h).toHaveBeenCalledWith("t1", 1));
+    await host.harness.lifecycle.dispose();
+  });
+
+  it("thread.archived drops the thread's jobs and logs it", async () => {
+    const { makeThreadResponse } = await import("@get-bb/plugin-sdk/testing");
+    const rows = { t1: makeThreadResponse({ id: "t1", status: "active" }) };
+    const { host } = await boot(rows, [{ threadId: "t1", kind: "promote-epic", payload: 1, queuedAt }]);
+    await host.harness.emitThreadEvent("thread.archived", { thread: rows.t1 });
+    await vi.waitFor(async () => expect(await host.bb.storage.kv.get(IDLE_JOBS_KEY)).toEqual([]));
+    expect(host.harness.inspection.logEntries.some((e) => JSON.stringify(e).includes("dropped promote-epic job on t1"))).toBe(true);
     await host.harness.lifecycle.dispose();
   });
 });

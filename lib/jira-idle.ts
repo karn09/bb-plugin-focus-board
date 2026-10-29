@@ -16,8 +16,9 @@ export type IdleHandler = (threadId: string, payload: JsonValue | undefined) => 
 /** The slice of bb.sdk.threads this module uses. */
 export interface ThreadDoor {
   get(args: { threadId: string }): Promise<unknown>;
-  send(args: { threadId: string; mode: "auto"; input: { type: "text"; text: string }[] }): Promise<unknown>;
+  send(args: { threadId: string; mode: "start"; input: { type: "text"; text: string }[] }): Promise<unknown>;
 }
+type Log = (msg: string) => void;
 
 const Job = z.object({
   threadId: z.string(),
@@ -27,31 +28,62 @@ const Job = z.object({
 });
 type Job = { threadId: string; kind: JobKind; payload?: JsonValue; queuedAt: string };
 
+// SDK request errors (BbHttpError) carry the server's `status` and `code`
+// (also in `body.code`); duck-typed so it survives any serialization.
+function apiError(e: unknown): { status?: unknown; code?: unknown } {
+  const err = (e ?? {}) as { status?: unknown; code?: unknown; body?: { code?: unknown } };
+  return { status: err.status, code: err.code ?? err.body?.code };
+}
+
 // `idle` and `error` are at rest; active/starting/stopping/pending are running.
-async function threadState(threads: ThreadDoor, threadId: string): Promise<"idle" | "busy" | "gone"> {
+// Only a missing (404 thread_not_found / null) or archived thread is gone; any
+// other read failure is treated as busy so queued work keeps waiting.
+async function threadState(threads: ThreadDoor, threadId: string, log: Log): Promise<"idle" | "busy" | "gone"> {
   let row: { status?: unknown; archivedAt?: unknown } | null;
   try {
     row = (await threads.get({ threadId })) as typeof row;
-  } catch {
-    return "gone";
+  } catch (e) {
+    const { status, code } = apiError(e);
+    if (status === 404 || code === "thread_not_found") return "gone";
+    log(`jira idle: cannot read thread ${threadId}, treating as busy: ${(e as Error)?.message}`);
+    return "busy";
   }
   if (!row || row.archivedAt != null) return "gone";
   return row.status === "idle" || row.status === "error" ? "idle" : "busy";
 }
 
-export async function sendIfIdle(threads: ThreadDoor, threadId: string, text: string): Promise<"sent" | "busy" | "gone"> {
-  const state = await threadState(threads, threadId);
+/**
+ * The only way the Jira feature sends a turn. Re-reads the thread right
+ * before sending, then sends with mode "start", which the server rejects
+ * atomically (409 thread_not_writable) if the thread became active in
+ * between; that rejection returns "busy". Any other send error is rethrown:
+ * callers must treat a throw as "not sent".
+ */
+export async function sendIfIdle(
+  threads: ThreadDoor,
+  threadId: string,
+  text: string,
+  opts?: { log?: Log },
+): Promise<"sent" | "busy" | "gone"> {
+  const state = await threadState(threads, threadId, opts?.log ?? (() => {}));
   if (state !== "idle") return state;
-  await threads.send({ threadId, mode: "auto", input: [{ type: "text", text }] });
+  try {
+    await threads.send({ threadId, mode: "start", input: [{ type: "text", text }] });
+  } catch (e) {
+    const { status, code } = apiError(e);
+    if (status === 409 && code === "thread_not_writable") return "busy";
+    throw e;
+  }
   return "sent";
 }
 
 export function createIdleWaiters(
   kv: KvLike,
   handlers: Partial<Record<JobKind, IdleHandler>>,
-  deps: { threads: ThreadDoor; log?: (msg: string) => void },
+  deps: { threads: ThreadDoor; log?: Log },
 ) {
   const log = deps.log ?? (() => {});
+  const state = (threadId: string) => threadState(deps.threads, threadId, log);
   // One chain for every KV read-modify-write. Handlers run outside it, so a
   // handler can waitFor again without deadlocking.
   let chain: Promise<unknown> = Promise.resolve();
@@ -65,16 +97,21 @@ export function createIdleWaiters(
     const raw = await kv.get(IDLE_JOBS_KEY);
     return (Array.isArray(raw) ? raw : []).flatMap((r) => {
       const p = Job.safeParse(r);
+      if (!p.success) log(`jira idle: dropped malformed job ${JSON.stringify(r)}`);
       return p.success ? [p.data as Job] : [];
     });
   };
   const update = (fn: (jobs: Job[]) => Job[]) =>
     locked(async () => {
       const jobs = await read();
-      const next = fn(jobs);
-      await kv.set(IDLE_JOBS_KEY, next);
+      await kv.set(IDLE_JOBS_KEY, fn(jobs));
       return jobs;
     });
+  const drop = (threadId: string, why: string) =>
+    update((jobs) => {
+      for (const j of jobs) if (j.threadId === threadId) log(`jira idle: dropped ${j.kind} job on ${threadId} (${why})`);
+      return jobs.filter((j) => j.threadId !== threadId);
+    }).then(() => undefined);
 
   // Taken jobs are removed before they run: at most once, never a retry loop.
   async function onIdle(threadId: string): Promise<void> {
@@ -92,24 +129,32 @@ export function createIdleWaiters(
     }
   }
 
+  // Run queued jobs (optionally of one kind) on every thread that is at rest now.
+  async function sweep(kind?: JobKind): Promise<void> {
+    const ids = new Set((await read()).filter((j) => kind === undefined || j.kind === kind).map((j) => j.threadId));
+    for (const threadId of ids) {
+      const s = await state(threadId);
+      if (s === "idle") await onIdle(threadId);
+      else if (s === "gone") await drop(threadId, "thread gone");
+    }
+  }
+
   return {
     async waitFor(threadId: string, kind: JobKind, payload?: JsonValue): Promise<void> {
       const job: Job = { threadId, kind, ...(payload === undefined ? {} : { payload }), queuedAt: new Date().toISOString() };
       await update((jobs) => [...jobs.filter((j) => !(j.threadId === threadId && j.kind === kind)), job]);
       // The thread may have gone idle before the job was stored; its idle
       // event would then be missed.
-      if ((await threadState(deps.threads, threadId)) === "idle") await onIdle(threadId);
+      if ((await state(threadId)) === "idle") await onIdle(threadId);
     },
     onIdle,
-    async resume(): Promise<void> {
-      for (const threadId of new Set((await read()).map((j) => j.threadId))) {
-        const state = await threadState(deps.threads, threadId);
-        if (state === "idle") await onIdle(threadId);
-        else if (state === "gone") await update((jobs) => jobs.filter((j) => j.threadId !== threadId));
-      }
-    },
-    register(kind: JobKind, handler: IdleHandler): void {
+    /** Drop every queued job of a thread (archived), logging each. */
+    drop: (threadId: string) => drop(threadId, "thread archived"),
+    resume: () => sweep(),
+    /** Set a kind's handler, then run that kind's queued jobs on idle threads. */
+    register(kind: JobKind, handler: IdleHandler): Promise<void> {
       handlers[kind] = handler;
+      return sweep(kind).catch((e) => log(`jira idle sweep for ${kind} failed: ${(e as Error).message}`));
     },
   };
 }
