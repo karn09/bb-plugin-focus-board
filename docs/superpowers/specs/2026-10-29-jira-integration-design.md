@@ -83,15 +83,15 @@ heavier option. This fork builds the heavier option, for Jira only.
   in shipped code. It comes from the 2026-09-28 and 2026-10-05 security
   audits. Upstream removed a `gh` call under this rule (issue #236,
   `lib/tracker-refresh.ts`). So the plugin can't call `acli` or `gh`
-  directly as it stands. **How Jira and PR data reach the plugin is open
-  question Q0.**
+  directly as it stands. **Decided (D0): a companion script automation
+  carries Jira and PR data, and the rule stays intact.**
 - **PR data.** `lib/tracker-status.ts` reads the GitHub plugin's SQLite cache
   at `~/.bb/plugins/github/data.db`, which doesn't exist on the operator's
   machine. That cache holds only state, title and update time anyway. The
   `bb--github-pr-status` cache covers only the current branch's PR per
   environment. The Done check, deeper check, drift warnings and
   reconciliation all need PR state, and the deeper check and reconciliation
-  also need checks and bodies. They get it the same way as Jira data (Q0).
+  also need checks and bodies. They get it the same way as Jira data (D0).
   **A PR state older than its last refresh never counts as a pass.** If PR
   data is missing or stale, the Done check asks the operator instead of
   passing.
@@ -110,7 +110,7 @@ heavier option. This fork builds the heavier option, for Jira only.
 - **Push notifications.** No plugin API sends an arbitrary push. bb's
   push-notifications plugin sends one only on `thread.idle` and
   `thread.failed`, filtered by the thread's notification level. So *a push
-  happens only when the thread finishes a turn*. See open question Q1.
+  happens only when the thread finishes a turn*. See D1.
 - **Fork hygiene.** Upstream ships often (1.3.1 to 1.7.3 in about two weeks).
   Put new behavior in new files (`lib/jira-*.ts`, `components/jira-*.tsx`,
   tests under `tests/jira-*.test.ts`). Keep edits to existing files to small,
@@ -125,8 +125,8 @@ heavier option. This fork builds the heavier option, for Jira only.
   store's `external` records. Add a structured `jira: { key }` field so links
   don't have to be parsed from URLs. The ticket-side view (which threads point
   at PT-3879) is derived from that.
-- **Ticket cache.** Every 5 minutes, through whichever transport Q0 picks, a
-  Jira search fetches (a) unresolved tickets assigned to the operator in the configured
+- **Ticket cache.** Every 5 minutes, the companion script (D0) runs a
+  Jira search that fetches (a) unresolved tickets assigned to the operator in the configured
   projects and (b) every ticket any thread links to. It stores key, summary,
   status, status category, assignee, parent/epic, issue type, updated time and
   URL in `bb.storage.kv`. Board reads come only from the cache, never live.
@@ -212,7 +212,7 @@ isn't there already. Instructions also tell the agent to put the key in branch
 names and PR titles. This is what makes the manager's PR-to-key matching and
 Jira's GitHub integration work.
 
-**Where a new ticket goes** (project and parent epic) is open question Q2.
+**Where a new ticket goes** (project and parent epic): see D2.
 
 ## 3. Done check
 
@@ -273,7 +273,7 @@ their nudge says "no ticket yet".
 - The card moves to **Needs you**, with a reason line: "waiting on review
   (#645)", "waiting on you", "no ticket yet", "PR merged, ready for Done?".
 - The thread is marked unread.
-- Push notification: see Q1.
+- Push notification: yes, through a tiny status turn (D1).
 
 **Day *m*, the deeper check** (run by the scheduler, plugin-side, no agent
 turn):
@@ -327,7 +327,8 @@ apply, matching `sweep`'s pattern).
 
 | Setting | Default |
 |---|---|
-| Jira projects | `PT, SRE` |
+| Jira projects searched | `PT, SRE` |
+| Default project for new tickets | `SRE` |
 | Nudge a quiet thread after (days) | 2 |
 | Run a deeper check after (days) | 5 |
 | Stale assigned ticket after (days) | 30 |
@@ -360,31 +361,59 @@ apply, matching `sweep`'s pattern).
 - Whether the Jira column shows in views other than Attention.
 - Test layout, following the coverage matrix.
 
-## Open questions for the operator
+## Decisions (operator, 2026-10-29)
 
-- **Q0. How Jira and PR data reach the plugin** (see Constraints). Options:
-  - **(a) Companion script automation.** Keeps the rule. A bb script
-    automation (the same mechanism upstream uses for its node_modules
-    watchdog) runs `acli` and `gh` every few minutes and writes a JSON
-    snapshot the plugin reads with `fs`.
-    - Writes such as claim, transition and comment are done by agents in
-      threads. Matching and the Done comment already involve a turn.
-    - Writes from a click are queued for the next script run, so they land
-      within a minute or so, not instantly.
-    - No edits to the gate or test, so rebasing on upstream stays clean.
-  - **(b) A narrow exception in the fork.** Allow `execFile` of exactly two
-    absolute paths (`acli`, `gh`), with argument arrays and no shell, behind
-    one wrapper file. The gate and test are edited to allow that file only.
-    - Writes from a click are instant.
-    - The rule's history is a security decision, and the gate and test
-      conflict on every rebase.
-  - **(c) Jira REST with a token.** Breaks "no stored tokens". Listed only to
-    rule it out.
-- **Q1. Push on nudge.** bb sends a push only when a thread finishes a turn.
-  A push at day *n* means the plugin sends each quiet thread a tiny turn
-  ("one-line status: what is this waiting on?"). That costs a small model call
-  per nudge and gives a fresh status line, which then becomes the card's
-  reason. Without it, nudges are visual only, and the day-*m* check could
-  send the push instead.
-- **Q2. Where new tickets go.** Which project (PT vs SRE) and which parent
-  epic by default? Does the agent propose them per ticket?
+- **D0. Transport: companion script automation.** The plugin keeps upstream's
+  no-process-execution rule untouched.
+  - **Reads.** A bb script automation (the mechanism upstream uses for its
+    node_modules watchdog) runs `acli` and `gh` on the operator's host every
+    few minutes. It writes one JSON snapshot that the plugin reads with `fs`:
+    - tickets assigned to the operator
+    - every linked ticket
+    - every linked PR: state, merged, checks, review decision, branch, body
+    - recent merged PRs that mention a linked key
+
+    The plugin shows the snapshot's age, and treats data older than two
+    refresh intervals as stale.
+  - **Writes.**
+    - *In-thread writes* are done by the thread's agent running `acli`, guided
+      by `bb.agents.configure` instructions: claim, In Progress, create, the
+      Done comment and transition. Matching and the Done check already involve
+      a turn.
+    - *Click writes* from the board, such as drift fixes, "Give back" and
+      Start-thread's In Progress, go into a write queue file. The script
+      drains it on its next run and records each result, and the card shows
+      "pending" until then.
+    - The queue holds only structured operations (`transition`, `assign`,
+      `comment`, `create`) with validated keys, never shell text.
+  - **Setup.** The plugin ships the script in the repo, and a
+    `bb focus-board jira setup` command prints the exact `bb automation
+    create` line for the operator to run. The plugin doesn't create the
+    automation itself.
+  - **Builder's call:** the snapshot and queue file locations (under the
+    plugin's data dir), the interval (default 2 min), and the script language
+    (bash or node).
+- **D1. Push on the day-2 nudge: yes.**
+  - The nudge sends the quiet thread one tiny turn ("In one line: what is this
+    thread waiting on?"), only when the thread is idle.
+  - The turn's completion fires bb's normal push. The agent's one-line answer
+    becomes the card's reason line.
+  - The day-5 deeper check stays plugin-side and needs no turn.
+  - **Rate cap:** at most 3 nudge turns per scheduler pass, oldest first, with
+    the rest carried to the next pass. This is the builder's default; make it
+    a setting.
+  - If the thread's push level is muted, still send the turn. Muted is the
+    operator's choice.
+- **D2. New tickets go to SRE by default.**
+  - Add a setting for the default project.
+  - **Epics are proposed, not defaulted.** When drafting, the agent judges
+    whether the work is ticket-shaped or epic-shaped. Epic-shaped means
+    multiple deliverables, likely child threads, or work spanning weeks.
+  - For *ticket-shaped* work, it proposes a parent epic from open epics in the
+    project (or none).
+  - For *epic-shaped* work, it proposes creating an epic, with the current
+    thread's piece as its first child ticket.
+  - The operator confirms or edits either proposal.
+  - A thread that later spins off two or more children while its ticket
+    isn't an epic gets a one-time card suggestion: "Promote <key> to an epic?"
+    This writes nothing until clicked.
