@@ -113,13 +113,14 @@ export function planReconcile(input: {
 /** Board link write for one auto-link (server.ts's link_set path). */
 export type LinkWriter = (threadId: string, key: string) => Promise<void>;
 
-export type ApplyResult = { failed: { threadId: string; error: string }[] };
+export type ApplyResult = { failed: { threadId: string; stage: "link" | "enroll"; error: string }[] };
 
 /**
  * resetEnrollment (set only by the jiraEnabled false→true trigger): every
  * planned thread is enrolled at `now`, so time spent with the feature off
  * never counts toward a nudge. Otherwise the first enrolledAt is kept.
- * A thread whose writes fail is skipped and reported; the rest still apply.
+ * Failures are per thread and reported; a failed link write still lets the
+ * thread's enrollment update run, so a reset is never skipped silently.
  */
 export async function applyReconcile(
   plan: ReconcilePlan,
@@ -132,18 +133,27 @@ export async function applyReconcile(
   const byThread = new Map<string, string[]>(plan.enroll.map((id) => [id, []]));
   for (const { threadId, key } of plan.autoLinks) byThread.set(threadId, [...(byThread.get(threadId) ?? []), key]);
   const failed: ApplyResult["failed"] = [];
+  const err = (e: unknown) => (e as Error).message;
   for (const [threadId, keys] of byThread) {
+    const linked: string[] = [];
+    for (const key of keys) {
+      try {
+        await linkWriter(threadId, key);
+        linked.push(key);
+      } catch (e) {
+        failed.push({ threadId, stage: "link", error: err(e) });
+      }
+    }
     try {
-      for (const key of keys) await linkWriter(threadId, key);
       await store.updateThread(threadId, (cur) => {
         const have = new Set(cur.links.map((l) => l.key));
         return {
-          links: keys.filter((k) => !have.has(k)).map((key) => ({ key, role: "owner" as const, source: "auto" as const })),
+          links: linked.filter((k) => !have.has(k)).map((key) => ({ key, role: "owner" as const, source: "auto" as const })),
           enrolledAt: opts?.resetEnrollment === true ? at : (cur.enrolledAt ?? at),
         };
       });
     } catch (e) {
-      failed.push({ threadId, error: (e as Error).message });
+      failed.push({ threadId, stage: "enroll", error: err(e) });
     }
   }
   return { failed };

@@ -37,7 +37,7 @@ export const JIRA_RECONCILE_CHANGED = "jira-reconcile-changed";
 
 const AppliedPlan = StoredReconcilePlan.extend({
   /** Threads skipped because a write failed; the rest applied. */
-  failed: z.array(z.object({ threadId: z.string(), error: z.string() })),
+  failed: z.array(z.object({ threadId: z.string(), stage: z.enum(["link", "enroll"]), error: z.string() })),
 });
 type AppliedPlan = z.infer<typeof AppliedPlan>;
 
@@ -184,20 +184,23 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     const link = makeExternalLink(jiraBrowseUrl(key), key, "auto", new Date());
     await deps.addLink(threadId, { ...link, jira: { key } });
   };
-  // Serialized so the start check and a settings flip never apply twice at once.
+  // Every PLAN_KEY write (apply, plan refresh) runs on one chain, so the
+  // start check, a settings flip and an RPC never interleave.
   let applying: Promise<unknown> = Promise.resolve();
-  const reconcileApply = (opts?: { resetEnrollment?: boolean }): Promise<AppliedPlan> => {
-    const run = applying.then(async () => {
+  const serial = <T>(task: () => Promise<T>): Promise<T> => {
+    const run = applying.then(task);
+    applying = run.catch(() => undefined);
+    return run;
+  };
+  const reconcileApply = (opts?: { resetEnrollment?: boolean }): Promise<AppliedPlan> =>
+    serial(async () => {
       const plan = await freshPlan();
       const { failed } = await applyReconcile(plan, store, linkWriter, Date.parse(plan.generatedAt), opts);
-      for (const f of failed) bb.log.warn(`jira reconcile: skipped thread ${f.threadId}: ${f.error}`);
+      for (const f of failed) bb.log.warn(`jira reconcile: thread ${f.threadId} ${f.stage} failed: ${f.error}`);
       await bb.storage.kv.set(PLAN_KEY, plan);
       bb.realtime.publish(JIRA_RECONCILE_CHANGED, { generatedAt: plan.generatedAt });
       return { ...plan, failed };
     });
-    applying = run.catch(() => undefined);
-    return run;
-  };
   // An operator-requested apply (CLI --confirm, RPC) needs the feature on:
   // enrolling while it is off would make the later enable nudge at once.
   const OFF = "Jira is off — enable it first; the dry run works without it";
@@ -216,7 +219,12 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         return;
       }
       if (seen) return;
-      await reconcileApply({ resetEnrollment: true });
+      const { failed } = await reconcileApply({ resetEnrollment: true });
+      // A thread left un-reset could be nudged at once: retry on next start.
+      if (failed.some((f) => f.stage === "enroll")) {
+        bb.log.warn("jira reconcile on enable: some enrollments failed; will retry on next start");
+        return;
+      }
       await bb.storage.kv.set(ENABLED_SEEN_KEY, true);
     }).catch((e) => bb.log.warn(`jira reconcile on enable failed: ${(e as Error).message}`)));
   checkFirstEnable().catch(() => undefined);
@@ -225,16 +233,17 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   });
 
   bb.rpc.register(jiraRpcContract, {
-    jira_reconcile_plan: async () => {
-      const stored = StoredReconcilePlan.safeParse(await bb.storage.kv.get(PLAN_KEY));
-      if (!stored.success) return freshPlan();
-      // A newer snapshot than the stored plan: refresh the dry plan (no apply).
-      const { snapshot } = await store.readSnapshot();
-      if (snapshot === null || !(Date.parse(snapshot.takenAt) > Date.parse(stored.data.generatedAt))) return stored.data;
-      const plan = await freshPlan();
-      await bb.storage.kv.set(PLAN_KEY, plan);
-      return plan;
-    },
+    jira_reconcile_plan: () =>
+      serial(async () => {
+        const stored = StoredReconcilePlan.safeParse(await bb.storage.kv.get(PLAN_KEY));
+        if (!stored.success) return freshPlan();
+        // A newer snapshot than the stored plan: refresh the dry plan (no apply).
+        const { snapshot } = await store.readSnapshot();
+        if (snapshot === null || !(Date.parse(snapshot.takenAt) > Date.parse(stored.data.generatedAt))) return stored.data;
+        const plan = await freshPlan();
+        await bb.storage.kv.set(PLAN_KEY, plan);
+        return plan;
+      }),
     jira_reconcile_apply: async () => {
       if (!(await enabled())) throw new Error(OFF);
       return reconcileApply();

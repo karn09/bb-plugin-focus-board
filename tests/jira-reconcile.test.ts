@@ -195,10 +195,12 @@ describe("applyReconcile", () => {
     };
     const r = await applyReconcile(planReconcile(input), store, writer, NOW);
     expect(r.failed).toEqual([
-      { threadId: "bc", error: "link write failed" },
-      { threadId: "waf", error: "metadata write failed" },
+      { threadId: "bc", stage: "link", error: "link write failed" },
+      { threadId: "waf", stage: "enroll", error: "metadata write failed" },
     ]);
     expect((await orig("utf", () => ({}))).enrolledAt).toBe(new Date(NOW).toISOString());
+    // A failed link write still enrolls the thread (but records no link for it).
+    expect(await store.readThread("bc")).toEqual(expect.objectContaining({ enrolledAt: new Date(NOW).toISOString(), links: [] }));
     expect((await store.readThread("e")).links).toHaveLength(1);
   });
 
@@ -216,6 +218,7 @@ describe("reconcile wiring (fake host)", () => {
   const metadata = new Map<string, Record<string, unknown>>();
   const send = vi.fn(async () => ({}));
   let failWrites = new Set<string>();
+  let failLinkWrites = new Set<string>();
   const rows = () => [
     makeThreadResponse({ id: "a", title: "PT-3878 A: plan the cutover" }),
     { ...makeThreadResponse({ id: "run", title: "PT-3570 wire up reviewer", status: "active" }), environmentBranchName: null },
@@ -230,6 +233,7 @@ describe("reconcile wiring (fake host)", () => {
     metadata.clear();
     send.mockClear();
     failWrites = new Set();
+    failLinkWrites = new Set();
     clock = NOW;
     vi.spyOn(Date, "now").mockImplementation(() => clock);
     host = createFakePluginHost({
@@ -242,6 +246,7 @@ describe("reconcile wiring (fake host)", () => {
           getPluginMetadata: async ({ threadId }: { threadId: string }) => metadata.get(threadId) ?? {},
           updatePluginMetadata: async ({ threadId, set, remove }: { threadId: string; set?: Record<string, unknown>; remove?: string[] }) => {
             if (failWrites.has(threadId)) throw new Error(`write failed for ${threadId}`);
+            if (failLinkWrites.has(threadId) && set?.linkedIssues !== undefined) throw new Error(`link write failed for ${threadId}`);
             const next = { ...(metadata.get(threadId) ?? {}), ...(set ?? {}) };
             for (const k of remove ?? []) delete next[k];
             metadata.set(threadId, next);
@@ -323,7 +328,7 @@ describe("reconcile wiring (fake host)", () => {
     await load({ jiraEnabled: true }, { seen: true });
     failWrites.add("pg");
     const r = (await harness.behavior.callRpc("jira_reconcile_apply", null)) as { failed: { threadId: string }[] };
-    expect(r.failed.map((f) => f.threadId)).toEqual(["pg"]);
+    expect(r.failed.map((f) => [f.threadId, f.stage])).toEqual([["pg", "link"], ["pg", "enroll"]]);
     expect(enrolledAt("utf")).toBeTruthy();
     expect(enrolledAt("a")).toBeTruthy();
   });
@@ -355,6 +360,36 @@ describe("reconcile wiring (fake host)", () => {
     expect(await host.bb.storage.kv.get("jira:enabled-seen")).toBe(false);
     clock = NOW + 30 * 86_400_000;
     await flip(true);
+    expect(await host.bb.storage.kv.get("jira:enabled-seen")).toBe(true);
+    expect(enrolledAt("a")).toBe(new Date(clock).toISOString());
+    expect(enrolledAt("utf")).toBe(new Date(clock).toISOString());
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("flip: a failed link write still resets that thread's enrolledAt", async () => {
+    await load();
+    metadata.set("a", { jira: { links: [], enrolledAt: "2026-09-01T00:00:00.000Z", verifying: null, doneCheck: null, nudgedAt: null, deepCheckedAt: null, reason: null, checkInWith: null } });
+    failLinkWrites.add("a");
+    await flip(true);
+    expect(enrolledAt("a")).toBe(new Date(NOW).toISOString());
+    expect(metadata.get("a")?.linkedIssues).toBeUndefined();
+    expect(await host.bb.storage.kv.get("jira:enabled-seen")).toBe(true);
+  });
+
+  it("flip: a failed enrollment leaves seen unset, and the next start re-runs with reset", async () => {
+    await load();
+    metadata.set("a", { jira: { links: [], enrolledAt: "2026-09-01T00:00:00.000Z", verifying: null, doneCheck: null, nudgedAt: null, deepCheckedAt: null, reason: null, checkInWith: null } });
+    failWrites.add("a");
+    await flip(true);
+    expect(await host.bb.storage.kv.get("jira:enabled-seen")).not.toBe(true);
+    expect(enrolledAt("a")).toBe("2026-09-01T00:00:00.000Z");
+    expect(enrolledAt("utf")).toBe(new Date(NOW).toISOString());
+
+    failWrites.clear();
+    clock = NOW + 3_600_000;
+    host = await harness.lifecycle.reload(server);
+    harness = host.harness;
+    await settle();
     expect(await host.bb.storage.kv.get("jira:enabled-seen")).toBe(true);
     expect(enrolledAt("a")).toBe(new Date(clock).toISOString());
     expect(enrolledAt("utf")).toBe(new Date(clock).toISOString());
