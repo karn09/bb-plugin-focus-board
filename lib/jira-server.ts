@@ -30,9 +30,8 @@ function readJsonFile(path: string): unknown {
 }
 
 export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
-  let refreshMinutes = 2; // refreshed from settings by `status` before it reads the snapshot
   const store: JiraStore = createJiraStore(bb.storage.kv as never, bb.sdk.threads as never, Date.now, {
-    refreshMinutes: () => refreshMinutes,
+    refreshMinutes: async () => jiraSettings(await deps.settings()).refreshMinutes,
     log: (m) => bb.log.warn(m),
   });
   const fileOpt = {
@@ -49,8 +48,15 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       } catch (e) {
         return fail(`cannot read ${input.options.file}: ${(e as Error).message}`);
       }
-      const r = await store.ingestSnapshot(raw);
-      return r.ok ? { exitCode: 0, stdout: "ingested\n" } : fail(`invalid snapshot: ${r.error}`);
+      try {
+        const r = await store.ingestSnapshot(raw);
+        if (!r.ok) return fail(`invalid snapshot: ${r.error}`);
+        const failed = (raw as { ok?: unknown; error?: unknown }).ok === false;
+        const why = (raw as { error?: unknown }).error;
+        return { exitCode: 0, stdout: failed ? `ingested (failure: ${typeof why === "string" ? why : "snapshot not ok"})\n` : "ingested\n" };
+      } catch (e) {
+        return fail(`cannot store snapshot: ${(e as Error).message}`);
+      }
     },
   });
 
@@ -92,7 +98,11 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         return fail(`cannot read ${input.options.file}: ${(e as Error).message}`);
       }
       if (!parsed.success) return fail(`invalid results: ${parsed.error.message}`);
-      await store.ack(parsed.data);
+      try {
+        await store.ack(parsed.data);
+      } catch (e) {
+        return fail(`cannot record results: ${(e as Error).message}`);
+      }
       return { exitCode: 0, stdout: `acked ${parsed.data.length}\n` };
     },
   });
@@ -101,12 +111,11 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     summary: "Jira snapshot age, pending ops and recent results",
     async run() {
       const s = jiraSettings(await deps.settings());
-      refreshMinutes = s.refreshMinutes;
-      const { snapshot, ageMs, stale } = await store.readSnapshot();
+      const { snapshot, ageMs, stale, error } = await store.readSnapshot();
       const ops = await store.pendingOps();
       const lines = [
         snapshot === null
-          ? "snapshot: none"
+          ? `snapshot: none${error ? ` (last refresh failed: ${error})` : ""}`
           : `snapshot: ${snapshot.ok ? "ok" : `error: ${snapshot.error}`}${stale ? " (stale)" : ""}, age ${ageMs === null ? "?" : `${Math.floor(ageMs / 1000)}s`}`,
         `pending ops: ${ops.length}`,
         ...(await store.recentResults(5)).map((r) => `result ${r.id}: ${r.ok ? `ok${r.createdKey ? ` ${r.createdKey}` : ""}` : `error ${r.error}`}`),

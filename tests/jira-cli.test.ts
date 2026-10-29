@@ -21,6 +21,7 @@ const fixture = (over: object = {}) => ({
 
 describe("bb focus-board jira CLI", () => {
   let harness: FakePluginHarness;
+  let host: ReturnType<typeof createFakePluginHost>;
   const metadata = new Map<string, Record<string, unknown>>();
   let threads: ReturnType<typeof makeThreadResponse>[] = [];
   const dir = mkdtempSync(join(tmpdir(), "jira-cli-"));
@@ -33,7 +34,7 @@ describe("bb focus-board jira CLI", () => {
   async function load() {
     metadata.clear();
     threads = [];
-    const host = createFakePluginHost({
+    host = createFakePluginHost({
       pluginId: "focus-board",
       sdk: {
         threads: {
@@ -82,6 +83,42 @@ describe("bb focus-board jira CLI", () => {
     expect(w.prRefs).toEqual([{ repo: "o/r", number: 7 }]);
     expect(w.projects).toEqual(["PT", "SRE"]);
     expect(w.branchHeads).toEqual([]);
+  });
+
+  it("failed first snapshot: ingest and status surface the error", async () => {
+    await load();
+    const r = await harness.behavior.runCli(["jira", "ingest", "--file", file("f.json", { ok: false, error: "acli signed out" })]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("ingested (failure: acli signed out)");
+    expect((await harness.behavior.runCli(["jira", "status"])).stdout).toContain("acli signed out");
+  });
+
+  it("status staleness follows live settings without running status first", async () => {
+    await load();
+    const old = fixture({ takenAt: new Date(Date.now() - 5 * 60_000).toISOString() });
+    await harness.behavior.runCli(["jira", "ingest", "--file", file("o.json", old)]);
+    expect((await harness.behavior.runCli(["jira", "status"])).stdout).toContain("(stale)");
+  });
+
+  it("rejects stdin, and invalid JSON leaves the stored snapshot unchanged", async () => {
+    await load();
+    await harness.behavior.runCli(["jira", "ingest", "--file", file("g.json", fixture())]);
+    const dash = await harness.behavior.runCli(["jira", "ingest", "--file", "-"]);
+    expect(dash.exitCode).toBe(1);
+    expect(dash.stderr).toContain("stdin");
+    const p = join(dir, "junk.json");
+    writeFileSync(p, "{not json");
+    expect((await harness.behavior.runCli(["jira", "ingest", "--file", p])).exitCode).toBe(1);
+    expect((await harness.behavior.runCli(["jira", "status"])).stdout).toContain("ok, age 0s");
+  });
+
+  it("ack removes a pending op", async () => {
+    await load();
+    await harness.behavior.runCli(["jira", "ingest", "--file", file("h.json", fixture())]);
+    await host.bb.storage.kv.set("jira:queue", [{ id: "op1", createdAt: "2026-10-29T00:00:00Z", threadId: null, op: "comment", key: "PT-1", body: "x" }]);
+    expect(JSON.parse((await harness.behavior.runCli(["jira", "queue", "--json"])).stdout).ops).toHaveLength(1);
+    await harness.behavior.runCli(["jira", "ack", "--file", file("k.json", [{ id: "op1", ok: true, error: null, createdKey: null }])]);
+    expect(JSON.parse((await harness.behavior.runCli(["jira", "queue", "--json"])).stdout).ops).toEqual([]);
   });
 
   it("queue and ack round-trip", async () => {

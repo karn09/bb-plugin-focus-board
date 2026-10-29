@@ -48,7 +48,7 @@ export function createJiraStore(
   kv: KvLike,
   threads: MetadataLike,
   now: () => number,
-  opts?: { refreshMinutes?: () => number; log?: (msg: string) => void },
+  opts?: { refreshMinutes?: () => number | Promise<number>; log?: (msg: string) => void },
 ) {
   // One in-process chain serializes every read-modify-write (rows and
   // thread records alike), like the board's withKvWriteLock.
@@ -109,14 +109,21 @@ export function createJiraStore(
       return { ok: true };
     },
 
-    async readSnapshot(): Promise<{ snapshot: JiraSnapshot | null; ageMs: number | null; stale: boolean }> {
+    async readSnapshot(): Promise<{
+      snapshot: JiraSnapshot | null;
+      ageMs: number | null;
+      stale: boolean;
+      /** Last refresh failure (kept even with no prior good snapshot), else null. */
+      error: string | null;
+    }> {
+      const failure = await kv.get(SNAPSHOT_FAILURE_KEY);
+      const error = typeof failure === "string" ? failure : null;
       const p = JiraSnapshot.safeParse(await kv.get(SNAPSHOT_KEY));
-      if (!p.success) return { snapshot: null, ageMs: null, stale: true };
+      if (!p.success) return { snapshot: null, ageMs: null, stale: true, error };
       const taken = Date.parse(p.data.takenAt);
       const ageMs = Number.isNaN(taken) ? null : Math.max(0, now() - taken);
-      const failed = (await kv.get(SNAPSHOT_FAILURE_KEY)) != null;
-      const refresh = opts?.refreshMinutes?.() ?? 2;
-      return { snapshot: p.data, ageMs, stale: failed || ageMs === null || ageMs > 2 * refresh * 60_000 };
+      const refresh = (await opts?.refreshMinutes?.()) ?? 2;
+      return { snapshot: p.data, ageMs, stale: failure != null || ageMs === null || ageMs > 2 * refresh * 60_000, error };
     },
 
     enqueue(op: Omit<QueueOp, "id" | "createdAt">): Promise<QueueOp> {

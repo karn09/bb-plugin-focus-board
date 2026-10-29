@@ -5,7 +5,7 @@ import type { JiraSnapshot } from "../lib/jira-schema";
 const MIN = 60_000;
 const T0 = Date.parse("2026-10-29T12:00:00Z");
 
-function setup(opts?: { refreshMinutes?: () => number }, failSetAfter = Infinity) {
+function setup(opts?: { refreshMinutes?: () => number | Promise<number> }, failSetAfter = Infinity) {
   const kv = new Map<string, unknown>();
   let sets = 0;
   const meta = new Map<string, Record<string, unknown>>();
@@ -54,9 +54,22 @@ describe("snapshot", () => {
     expect(r.stale).toBe(true);
     expect(r.ageMs).toBe(5 * MIN);
   });
+  it("async refreshMinutes: 10 keeps a 5-min snapshot fresh, 2 makes it stale", async () => {
+    for (const [m, stale] of [[10, false], [2, true]] as const) {
+      const { store, advance } = setup({ refreshMinutes: async () => m });
+      await store.ingestSnapshot(snap());
+      advance(5 * MIN);
+      expect((await store.readSnapshot()).stale).toBe(stale);
+    }
+  });
+  it("surfaces a failure even with no prior good snapshot", async () => {
+    const { store } = setup();
+    await store.ingestSnapshot({ ok: false, error: "acli signed out" });
+    expect(await store.readSnapshot()).toMatchObject({ snapshot: null, stale: true, error: "acli signed out" });
+  });
   it("defaults refresh to 2 and is stale with no snapshot", async () => {
     const { store, advance } = setup();
-    expect(await store.readSnapshot()).toEqual({ snapshot: null, ageMs: null, stale: true });
+    expect(await store.readSnapshot()).toEqual({ snapshot: null, ageMs: null, stale: true, error: null });
     await store.ingestSnapshot(snap());
     advance(4 * MIN + 1);
     expect((await store.readSnapshot()).stale).toBe(true);
