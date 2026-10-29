@@ -48,10 +48,13 @@ export type ExternalItemLink = {
   hostname: string;
   /** Optional display text (e.g. "PROJ-142"); falls back to the hostname. */
   label?: string;
+  /** Jira issue this link points at, when the Jira integration wrote it. */
+  jira?: { key: string };
   createdAt: string;
   source: "agent" | "operator" | "auto";
 };
 
+const JIRA_KEY_OK = /^[A-Z][A-Z0-9]+-\d+$/;
 const LINK_SOURCES = new Set(["agent", "operator", "auto"]);
 const LINK_KINDS = new Set(["issue", "pull"]);
 
@@ -148,6 +151,12 @@ function parseLink(value: JsonValue, index: number): ThreadLink {
     const link: ExternalItemLink = { tracker, url, hostname, createdAt, source };
     if (typeof entry["label"] === "string" && entry["label"].length > 0) {
       link.label = entry["label"];
+    }
+    // A malformed jira field is dropped, not fatal: the link is still valid.
+    const jira = entry["jira"];
+    if (typeof jira === "object" && jira !== null && !Array.isArray(jira)) {
+      const key = jira["key"];
+      if (typeof key === "string" && JIRA_KEY_OK.test(key)) link.jira = { key };
     }
     return link;
   }

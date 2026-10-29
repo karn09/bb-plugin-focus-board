@@ -452,3 +452,15 @@ describe("makeExternalLink", () => {
     expect(() => makeExternalLink("not a url", undefined, "operator", new Date())).toThrow();
   });
 });
+
+describe("jira external link field", () => {
+  const base = { tracker: "external", url: "https://growtherapy.atlassian.net/browse/PT-1", createdAt: "2026-10-29T00:00:00Z", source: "auto" };
+  it("round-trips a valid jira key", () => {
+    const [l] = parseLinkedIssues([{ ...base, jira: { key: "PT-1" } }])!;
+    expect(l).toMatchObject({ jira: { key: "PT-1" } });
+  });
+  it("drops a malformed jira field", () => {
+    const [l] = parseLinkedIssues([{ ...base, jira: { key: "x; rm" } }])!;
+    expect(l).not.toHaveProperty("jira");
+  });
+});

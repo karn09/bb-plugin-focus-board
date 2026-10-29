@@ -797,6 +797,55 @@ export default async function plugin(bb: BbPluginApi) {
       experimental_schema: ARCHIVE_UNIT_SCHEMA,
       default: DEFAULT_ARCHIVE_UNIT,
     },
+    // Jira integration. Off by default; with it off the board behaves like upstream.
+    jiraEnabled: {
+      type: "boolean",
+      label: "Jira: enable integration",
+      description: "Link threads to Jira tickets and keep them in sync. Needs the companion script and an acli login.",
+      default: false,
+    },
+    jiraProjects: {
+      type: "string",
+      label: "Jira: projects to search",
+      description: "Comma-separated project keys. Default PT,SRE.",
+      default: "PT,SRE",
+    },
+    jiraDefaultProject: {
+      type: "string",
+      label: "Jira: default project for new tickets",
+      default: "SRE",
+    },
+    jiraNudgeDays: {
+      type: "number",
+      label: "Jira: nudge a quiet thread after (days)",
+      experimental_schema: z.number().int().min(1).max(365),
+      default: 2,
+    },
+    jiraDeepCheckDays: {
+      type: "number",
+      label: "Jira: deeper check after (days)",
+      description: "Always kept above the nudge days.",
+      experimental_schema: z.number().int().min(1).max(365),
+      default: 5,
+    },
+    jiraStaleTicketDays: {
+      type: "number",
+      label: "Jira: stale ticket after (days)",
+      experimental_schema: z.number().int().min(1).max(3650),
+      default: 30,
+    },
+    jiraNudgeTurnsPerPass: {
+      type: "number",
+      label: "Jira: max nudge turns per scheduler pass",
+      experimental_schema: z.number().int().min(1).max(50),
+      default: 3,
+    },
+    jiraRefreshMinutes: {
+      type: "number",
+      label: "Jira: snapshot refresh (minutes)",
+      experimental_schema: z.number().int().min(1).max(60),
+      default: 2,
+    },
     // The thread pane's Escape behavior. Rendered as a toggle in the
     // plugin detail page's configuration panel; the board reads it
     // reactively through the frontend `useSettings()` hook (explicit
