@@ -1,6 +1,6 @@
 // Board-vs-Jira drift for one ticket, given the threads linked to it. Pure;
 // planReconcile (lib/jira-reconcile.ts) is the one caller that feeds it.
-import type { DriftItem, GhPr, JiraTicket } from "./jira-schema";
+import type { DriftItem, GhPr, JiraTicket, QueueOp } from "./jira-schema";
 
 export type DriftThread = { id: string; done: boolean; prs: GhPr[] };
 
@@ -43,4 +43,18 @@ export function detectDrift(
     out.push({ key, kind: "stale-unlinked", detail: `No Jira activity for ${idleDays} days and no linked thread` });
   }
   return out;
+}
+
+/**
+ * Whether a fix for this drift is already queued (un-acked): todo-with-prs
+ * (and Start thread) by a pending transition to indeterminate, Give back by
+ * a pending assign none. Used server-side to refuse a second enqueue and by
+ * the column to hide the button.
+ */
+export function fixQueued(ops: readonly QueueOp[], key: string, kind: DriftItem["kind"]): boolean {
+  return ops.some((o) =>
+    kind === "stale-unlinked"
+      ? o.op === "assign" && o.key === key && o.to === "none"
+      : kind === "todo-with-prs" && o.op === "transition" && o.key === key && o.toCategory === "indeterminate",
+  );
 }

@@ -9,7 +9,7 @@ import { z } from "zod";
 import { cliCommand, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { createIdleWaiters } from "./jira-idle";
 import { jiraBrowseUrl } from "./jira-keys";
-import { livePrs, prUrl } from "./jira-drift";
+import { fixQueued, livePrs, prUrl } from "./jira-drift";
 import { applyReconcile, externalJiraKey, planReconcile, StoredReconcilePlan, threadPrsOf, type ReconThread } from "./jira-reconcile";
 import { DriftItem, JiraTicket, OpResult, QueueOp, ThreadJiraRecord } from "./jira-schema";
 import { jiraSettings } from "./jira-settings";
@@ -80,8 +80,10 @@ export const jiraRpcContract = defineRpcContract({
       key: JiraTicket.shape.key,
       threadId: z.string().optional(),
       kind: DriftItem.shape.kind.optional(),
+      /** Give back only: set by the column's confirm dialog. */
+      confirm: z.literal(true).optional(),
     }),
-    output: z.object({ ok: z.boolean(), error: z.string().optional() }),
+    output: z.object({ ok: z.boolean(), error: z.string().optional(), alreadyQueued: z.literal(true).optional() }),
   },
 });
 
@@ -300,24 +302,34 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       bb.realtime.publish(JIRA_RECONCILE_CHANGED, { generatedAt: stored.data.generatedAt });
     });
 
+  // Check-then-enqueue on one chain: a double click (or two windows) queues
+  // a fix once; the second press sees the first's ops still pending.
+  type ColumnResult = { ok: boolean; error?: string; alreadyQueued?: true };
+  let queueing: Promise<unknown> = Promise.resolve();
+  const onceQueued = (key: string, kind: DriftItem["kind"], task: () => Promise<ColumnResult>): Promise<ColumnResult> => {
+    const run = queueing.then(async () => (fixQueued(await store.pendingOps(), key, kind) ? { ok: true, alreadyQueued: true as const } : task()));
+    queueing = run.catch(() => undefined);
+    return run;
+  };
+
   // Drift fixes re-derive the drift server-side: a stale board cannot queue a write.
-  async function fixDrift(key: string, kind: DriftItem["kind"]): Promise<{ ok: boolean; error?: string }> {
-    if (kind === "all-done-still-open") return { ok: false, error: "not yet" }; // Task 10: the Done check.
-    const { plan, s, links, threads, prs } = await planWithInputs();
-    if (!plan.drift.some((d) => d.key === key && d.kind === kind)) return { ok: false, error: "no such drift" };
-    if (kind === "todo-with-prs") {
-      const ids = new Set(plan.autoLinks.filter((l) => l.key === key).map((l) => l.threadId));
-      const linked = threads.filter((t) => ids.has(t.id)).map((t) => ({ id: t.id, done: t.done, prs: threadPrsOf(t, links[t.id] ?? [], prs) }));
-      await store.enqueue({ op: "transition", key, toCategory: "indeterminate", threadId: null });
-      const body = ["Focus Board: moving this to In Progress. Linked threads already have these pull requests:", ...livePrs(linked).map(prUrl)].join("\n");
-      await store.enqueue({ op: "comment", key, body, threadId: null });
-    } else {
-      const body = `Focus Board: giving this ticket back. It had no Jira activity for ${s.staleTicketDays} days or more and no linked work, so I am unassigning myself.`;
-      await store.enqueue({ op: "comment", key, body, threadId: null });
-      await store.enqueue({ op: "assign", key, to: "none", threadId: null });
-    }
-    return { ok: true };
-  }
+  const fixDrift = (key: string, kind: DriftItem["kind"]): Promise<ColumnResult> =>
+    onceQueued(key, kind, async () => {
+      const { plan, s, links, threads, prs } = await planWithInputs();
+      if (!plan.drift.some((d) => d.key === key && d.kind === kind)) return { ok: false, error: "no such drift" };
+      if (kind === "todo-with-prs") {
+        const ids = new Set(plan.autoLinks.filter((l) => l.key === key).map((l) => l.threadId));
+        const linked = threads.filter((t) => ids.has(t.id)).map((t) => ({ id: t.id, done: t.done, prs: threadPrsOf(t, links[t.id] ?? [], prs) }));
+        await store.enqueue({ op: "transition", key, toCategory: "indeterminate", threadId: null });
+        const body = ["Focus Board: moving this to In Progress. Linked threads already have these pull requests:", ...livePrs(linked).map(prUrl)].join("\n");
+        await store.enqueue({ op: "comment", key, body, threadId: null });
+      } else {
+        const body = `Focus Board: giving this ticket back. It had no Jira activity for ${s.staleTicketDays} days or more and no linked work, so I am unassigning myself.`;
+        await store.enqueue({ op: "comment", key, body, threadId: null });
+        await store.enqueue({ op: "assign", key, to: "none", threadId: null });
+      }
+      return { ok: true };
+    });
 
   deps.onSettingsChange?.(() => {
     checkFirstEnable().catch(() => undefined);
@@ -362,18 +374,24 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       await store.writeThread(threadId, { checkInWith: null });
       return { ok: true };
     },
-    jira_column_action: async ({ action, key, threadId, kind }) => {
+    jira_column_action: async ({ action, key, threadId, kind, confirm }) => {
       if (!(await enabled())) return { ok: false, error: OFF };
-      if (action === "fix") return kind ? fixDrift(key, kind) : { ok: false, error: "kind required" };
-      if (threadId === undefined) return { ok: false, error: "threadId required" };
-      if (action === "started") {
-        // The spawn seeded the record; a just-spawned thread may not be listed yet, so no live check.
-        await operatorLink(threadId, key);
-        const t = (await store.readSnapshot()).snapshot?.tickets.find((x) => x.key === key);
-        if (t?.statusCategory === "new" && !t.isEpic) await store.enqueue({ op: "transition", key, toCategory: "indeterminate", threadId });
-        return { ok: true };
+      if (action === "fix") {
+        if (kind === undefined) return { ok: false, error: "kind required" };
+        if (kind === "all-done-still-open") return { ok: false, error: "not yet" }; // Task 10: the Done check.
+        if (kind === "stale-unlinked" && confirm !== true) return { ok: false, error: "confirm required" };
+        return fixDrift(key, kind);
       }
+      if (threadId === undefined) return { ok: false, error: "threadId required" };
       if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread" };
+      if (action === "started") {
+        await operatorLink(threadId, key);
+        return onceQueued(key, "todo-with-prs", async () => {
+          const t = (await store.readSnapshot()).snapshot?.tickets.find((x) => x.key === key);
+          if (t?.statusCategory === "new" && !t.isEpic) await store.enqueue({ op: "transition", key, toCategory: "indeterminate", threadId });
+          return { ok: true };
+        });
+      }
       if (action === "link") await operatorLink(threadId, key);
       await dropSuggestion(threadId, key, action === "dismiss-suggestion");
       return { ok: true };

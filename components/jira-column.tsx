@@ -6,7 +6,8 @@
 import { useContext, useState } from "react";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
-import type { DriftItem, JiraTicket } from "../lib/jira-schema";
+import { fixQueued } from "../lib/jira-drift";
+import type { DriftItem, JiraTicket, QueueOp, ThreadJiraRecord } from "../lib/jira-schema";
 import { JiraBoardContext } from "./jira-card-badges";
 import { readStoredText, writeStored } from "./preferences";
 
@@ -30,9 +31,31 @@ export type JiraColumnData = {
   onStartThread: (ticket: JiraTicket) => void;
   onLink: (key: string, threadId: string) => void;
   onDismiss: (key: string, threadId: string) => void;
-  onFix: (item: DriftItem) => void;
+  /** confirm is set only by the Give back dialog. */
+  onFix: (item: DriftItem, opts?: { confirm: true }) => void;
   onOpenThread: (threadId: string) => void;
+  /** Un-acked queue ops: a fix already queued shows "queued" instead of its button. */
+  pending: readonly QueueOp[];
 };
+
+/**
+ * Linked threads per key: thread-record links plus the reconcile plan's
+ * autoLinks (the same "linked" drift uses), deduped, in that order.
+ */
+export function jiraThreadsByKey(
+  records: Record<string, Pick<ThreadJiraRecord, "links">>,
+  autoLinks: readonly { threadId: string; key: string }[],
+  titleOf: ReadonlyMap<string, string>,
+): Record<string, ThreadRef[]> {
+  const out: Record<string, ThreadRef[]> = {};
+  const add = (key: string, id: string) => {
+    const list = (out[key] ??= []);
+    if (!list.some((t) => t.id === id)) list.push({ id, title: titleOf.get(id) ?? id });
+  };
+  for (const [id, rec] of Object.entries(records)) for (const l of rec.links) add(l.key, id);
+  for (const l of autoLinks) add(l.key, l.threadId);
+  return out;
+}
 
 export type JiraColumnProps = JiraColumnData & {
   hideLinked: boolean;
@@ -101,17 +124,21 @@ export function JiraColumn(props: JiraColumnProps) {
               {drift.filter((d) => d.key === t.key).map((d) => (
                 <div key={d.kind} data-jira-drift={d.kind} className="rounded bg-amber-500/10 p-1 text-[11px]">
                   <p>{d.detail}</p>
-                  <button
-                    type="button"
-                    className={btn}
-                    onClick={() => (d.kind === "stale-unlinked" ? setConfirming(d) : props.onFix(d))}
-                  >
-                    {FIX_LABEL[d.kind]}
-                  </button>
+                  {fixQueued(props.pending, d.key, d.kind) ? (
+                    <span className="italic text-muted-foreground">queued</span>
+                  ) : (
+                    <button
+                      type="button"
+                      className={btn}
+                      onClick={() => (d.kind === "stale-unlinked" ? setConfirming(d) : props.onFix(d))}
+                    >
+                      {FIX_LABEL[d.kind]}
+                    </button>
+                  )}
                   {confirming?.key === d.key && confirming.kind === d.kind ? (
                     <div role="alertdialog" aria-label={`Give back ${d.key}`} className="mt-1 space-y-1 rounded border border-border p-1">
                       <p>Comment on {d.key} that you are giving it back, then unassign yourself?</p>
-                      <button type="button" className={cn(btn, "bg-amber-500/80 text-amber-950")} onClick={() => { setConfirming(null); props.onFix(d); }}>
+                      <button type="button" className={cn(btn, "bg-amber-500/80 text-amber-950")} onClick={() => { setConfirming(null); props.onFix(d, { confirm: true }); }}>
                         Comment and unassign
                       </button>
                       <button type="button" className={btn} onClick={() => setConfirming(null)}>Cancel</button>

@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { JiraColumn } from "../components/jira-column";
+import { JiraColumn, jiraThreadsByKey } from "../components/jira-column";
 import { JIRA_COLUMN_ID, buildColumns, withJiraColumn } from "../components/grouping";
 import { jiraStartThreadSeed } from "../lib/new-thread-seed";
-import type { JiraTicket } from "../lib/jira-schema";
+import type { JiraTicket, QueueOp } from "../lib/jira-schema";
 
 const ticket = (key: string, summary: string, over: Partial<JiraTicket> = {}): JiraTicket => ({
   key, summary, status: "In Progress", statusCategory: "indeterminate", assignee: null, assignedToMe: true,
@@ -26,6 +26,7 @@ const base = () => ({
   onDismiss: vi.fn(),
   onFix: vi.fn(),
   onOpenThread: vi.fn(),
+  pending: [] as QueueOp[],
 });
 
 afterEach(cleanup);
@@ -89,7 +90,27 @@ describe("JiraColumn", () => {
     expect(p.onFix).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("alertdialog")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Comment and unassign" }));
-    expect(p.onFix).toHaveBeenLastCalledWith(p.drift[1]);
+    expect(p.onFix).toHaveBeenLastCalledWith(p.drift[1], { confirm: true });
+    expect(p.onFix.mock.calls[0]).toEqual([p.drift[0]]);
+  });
+
+  it("a fix whose op is already pending shows queued, not the button", () => {
+    const pending: QueueOp[] = [
+      { id: "o1", createdAt: "", threadId: null, op: "transition", key: "PT-3878", toCategory: "indeterminate" },
+      { id: "o2", createdAt: "", threadId: null, op: "assign", key: "PT-3570", to: "none" },
+    ];
+    const p = {
+      ...base(),
+      pending,
+      drift: [
+        { key: "PT-3878", kind: "todo-with-prs" as const, detail: "d1" },
+        { key: "PT-3570", kind: "stale-unlinked" as const, detail: "d2" },
+      ],
+    };
+    render(<JiraColumn {...p} />);
+    expect(screen.queryByRole("button", { name: "Move to In Progress" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Give back" })).toBeNull();
+    expect(screen.getAllByText("queued")).toHaveLength(2);
   });
 
   it("collapsed renders a strip that expands", () => {
@@ -98,6 +119,16 @@ describe("JiraColumn", () => {
     expect(screen.queryByText("PT-3570")).toBeNull();
     fireEvent.click(screen.getByLabelText("Expand Jira column"));
     expect(onCollapsedChange).toHaveBeenCalledWith(false);
+  });
+});
+
+describe("jiraThreadsByKey", () => {
+  it("merges record links with the plan's autoLinks, deduped, titled", () => {
+    const rec = (keys: string[]) => ({ links: keys.map((key) => ({ key, role: "owner" as const, source: "auto" as const })) });
+    const titleOf = new Map([["a", "A"], ["b", "B"]]);
+    expect(
+      jiraThreadsByKey({ a: rec(["PT-1"]) }, [{ threadId: "a", key: "PT-1" }, { threadId: "b", key: "PT-1" }, { threadId: "b", key: "PT-2" }], titleOf),
+    ).toEqual({ "PT-1": [{ id: "a", title: "A" }, { id: "b", title: "B" }], "PT-2": [{ id: "b", title: "B" }] });
   });
 });
 
@@ -119,6 +150,7 @@ describe("withJiraColumn", () => {
   const ctx = { projects: [], providers: [] };
   it("prepends an empty jira column only on the Attention view with Jira on; else returns the same array", () => {
     const cols = buildColumns([], "status", ctx);
+    expect(JIRA_COLUMN_ID).toBe("__jira");
     expect(withJiraColumn(cols, "status", true)[0]).toEqual({ id: JIRA_COLUMN_ID, label: "Jira", threads: [] });
     expect(withJiraColumn(cols, "status", true).slice(1)).toEqual(cols);
     expect(withJiraColumn(cols, "status", false)).toBe(cols);

@@ -681,8 +681,8 @@ export function buildColumns(
   return columns;
 }
 
-/** The Jira column's id (components/jira-column.tsx renders it). */
-export const JIRA_COLUMN_ID = "jira";
+/** The Jira column's id (components/jira-column.tsx renders it): no bucket id has the "__" prefix. */
+export const JIRA_COLUMN_ID = "__jira";
 
 /**
  * Prepends the Jira column on the Attention view while Jira is on. It holds

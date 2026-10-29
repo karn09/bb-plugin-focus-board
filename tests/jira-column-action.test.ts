@@ -124,9 +124,37 @@ describe("jira_column_action", () => {
     expect(await queue()).toEqual([]);
   });
 
+  it("Give back without confirm queues nothing", async () => {
+    await load({ jiraEnabled: true });
+    expect(await act({ action: "fix", key: "SRE-9", kind: "stale-unlinked" })).toEqual({ ok: false, error: "confirm required" });
+    expect(await queue()).toEqual([]);
+  });
+
+  it("the same fix twice queues only the first fix's ops (even concurrently)", async () => {
+    await load({ jiraEnabled: true });
+    const [a, b] = await Promise.all([
+      act({ action: "fix", key: "PT-3879", kind: "todo-with-prs" }),
+      act({ action: "fix", key: "PT-3879", kind: "todo-with-prs" }),
+    ]);
+    expect([a, b]).toEqual([{ ok: true }, { ok: true, alreadyQueued: true }]);
+    expect((await queue()).map((o) => o.op)).toEqual(["transition", "comment"]);
+    await act({ action: "fix", key: "SRE-9", kind: "stale-unlinked", confirm: true });
+    expect(await act({ action: "fix", key: "SRE-9", kind: "stale-unlinked", confirm: true })).toEqual({ ok: true, alreadyQueued: true });
+    expect((await queue()).map((o) => o.op)).toEqual(["transition", "comment", "comment", "assign"]);
+  });
+
+  it("started refuses an unknown thread and does not re-queue the transition", async () => {
+    await load({ jiraEnabled: true });
+    expect(await act({ action: "started", key: "SRE-10", threadId: "nope" })).toEqual({ ok: false, error: "unknown thread" });
+    expect(await queue()).toEqual([]);
+    await act({ action: "started", key: "SRE-10", threadId: "z" });
+    expect(await act({ action: "started", key: "SRE-10", threadId: "pg" })).toEqual({ ok: true, alreadyQueued: true });
+    expect(await queue()).toHaveLength(1);
+  });
+
   it("fix stale-unlinked (Give back): a comment then assign none", async () => {
     await load({ jiraEnabled: true });
-    expect(await act({ action: "fix", key: "SRE-9", kind: "stale-unlinked" })).toEqual({ ok: true });
+    expect(await act({ action: "fix", key: "SRE-9", kind: "stale-unlinked", confirm: true })).toEqual({ ok: true });
     expect(await queue()).toEqual([
       expect.objectContaining({ op: "comment", key: "SRE-9", body: expect.any(String) }),
       expect.objectContaining({ op: "assign", key: "SRE-9", to: "none" }),

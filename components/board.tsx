@@ -2360,7 +2360,7 @@ export function Board({
         >
         {columns.map((column) => {
           // Not a thread lane: no drop, rank, sweep or cards (withJiraColumn).
-          if (column.id === JIRA_COLUMN_ID) return <JiraColumnSlot key={column.id} />;
+          if (groupBy === "status" && column.id === JIRA_COLUMN_ID) return <JiraColumnSlot key={column.id} />;
           const dropHandler = dropHandlerFor(column.id);
           const isDropTarget = dropHandler !== null;
           const sweepKind = sweepColumnKind(column.id);

@@ -25,6 +25,7 @@ import { FocusBoardAppIcon } from "./components/ui/icon";
 import type { rpcContract } from "./server";
 import type { jiraRpcContract } from "./lib/jira-server";
 import { JiraBoardContext, type JiraBoardValue } from "./components/jira-card-badges";
+import { jiraThreadsByKey } from "./components/jira-column";
 import { Board } from "./components/board";
 import { BoardToolbar } from "./components/board-toolbar";
 import { ThreadPane } from "./components/thread-pane";
@@ -531,8 +532,8 @@ function BoardPage({ subPath }: { subPath: string }) {
     enabled: boolean; stale: boolean; tickets: JiraBoardValue["ticketByKey"];
     threads: JiraBoardValue["threads"]; pending: JiraBoardValue["pendingOps"];
     snapshotAge: number | null; error: string | null;
-    suggestions: { threadId: string; key: string }[]; drift: DriftItem[];
-  }>({ enabled: false, stale: false, tickets: {}, threads: {}, pending: [], snapshotAge: null, error: null, suggestions: [], drift: [] });
+    suggestions: { threadId: string; key: string }[]; drift: DriftItem[]; autoLinks: { threadId: string; key: string }[];
+  }>({ enabled: false, stale: false, tickets: {}, threads: {}, pending: [], snapshotAge: null, error: null, suggestions: [], drift: [], autoLinks: [] });
   const refetchJira = useCallback(() => {
     jiraRpc.call("jira_board_state", null).then(
       async (r) => {
@@ -548,6 +549,7 @@ function BoardPage({ subPath }: { subPath: string }) {
           error: r.error,
           suggestions: plan?.suggestions ?? [],
           drift: plan?.drift ?? [],
+          autoLinks: plan?.autoLinks ?? [],
         });
       },
       () => {}, // Jira is optional state; the board works without it.
@@ -2615,10 +2617,7 @@ function BoardPage({ subPath }: { subPath: string }) {
   const jiraBoardValue = useMemo<JiraBoardValue>(() => {
     if (!jiraState.enabled) return jiraValue;
     const titleOf = new Map(threads.map((t) => [t.id, t.displayTitle]));
-    const threadsByKey: Record<string, { id: string; title: string }[]> = {};
-    for (const [id, rec] of Object.entries(jiraState.threads)) {
-      for (const l of rec.links) (threadsByKey[l.key] ??= []).push({ id, title: titleOf.get(id) ?? id });
-    }
+    const threadsByKey = jiraThreadsByKey(jiraState.threads, jiraState.autoLinks, titleOf);
     const suggestions: Record<string, { threadId: string; title: string }[]> = {};
     for (const x of jiraState.suggestions) (suggestions[x.key] ??= []).push({ threadId: x.threadId, title: titleOf.get(x.threadId) ?? x.threadId });
     const act = (input: Parameters<typeof jiraRpc.call<"jira_column_action">>[1]) => {
@@ -2637,8 +2636,9 @@ function BoardPage({ subPath }: { subPath: string }) {
         onStartThread: startJiraThread,
         onLink: (key, threadId) => act({ action: "link", key, threadId }),
         onDismiss: (key, threadId) => act({ action: "dismiss-suggestion", key, threadId }),
-        onFix: (d) => act({ action: "fix", key: d.key, kind: d.kind }),
+        onFix: (d, opts) => act({ action: "fix", key: d.key, kind: d.kind, ...opts }),
         onOpenThread: openThreadCard,
+        pending: jiraState.pending,
       },
     };
   }, [jiraValue, jiraState, threads, jiraRpc, refetchJira, startJiraThread, openThreadCard]);
