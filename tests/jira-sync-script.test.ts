@@ -15,6 +15,7 @@ const dir = process.env.STUB_DIR, name = path.basename(process.argv[1]);
 const argv = process.argv.slice(2);
 const i = argv.indexOf("--file");
 const file = i >= 0 ? fs.readFileSync(argv[i + 1], "utf8") : null;
+fs.appendFileSync(path.join(dir, "seq.log"), name + " " + argv.join(" ") + "\\n");
 fs.appendFileSync(path.join(dir, name + ".log"), JSON.stringify({ argv, file }) + "\\n");
 const rp = path.join(dir, name + ".rules.json");
 const rules = fs.existsSync(rp) ? JSON.parse(fs.readFileSync(rp, "utf8")) : [];
@@ -31,6 +32,7 @@ const calls = (name: string): { argv: string[]; file: string | null }[] => {
   const p = join(dir, `${name}.log`);
   return existsSync(p) ? readFileSync(p, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
 };
+const seq = () => (existsSync(join(dir, "seq.log")) ? readFileSync(join(dir, "seq.log"), "utf8").trim().split("\n") : []);
 const run = () =>
   execFileSync("node", [join(__dirname, "../scripts/jira-sync.mjs")], {
     env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, STUB_DIR: dir },
@@ -66,6 +68,13 @@ beforeEach(() => {
 });
 
 describe("toTicket", () => {
+  it("derives category from status name when missing, and defaults the base url", () => {
+    const noCat = (name: string) => toTicket(issue("ENG-1", { status: { name } }), "").statusCategory;
+    expect([noCat("Done"), noCat("Closed"), noCat("To Do"), noCat("In Review")]).toEqual(["done", "done", "new", "indeterminate"]);
+    const t = toTicket({ key: "ENG-1", fields: issue("ENG-1").fields }, "");
+    expect(t.url).toBe("https://growtherapy.atlassian.net/browse/ENG-1");
+  });
+
   it("maps a REST v3 shaped issue", () => {
     const t = toTicket(issue("ENG-1", { parent: { key: "ENG-9", fields: { issuetype: { name: "Epic" } } } }), "me1");
     expect(t).toMatchObject({
@@ -218,5 +227,69 @@ describe("jira-sync.mjs", () => {
     for (const n of ["acli", "gh", "bb"])
       for (const c of calls(n))
         for (const a of c.argv) expect(heads.has(a.split(" ")[0]) && a.includes(" ")).toBe(false);
+  });
+
+  const queue = (ops: object[]) =>
+    rules("bb", [
+      { match: "jira wanted", stdout: JSON.stringify(wanted) },
+      { match: "jira queue", stdout: JSON.stringify({ ops }) },
+    ]);
+  const events = () =>
+    seq().map((l) => (l.startsWith("bb") && l.includes(" ack ") ? "ack" : /^acli jira workitem (transition|assign |create|comment create)/.test(l) ? "apply" : null)).filter(Boolean);
+
+  it("applies then acks each op in order (apply1, ack1, apply2, ack2)", () => {
+    queue([op({ id: "o1", op: "assign", key: "ENG-1", to: "me" }), op({ id: "o2", op: "assign", key: "ENG-2", to: "none" })]);
+    run();
+    expect(events()).toEqual(["apply", "ack", "apply", "ack"]);
+    const lines = seq().filter((l) => / (assign|ack) /.test(l));
+    expect(lines[0]).toContain("ENG-1");
+    expect(lines[2]).toContain("ENG-2");
+  });
+
+  it("replay after a failed ack does not duplicate comment, create, or transition", () => {
+    const ops = [
+      op({ id: "c1", op: "comment", key: "ENG-1", body: "hi" }),
+      op({ id: "n1", op: "create", project: "ENG", issueType: "Task", summary: "S", description: "D", parentKey: null }),
+      op({ id: "t1", op: "transition", key: "ENG-1", toCategory: "done" }),
+    ];
+    queue(ops);
+    // Pass 1: acks fail (bb exits 1 on ack), so the pass crashes after op c1 is applied.
+    rules("bb", [
+      { match: " ack ", code: 1, stderr: "ack down" },
+      { match: "jira wanted", stdout: JSON.stringify(wanted) },
+      { match: "jira queue", stdout: JSON.stringify({ ops }) },
+    ]);
+    rules("acli", [{ match: "comment list", stdout: "[]" }]);
+    expect(() => run()).toThrow();
+    expect(calls("acli").filter((c) => c.argv.includes("comment") && c.argv.includes("create"))).toHaveLength(1);
+    // Pass 2: Jira now has the comment; ack works. The create happened? Simulate: first pass never reached create.
+    queue(ops);
+    rules("acli", [
+      { match: "comment list", stdout: JSON.stringify({ comments: [{ body: "hi\n\n[fb:c1]" }] }) },
+      { match: 'description ~ "fb:n1"', stdout: JSON.stringify([{ key: "ENG-50" }]) },
+      { match: "workitem view", stdout: JSON.stringify(issue("ENG-1", { status: { name: "Done", statusCategory: { key: "done" } } })) },
+    ]);
+    run();
+    const a = calls("acli");
+    expect(a.filter((c) => c.argv.includes("comment") && c.argv.includes("create"))).toHaveLength(1);
+    expect(a.some((c) => c.argv.includes("workitem") && c.argv.includes("create") && !c.argv.includes("comment"))).toBe(false);
+    expect(a.some((c) => c.argv.includes("transition"))).toBe(false);
+    const res = acks().at(-1).concat(acks().at(-2), acks().at(-3)).filter((r: { ok: boolean }) => r);
+    expect(res.find((r: { id: string }) => r.id === "n1")).toMatchObject({ ok: true, createdKey: "ENG-50" });
+  });
+
+  it("create puts the marker at the end of the description", () => {
+    queue([op({ id: "n2", op: "create", project: "ENG", issueType: "Task", summary: "S", description: "D", parentKey: null })]);
+    rules("acli", [{ match: "workitem create", stdout: JSON.stringify({ key: "ENG-8" }) }]);
+    run();
+    const c = calls("acli").find((c) => c.argv.includes("create"))!;
+    expect(c.argv[c.argv.indexOf("--description") + 1]).toBe("D\n\n[fb:n2]");
+  });
+
+  it("unknown toCategory acks ok:false with a clear error", () => {
+    queue([op({ op: "transition", key: "ENG-1", toCategory: "new" })]);
+    rules("acli", [{ match: "workitem view", stdout: JSON.stringify(issue("ENG-1", { status: { name: "Done", statusCategory: { key: "done" } } })) }]);
+    run();
+    expect(acks()[0][0]).toMatchObject({ ok: false, error: expect.stringContaining("unsupported toCategory") });
   });
 });

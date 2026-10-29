@@ -16,7 +16,7 @@ const PROJ = /^[A-Z][A-Z0-9]+$/;
 const FIELDS = "key,summary,status,assignee,issuetype,parent,updated";
 const run = async (cmd, args) => {
   try {
-    return (await exec(cmd, args, { maxBuffer: 64 * 1024 * 1024 })).stdout;
+    return (await exec(cmd, args, { maxBuffer: 64 * 1024 * 1024, timeout: 60_000 })).stdout;
   } catch (e) {
     throw new Error(`${cmd} ${args[0] ?? ""} failed: ${(e.stderr || e.message || "").toString().trim()}`.slice(0, 500));
   }
@@ -39,7 +39,11 @@ async function bbFile(sub, value) {
 
 // ---- acli JSON -> JiraTicket (REST v3 issue shape; defensive) ----
 const CATS = new Set(["new", "indeterminate", "done"]);
-const origin = (self) => { try { return new URL(self).origin; } catch { return process.env.JIRA_BASE_URL?.replace(/\/$/, "") ?? ""; } };
+const origin = (self) => {
+  try { return new URL(self).origin; } catch { return (process.env.JIRA_BASE_URL || "https://growtherapy.atlassian.net").replace(/\/$/, ""); }
+};
+const catByName = (n) =>
+  /^(done|closed|resolved|invalid|n\/a)$/i.test(n) ? "done" : /^(to do|open|backlog)$/i.test(n) ? "new" : "indeterminate";
 export function toTicket(raw, meAccountId) {
   const f = raw?.fields ?? {};
   const cat = f.status?.statusCategory?.key;
@@ -50,7 +54,7 @@ export function toTicket(raw, meAccountId) {
     key: raw.key,
     summary: f.summary ?? "",
     status: f.status?.name ?? "",
-    statusCategory: CATS.has(cat) ? cat : "new",
+    statusCategory: CATS.has(cat) ? cat : catByName(f.status?.name ?? ""),
     assignee: a?.accountId ? { accountId: a.accountId, displayName: a.displayName ?? "" } : null,
     assignedToMe: !!a?.accountId && a.accountId === meAccountId,
     issueType: type,
@@ -75,6 +79,7 @@ async function applyOp(op) {
     case "transition": {
       const cur = json(await acli("view", op.key, "--fields", "status", "--json"));
       if (cur?.fields?.status?.statusCategory?.key === op.toCategory) return null;
+      if (!TARGETS[op.toCategory]) throw new Error(`unsupported toCategory: ${op.toCategory}`);
       let last;
       for (const s of TARGETS[op.toCategory]) {
         try { await acli("transition", "--key", op.key, "--status", s, "--yes"); return null; } catch (e) { last = e; }
@@ -91,8 +96,12 @@ async function applyOp(op) {
       return null;
     }
     case "create": {
+      const marker = `[fb:${op.id}]`;
+      // Replay-safe: a crash/failed ack after create must not make a duplicate next pass.
+      const found = asList(json(await acli("search", "--jql", `project = ${op.project} AND description ~ "fb:${op.id}"`, "--fields", "key", "--json")));
+      if (found[0]?.key && KEY.test(found[0].key)) return found[0].key;
       const out = await acli("create", "--project", op.project, "--type", op.issueType, "--summary", op.summary,
-        "--description", op.description, ...(op.parentKey ? ["--parent", op.parentKey] : []), "--json");
+        "--description", `${op.description}\n\n${marker}`, ...(op.parentKey ? ["--parent", op.parentKey] : []), "--json");
       const key = json(out)?.key ?? out.match(/[A-Z][A-Z0-9]+-\d+/)?.[0];
       if (!key || !KEY.test(key)) throw new Error("create returned no key");
       return key;
