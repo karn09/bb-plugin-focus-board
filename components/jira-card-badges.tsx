@@ -9,7 +9,8 @@ import type { JiraColumnData } from "./jira-column";
 
 export type JiraCardKind =
   | "find-ticket" | "confirm-done" | "skip-done" | "spin-off"
-  | "keep-working" | "not-needed" | "clear-check-in" | "promote-epic";
+  | "keep-working" | "not-needed" | "clear-check-in" | "promote-epic"
+  | "run-done-check" | "dismiss-reason";
 
 const TONE = { new: "neutral", indeterminate: "info", done: "good" } as const;
 const TONE_CLASS = {
@@ -28,9 +29,13 @@ export type JiraCardBadgesProps = {
   pendingOps: readonly QueueOp[];
   /** index + reason: which Done-check reason (spin-off / not-needed); the server refuses a stale pair. */
   onAction: (kind: JiraCardKind, threadId: string, index?: number, reason?: string) => void;
+  /** The deeper check's one-click next step for this card (lib/jira-reminders.ts). */
+  next?: { next: "done-check" | "open-pr" | "snooze"; prUrl?: string };
+  /** The board's own snooze (the "snooze" next step). */
+  onSnooze?: (threadId: string) => void;
 };
 
-export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, pendingOps, onAction }: JiraCardBadgesProps) {
+export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, pendingOps, onAction, next, onSnooze }: JiraCardBadgesProps) {
   if (!enabled) return null;
   const links = record?.links ?? [];
   const failed = record?.doneCheck?.verdict === "fail" ? record.doneCheck.reasons : [];
@@ -103,6 +108,28 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
       ) : record?.reason ? (
         <span className="w-full truncate text-[10px] text-muted-foreground">{record.reason}</span>
       ) : null}
+      {record?.reason && failed.length === 0 && next?.next === "done-check" ? (
+        <button type="button" className={cn(chip, "underline")} onClick={() => onAction("run-done-check", threadId)}>
+          Run Done check
+        </button>
+      ) : null}
+      {record?.reason && failed.length === 0 && next?.next === "open-pr" && next.prUrl ? (
+        <a className={cn(chip, "underline")} href={next.prUrl} target="_blank" rel="noreferrer">
+          Open PR
+        </a>
+      ) : null}
+      {record?.reason && failed.length === 0 && next?.next === "snooze" && onSnooze ? (
+        <button
+          type="button"
+          className={cn(chip, "underline")}
+          onClick={() => {
+            onSnooze(threadId);
+            onAction("dismiss-reason", threadId);
+          }}
+        >
+          Snooze
+        </button>
+      ) : null}
       {checkOpen ? (
         <details className="text-[10px] text-muted-foreground">
           <summary className="cursor-pointer">More</summary>
@@ -115,8 +142,10 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
   );
 }
 
-export type JiraBoardValue = Omit<JiraCardBadgesProps, "threadId" | "record"> & {
+export type JiraBoardValue = Omit<JiraCardBadgesProps, "threadId" | "record" | "next"> & {
   threads: Record<string, ThreadJiraRecord>;
+  /** threadId → the deeper check's next step (jira_board_state.next). */
+  nextByThread?: Record<string, NonNullable<JiraCardBadgesProps["next"]>>;
   /** The Jira column's data (components/jira-column.tsx); absent renders no column. */
   column?: JiraColumnData;
 };
@@ -126,5 +155,5 @@ export const JiraBoardContext = createContext<JiraBoardValue | null>(null);
 export function JiraCardSlot({ threadId }: { threadId: string }) {
   const v = useContext(JiraBoardContext);
   if (v === null || !v.enabled) return null;
-  return <JiraCardBadges {...v} threadId={threadId} record={v.threads[threadId]} />;
+  return <JiraCardBadges {...v} threadId={threadId} record={v.threads[threadId]} next={v.nextByThread?.[threadId]} />;
 }

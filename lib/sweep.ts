@@ -52,6 +52,8 @@ export interface SweepConfig {
   idleArchiveMs?: number;
   /** Idle-arm override lookup; the Done arm uses DoneAgeSource.kept. */
   kept?: (threadId: string) => boolean;
+  /** Jira on: reminders replace the idle arm, so it proposes nothing. */
+  jiraEnabled?: boolean;
 }
 
 /**
@@ -101,6 +103,7 @@ export function sweepCandidatesForIdleColumn(
   /** Clear-error acknowledgment ids (issue #157): acked error arms read idle. */
   errorAcks: ReadonlySet<string> = new Set<string>(),
 ): string[] {
+  if (config.jiraEnabled === true) return [];
   const threshold = config.idleArchiveMs ?? DEFAULT_IDLE_ARCHIVE_MS;
   return threads
     .filter((thread) => !doneIds.has(thread.id) && !thread.isPinned)

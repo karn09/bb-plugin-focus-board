@@ -102,7 +102,10 @@ export function SettingsModal({
   onSetMotionPacing,
   onSetLaneDirection,
   onWallpaperChange,
+  jiraEnabled = false,
 }: {
+  /** Jira on: reminders replace the long-idle sweep, so its row is hidden. */
+  jiraEnabled?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** The selected tab; the app owns it so a deep link can land on content. */
@@ -244,13 +247,15 @@ export function SettingsModal({
                   storedValues={sweep}
                   onSet={onSetSweep}
                 />
-                <SweepThresholdRow
-                  arm="idle"
-                  numberKey="idleArchiveValue"
-                  unitKey="idleArchiveUnit"
-                  storedValues={sweep}
-                  onSet={onSetSweep}
-                />
+                {jiraEnabled ? null : (
+                  <SweepThresholdRow
+                    arm="idle"
+                    numberKey="idleArchiveValue"
+                    unitKey="idleArchiveUnit"
+                    storedValues={sweep}
+                    onSet={onSetSweep}
+                  />
+                )}
                 <p className="text-xs leading-relaxed text-muted-foreground/80">
                   Developer-only switches (pane chat scroll instrumentation)
                   live in Focus Board&apos;s configuration page; the

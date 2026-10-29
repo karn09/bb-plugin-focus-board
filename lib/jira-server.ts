@@ -8,7 +8,9 @@
 // focus_board_jira_link / focus_board_spawn_child tools, and the find-ticket /
 // promote-epic card turns. And the Done check (lib/jira-done-check.ts):
 // startDoneCheck, the focus_board_done_verdict tool, jira_done_confirm and
-// the Done card actions.
+// the Done card actions. And the reminders (lib/jira-reminders.ts): the
+// "jira-reminders" schedule (nudge turn, deeper check), the nudge reply
+// capture and the reason clearing.
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { cliCommand, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
@@ -17,6 +19,7 @@ import { findTicketText, JIRA_AGENT_TOOLS, JIRA_LINK_TOOL, JIRA_SPAWN_TOOL, jira
 import { jiraBrowseUrl } from "./jira-keys";
 import { fixQueued, livePrs, prUrl } from "./jira-drift";
 import { capReasons, DONE_SUMMARY_PREFIX, doneSummary, evaluateMechanical, JIRA_VERDICT_TOOL, spinOffText, ticketUpdate, verifyTurnText } from "./jira-done-check";
+import { deepCheckFindings, NUDGE_TEXT, planReminders, replyLine, type DeepNext, type ReminderThread } from "./jira-reminders";
 import { applyReconcile, externalJiraKey, planReconcile, StoredReconcilePlan, threadPrsOf, type ReconThread } from "./jira-reconcile";
 import { DriftItem, JiraTicket, OpResult, QueueOp, ThreadJiraRecord } from "./jira-schema";
 import { jiraSettings } from "./jira-settings";
@@ -47,6 +50,8 @@ export type JiraDeps = {
   markDone?: (threadId: string) => Promise<void>;
   /** Publish done-changed { done: false }: a check ended without a stamp, so boards drop their optimistic Done. */
   notDone?: (threadId: string) => void;
+  /** Live threads for the reminder pass: status, last activity (epoch ms), Done, snooze wake (epoch ms, null when not snoozed). */
+  reminderThreads?: () => Promise<{ id: string; status: string; updatedAt: number; branch: string | null; done: boolean; snoozeWakeAt: number | null }[]>;
 };
 
 const PLAN_KEY = "jira:reconcile-plan";
@@ -56,10 +61,19 @@ const ENABLED_SEEN_KEY = "jira:enabled-seen";
 const DISMISSED_KEY = "jira:dismissed-suggestions";
 /** threadId → verifying.startedAt of the check whose verify turn was sent (the verdict tool's gate). */
 const VERIFY_SENT_KEY = "jira:verify-sent";
+/** threadId → the nudge turn in flight or answered (its own activity is not "new activity"). */
+const NUDGE_TURNS_KEY = "jira:nudge-turns";
+/** threadId → the snooze wake seen (epoch ms): the quiet clock restarts there. */
+const SNOOZE_SEEN_KEY = "jira:snooze-seen";
+/** threadId → the deeper check's next step, shown while the reason is still that check's. */
+const NEXT_STEPS_KEY = "jira:next-steps";
 export const JIRA_RECONCILE_CHANGED = "jira-reconcile-changed";
 export const JIRA_CHANGED = "jira-changed";
 
-export const JIRA_CARD_ACTIONS = ["find-ticket", "confirm-done", "skip-done", "spin-off", "keep-working", "not-needed", "clear-check-in", "promote-epic"] as const;
+export const JIRA_CARD_ACTIONS = [
+  "find-ticket", "confirm-done", "skip-done", "spin-off", "keep-working", "not-needed", "clear-check-in", "promote-epic", "run-done-check", "dismiss-reason",
+] as const;
+const NextStep = z.object({ reason: z.string(), next: z.enum(["done-check", "open-pr", "snooze"]), prUrl: z.string().optional() });
 
 const AppliedPlan = StoredReconcilePlan.extend({
   /** Threads skipped because a write failed; the rest applied. */
@@ -83,6 +97,8 @@ export const jiraRpcContract = defineRpcContract({
       tickets: z.array(JiraTicket),
       threads: z.record(z.string(), ThreadJiraRecord),
       pending: z.record(z.string(), QueueOp),
+      /** Deeper-check next steps, only while the card's reason is still that check's. */
+      next: z.record(z.string(), NextStep),
     }),
   },
   /** A card button press; kinds whose behavior lands later answer "not yet". */
@@ -112,7 +128,7 @@ export const jiraRpcContract = defineRpcContract({
       /** Give back only: set by the column's confirm dialog. */
       confirm: z.literal(true).optional(),
     }),
-    output: z.object({ ok: z.boolean(), error: z.string().optional(), alreadyQueued: z.literal(true).optional() }),
+    output: z.object({ ok: z.boolean(), error: z.string().optional(), alreadyQueued: z.literal(true).optional(), started: z.number().int().optional() }),
   },
 });
 
@@ -648,8 +664,8 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       await markDone(threadId);
       return "done";
     }
-    await store.updateThread(threadId, () => ({ verifying: { startedAt: isoNow() }, doneCheck: null, reason: null }));
-    await idle.waitFor(threadId, "done-check"); // runs now when idle, else on the next idle
+    await perThread(threadId, () => store.updateThread(threadId, () => ({ verifying: { startedAt: isoNow() }, doneCheck: null, reason: null })));
+    await idle.waitFor(threadId, "done-check"); // runs now when idle, else on the next idle (outside perThread: runCheck takes it)
     return (await isDone(threadId)) ? "done" : "checking";
   };
 
@@ -740,6 +756,158 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     },
   });
 
+  // ---- Reminders: the nudge turn (day n) and the deeper check (day m). ----
+  const warn = (m: string) => bb.log.warn(m);
+  /** A KV-mirrored map: changes run in order after the load, so none is dropped or resurrected. */
+  const persisted = <T>(key: string) => {
+    const map = new Map<string, T>();
+    const loaded = bb.storage.kv
+      .get(key)
+      .then((raw) => {
+        if (raw && typeof raw === "object") for (const [k, v] of Object.entries(raw)) map.set(k, v as T);
+      })
+      .catch((e) => warn(`jira: ${key} unreadable: ${(e as Error).message}`));
+    let chain: Promise<unknown> = loaded;
+    const set = (id: string, v: T | undefined) => {
+      const run = chain.then(() => {
+        if (v === undefined) map.delete(id);
+        else map.set(id, v);
+        return bb.storage.kv.set(key, Object.fromEntries(map));
+      });
+      chain = run.catch(() => undefined);
+      return run;
+    };
+    return { loaded, map, set };
+  };
+  // "sent" set first, since its thread.active may arrive before sendIfIdle returns; "running" on that
+  // active, "replied" on the next rest. Kept until real activity: until then the thread's
+  // last activity is the one from before the nudge.
+  type NudgeTurn = { phase: "sent" | "running" | "replied"; lastActivityAt: number };
+  const nudgeTurns = persisted<NudgeTurn>(NUDGE_TURNS_KEY);
+  const snoozeSeen = persisted<number>(SNOOZE_SEEN_KEY);
+  const nextSteps = persisted<z.infer<typeof NextStep>>(NEXT_STEPS_KEY);
+
+  /** New activity or an operator click: the reason line goes (never mid-check). */
+  const clearReason = (threadId: string) =>
+    perThread(threadId, async () => {
+      const rec = await store.readThread(threadId);
+      if (rec.reason !== null && rec.verifying === null) await store.writeThread(threadId, { reason: null });
+    });
+  const onActive = async (threadId: string) => {
+    if (!cfg.enabled) return;
+    await nudgeTurns.loaded;
+    const t = nudgeTurns.map.get(threadId);
+    if (t?.phase === "sent") return void (await nudgeTurns.set(threadId, { ...t, phase: "running" })); // the nudge turn itself
+    if (t?.phase === "running") return;
+    if (t) await nudgeTurns.set(threadId, undefined);
+    await clearReason(threadId);
+  };
+  /** The rest after a sent nudge: the reply's first line is the reason. */
+  const onRest = async (threadId: string, text: string | null) => {
+    if (!cfg.enabled) return;
+    await nudgeTurns.loaded;
+    const t = nudgeTurns.map.get(threadId);
+    if (!t || t.phase === "replied") return;
+    await nudgeTurns.set(threadId, { ...t, phase: "replied" });
+    const line = replyLine(text);
+    if (line !== null) await perThread(threadId, () => store.writeThread(threadId, { reason: line }));
+  };
+  const logFail = (what: string) => (e: unknown) => warn(`jira reminders: ${what} failed: ${(e as Error).message}`);
+  bb.events.on("thread.active", ({ thread }) => void onActive(thread.id).catch(logFail("activity")));
+  bb.events.on("thread.idle", ({ thread, lastAssistantText }) => void onRest(thread.id, lastAssistantText).catch(logFail("reply capture")));
+  bb.events.on("thread.failed", ({ thread }) => void onRest(thread.id, null).catch(logFail("reply capture")));
+
+  /** One nudge: only an idle thread gets it; busy or a throw leaves it un-nudged for the next pass. */
+  const nudge = async (threadId: string, lastActivityAt: number, unlinked: boolean): Promise<boolean> => {
+    const prev = nudgeTurns.map.get(threadId);
+    await nudgeTurns.set(threadId, { phase: "sent", lastActivityAt });
+    let r: "sent" | "busy" | "gone" = "busy";
+    try {
+      await bb.sdk.threads.markUnread({ threadId }).catch(logFail(`markUnread on ${threadId}`));
+      r = await sendIfIdle(bb.sdk.threads as never, threadId, NUDGE_TEXT, { log: warn });
+    } catch (e) {
+      warn(`jira: nudge on ${threadId} not sent, retrying next pass: ${(e as Error).message}`);
+    }
+    if (r !== "sent") {
+      await nudgeTurns.set(threadId, prev);
+      return false;
+    }
+    await perThread(threadId, () =>
+      store.updateThread(threadId, (cur) => ({
+        nudgedAt: isoNow(),
+        // A reply that already landed (or a Done check started since) keeps its reason.
+        ...(cur.verifying !== null || nudgeTurns.map.get(threadId)?.phase === "replied" ? {} : { reason: unlinked ? "no ticket yet" : "waiting on you" }),
+      })),
+    );
+    return true;
+  };
+
+  const ms = (iso: string | null) => {
+    const v = iso === null ? NaN : Date.parse(iso);
+    return Number.isNaN(v) ? null : v;
+  };
+  let passing = false; // one pass at a time: an overlapping tick is skipped
+  const reminderPass = async () => {
+    if (passing) return;
+    passing = true;
+    try {
+      const s = jiraSettings(await deps.settings());
+      if (!s.enabled || !deps.reminderThreads) return;
+      await Promise.all([nudgeTurns.loaded, snoozeSeen.loaded, nextSteps.loaded]);
+      const now = Date.now();
+      const { snapshot, stale } = await store.readSnapshot();
+      const allPrs = snapshot?.prs ?? [];
+      const facts = new Map<string, { rec: ThreadJiraRecord; prs: typeof allPrs; missing: boolean; lastActivityAt: number }>();
+      const threads: ReminderThread[] = [];
+      for (const row of await deps.reminderThreads()) {
+        const rec = await store.readThread(row.id);
+        const links = await deps.readLinks(row.id);
+        const prs = threadPrsOf({ branch: row.branch }, links, allPrs);
+        const missing = links.some((l) => l.tracker === "github" && l.kind === "pull" && !allPrs.some((p) => p.repo === l.repo && p.number === l.issue));
+        const tickets = rec.links.flatMap((l) => snapshot?.tickets.find((t) => t.key === l.key) ?? []);
+        const changes = [...prs, ...tickets].flatMap((x) => ms(x.updatedAt) ?? []);
+        const snoozed = row.snoozeWakeAt !== null && row.snoozeWakeAt > now;
+        const seen = snoozeSeen.map.get(row.id);
+        if (snoozed && seen !== row.snoozeWakeAt) await snoozeSeen.set(row.id, row.snoozeWakeAt!);
+        else if (!snoozed && seen !== undefined && seen > now) await snoozeSeen.set(row.id, now); // cleared early
+        const lastActivityAt = nudgeTurns.map.get(row.id)?.lastActivityAt ?? row.updatedAt;
+        facts.set(row.id, { rec, prs, missing, lastActivityAt });
+        threads.push({
+          id: row.id, archived: false, done: row.done, snoozed, status: row.status, verifying: rec.verifying !== null,
+          lastActivityAt, enrolledAt: ms(rec.enrolledAt), nudgedAt: ms(rec.nudgedAt), deepCheckedAt: ms(rec.deepCheckedAt),
+          snoozeWokeAt: snoozed ? null : (snoozeSeen.map.get(row.id) ?? null), linkedChangeAt: changes.length > 0 ? Math.max(...changes) : null,
+        });
+      }
+      // Uncapped here: the cap counts sent turns, so a busy thread does not use a slot.
+      const plan = planReminders({ threads, now, nudgeDays: s.nudgeDays, deepCheckDays: s.deepCheckDays, cap: Number.POSITIVE_INFINITY });
+      for (const id of plan.deepCheck) {
+        const f = facts.get(id)!;
+        const found = deepCheckFindings({
+          links: f.rec.links,
+          snapshot: snapshot && { stale: stale || f.missing, tickets: snapshot.tickets },
+          prs: f.prs,
+          mentions: snapshot?.mentions ?? [],
+          me: snapshot?.me.accountId ?? null,
+        });
+        const wrote = await perThread(id, async () => {
+          if ((await store.readThread(id)).verifying !== null) return false;
+          await store.writeThread(id, { deepCheckedAt: isoNow(), reason: found.reason });
+          return true;
+        });
+        if (wrote) await nextSteps.set(id, { reason: found.reason, next: found.next as DeepNext, ...(found.prUrl ? { prUrl: found.prUrl } : {}) });
+      }
+      let sent = 0;
+      for (const id of plan.nudge) {
+        if (sent >= s.nudgeTurnsPerPass) break;
+        const f = facts.get(id)!;
+        if (await nudge(id, f.lastActivityAt, f.rec.links.length === 0)) sent++;
+      }
+    } finally {
+      passing = false;
+    }
+  };
+  bb.background.schedule("jira-reminders", "*/5 * * * *", () => reminderPass().catch(logFail("pass")));
+
   bb.rpc.register(jiraRpcContract, {
     jira_reconcile_plan: () =>
       serial(async () => {
@@ -757,10 +925,12 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       return reconcileApply();
     },
     jira_board_state: async () => {
-      if (!(await enabled())) return { enabled: false, snapshotAge: null, stale: false, error: null, tickets: [], threads: {}, pending: {} };
+      if (!(await enabled())) return { enabled: false, snapshotAge: null, stale: false, error: null, tickets: [], threads: {}, pending: {}, next: {} };
       const { snapshot, ageMs, stale, error } = await store.readSnapshot();
       const threads: Record<string, ThreadJiraRecord> = {};
       for (const { id } of await deps.liveLinks()) threads[id] = await store.readThread(id);
+      await nextSteps.loaded;
+      const next = Object.fromEntries([...nextSteps.map].filter(([id, n]) => threads[id]?.reason === n.reason));
       return {
         enabled: true,
         snapshotAge: ageMs,
@@ -769,11 +939,19 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         tickets: snapshot?.tickets ?? [],
         threads,
         pending: Object.fromEntries((await store.pendingOps()).map((o) => [o.id, o])),
+        next,
       };
     },
     jira_card_action: async ({ kind, threadId, index, reason }) => {
       if (!(await enabled())) return { ok: false, error: OFF };
       if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread" };
+      if (kind === "run-done-check") {
+        await startDoneCheck(threadId); // clears the reason
+        return { ok: true };
+      }
+      // Every other click outside the Done check clears the reason line.
+      if (kind === "dismiss-reason" || kind === "clear-check-in" || kind === "find-ticket" || kind === "promote-epic") await clearReason(threadId);
+      if (kind === "dismiss-reason") return { ok: true };
       if (kind === "clear-check-in") {
         await store.writeThread(threadId, { checkInWith: null });
         return { ok: true };
@@ -807,7 +985,17 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       if (!(await enabled())) return { ok: false, error: OFF };
       if (action === "fix") {
         if (kind === undefined) return { ok: false, error: "kind required" };
-        if (kind === "all-done-still-open") return { ok: false, error: "not yet" }; // Task 10: the Done check.
+        if (kind === "all-done-still-open") {
+          // The Done check (not a direct transition) on every linked thread not yet Done; its pass queues the ticket update.
+          let started = 0;
+          for (const { id } of await deps.liveLinks()) {
+            const rec = await store.readThread(id);
+            if (!rec.links.some((l) => l.key === key) || rec.verifying !== null || (await isDone(id))) continue;
+            await startDoneCheck(id);
+            started++;
+          }
+          return { ok: true, started };
+        }
         if (kind === "stale-unlinked" && confirm !== true) return { ok: false, error: "confirm required" };
         return fixDrift(key, kind);
       }

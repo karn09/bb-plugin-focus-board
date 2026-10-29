@@ -102,3 +102,23 @@ describe("JiraCardBadges", () => {
     expect(onAction).toHaveBeenCalledWith("keep-working", "t1");
   });
 });
+
+describe("JiraCardBadges: the deeper check's next step (Task 11)", () => {
+  it("Run Done check, Open PR, Snooze; the reason renders as text", () => {
+    const onAction = vi.fn();
+    const onSnooze = vi.fn();
+    const { rerender } = render(
+      <JiraCardBadges {...props} onAction={onAction} onSnooze={onSnooze} record={rec({ reason: "<b>All PRs merged</b>" })} next={{ next: "done-check" }} />,
+    );
+    expect(screen.getByText("<b>All PRs merged</b>")).toBeTruthy();
+    fireEvent.click(screen.getByText("Run Done check"));
+    expect(onAction).toHaveBeenCalledWith("run-done-check", "t1");
+    rerender(<JiraCardBadges {...props} onAction={onAction} onSnooze={onSnooze} record={rec({ reason: "PR #4: CI failing" })} next={{ next: "open-pr", prUrl: "https://github.com/o/r/pull/4" }} />);
+    expect(screen.getByText("Open PR").getAttribute("href")).toBe("https://github.com/o/r/pull/4");
+    rerender(<JiraCardBadges {...props} onAction={onAction} onSnooze={onSnooze} record={rec({ reason: "PR status unavailable" })} next={{ next: "snooze" }} />);
+    expect(screen.queryByText("Run Done check")).toBeNull();
+    fireEvent.click(screen.getByText("Snooze"));
+    expect(onSnooze).toHaveBeenCalledWith("t1");
+    expect(onAction).toHaveBeenCalledWith("dismiss-reason", "t1");
+  });
+});

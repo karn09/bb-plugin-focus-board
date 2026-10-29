@@ -84,6 +84,8 @@ export interface GroupingContext {
 export function threadState(
   thread: PluginSidebarThread,
   errorAcks?: ReadonlySet<string>,
+  /** Jira on: threads whose Jira record carries a reason (a nudge, deeper check or failed Done check). */
+  needsYou?: ReadonlySet<string>,
 ): ThreadState {
   // Attention outranks working: a turn that is paused waiting on the operator
   // (a pending interaction such as a secret request, or an unread error) still
@@ -102,6 +104,7 @@ export function threadState(
   const errorAcked = errorAcks?.has(thread.id) === true;
   if (
     thread.hasPendingInteraction ||
+    needsYou?.has(thread.id) === true ||
     (!errorAcked &&
       (thread.indicator === "unread-error" ||
         thread.indicator === "queued-failed" ||
@@ -505,10 +508,11 @@ export function columnFor(
   context: GroupingContext,
   now: number = Date.now(),
   errorAcks?: ReadonlySet<string>,
+  needsYou?: ReadonlySet<string>,
 ): { id: string; label: string } {
   if (groupBy === "none") return { id: "all", label: "Threads" };
   if (groupBy === "status") {
-    const state = threadState(thread, errorAcks);
+    const state = threadState(thread, errorAcks, needsYou);
     if (state !== "idle") return { id: state, label: THREAD_STATE_LABELS[state] };
     const age = now - thread.updatedAt;
     return ageBucketFor(age, IDLE_BUCKETS);
@@ -582,6 +586,11 @@ export function buildColumns(
    * into its state column (or nests quiet) instead of Needs you.
    */
   errorAcks: ReadonlySet<string> = new Set(),
+  /**
+   * Jira on: threads with a Jira reason line read as Needs you (threadState).
+   * Done threads never reach it: they form the Done column first.
+   */
+  needsYou?: ReadonlySet<string>,
 ): BoardColumn[] {
   // Threads marked Done form their own column, always farthest right on the
   // Attention board and present (dimmed) on every other grouping.
@@ -608,7 +617,7 @@ export function buildColumns(
       attentionColumns.get(thread.id) ??
         columnOverrides.get(thread.id) ??
         frozenColumns.get(thread.id) ??
-        columnFor(thread, groupBy, context, now, errorAcks),
+        columnFor(thread, groupBy, context, now, errorAcks, needsYou),
     );
   }
 

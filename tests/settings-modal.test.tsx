@@ -65,6 +65,7 @@ function renderModal(
     onSetLaneDirection: (value: "vertical" | "horizontal") => void;
     onWallpaperChange: (next: WallpaperSettings) => void;
     onOpenChange: (open: boolean) => void;
+    jiraEnabled: boolean;
   }> = {},
   options: { compact?: boolean } = {},
 ): RenderHandlers {
@@ -306,6 +307,12 @@ describe("settings modal: Behavior tab's New Thread shortcut row", () => {
 });
 
 describe("settings modal: Behavior tab's Sweep block", () => {
+  it("Jira on: the long-idle row is hidden (reminders replace it); the Done row stays", () => {
+    renderModal({ jiraEnabled: true });
+    expect(screen.queryByLabelText("Sweep: mark long-idle threads Done after count")).toBeNull();
+    expect(screen.getByLabelText("Sweep: archive Done threads after count")).toBeTruthy();
+  });
+
   it("renders both arms with the defaults when nothing is stored yet (loading)", () => {
     renderModal();
     const doneCount = screen.getByLabelText("Sweep: archive Done threads after count") as HTMLInputElement;

@@ -118,6 +118,12 @@ export interface NestingOptions {
    */
   errorAcks?: ReadonlySet<string>;
   /**
+   * Jira on: threads with a Jira reason line, laned as Needs you
+   * (buildColumns). Family rules (R4, nesting) do not read it.
+   */
+  // ponytail: lane placement only; a nested child with a reason stays nested. Thread it through familyColumnOverrides/childPlacement if that matters.
+  needsYou?: ReadonlySet<string>;
+  /**
    * The attention freeze (components/attention-freeze): the plan compiled
    * from the captures app.tsx holds for attended cards — the lane pins that
    * win over every claim, the final-list slot pins, and the nested-row
@@ -203,6 +209,9 @@ export function assembleBoard(
           now,
           ranks,
           attentionColumns,
+          new Map(),
+          undefined,
+          options.needsYou,
         ),
         attention?.slots ?? new Map(),
       ),
@@ -238,6 +247,7 @@ export function assembleBoard(
       familyOverrides,
       attentionColumns,
       options.errorAcks,
+      options.needsYou,
     ),
     visible,
     groupBy,

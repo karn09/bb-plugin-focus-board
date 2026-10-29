@@ -13,6 +13,7 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { createThreadPulseTracker } from "./lib/thread-pulse";
 import { registerJira } from "./lib/jira-server";
+import { jiraSettings } from "./lib/jira-settings";
 import { trackedRegisterTool } from "./lib/jira-agent";
 import {
   PluginCliError,
@@ -3456,6 +3457,8 @@ export default async function plugin(bb: BbPluginApi) {
         }),
       );
       let eligible = sweepCliEligible(facts, thresholds, Date.now());
+      // Jira on: reminders replace the long-idle arm; Done archiving is unchanged.
+      if (jiraSettings(values).enabled) eligible = eligible.filter((entry) => entry.reason === "done");
       if (ids.length > 0) {
         const idSet = new Set(ids);
         if (confirm) {
@@ -4012,6 +4015,28 @@ export default async function plugin(bb: BbPluginApi) {
       bb.realtime.publish(DONE_CHANGED, { threadId, done: true });
     },
     notDone: (threadId) => bb.realtime.publish(DONE_CHANGED, { threadId, done: false }),
+    reminderThreads: async () => {
+      const rows = (await bb.sdk.threads.list({})).filter((row) => row.archivedAt === null);
+      return Promise.all(
+        rows.map(async (row) => {
+          let snoozeWakeAt: number | null;
+          try {
+            const record = await readSnoozeRecord(row.id);
+            snoozeWakeAt = record === null ? null : snoozeWakeAtMs(record);
+          } catch {
+            snoozeWakeAt = Number.POSITIVE_INFINITY; // a corrupt snooze record: leave the thread alone
+          }
+          return {
+            id: row.id,
+            status: row.status,
+            updatedAt: row.updatedAt,
+            branch: row.environmentBranchName ?? null,
+            done: (await readDoneRecord(row.id)) !== null,
+            snoozeWakeAt,
+          };
+        }),
+      );
+    },
   });
   bb.onDispose(() => jira.dispose());
 

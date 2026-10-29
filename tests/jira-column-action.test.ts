@@ -117,10 +117,10 @@ describe("jira_column_action", () => {
     expect((ops[1] as { body: string }).body).not.toMatch(/[`$|;&]/);
   });
 
-  it("fix refuses drift that is not there; all-done-still-open is not yet", async () => {
+  it("fix refuses drift that is not there; all-done-still-open with no open linked thread starts nothing", async () => {
     await load({ jiraEnabled: true });
     expect(await act({ action: "fix", key: "PT-3570", kind: "todo-with-prs" })).toEqual({ ok: false, error: "no such drift" });
-    expect(await act({ action: "fix", key: "PT-3570", kind: "all-done-still-open" })).toEqual({ ok: false, error: "not yet" });
+    expect(await act({ action: "fix", key: "PT-3570", kind: "all-done-still-open" })).toEqual({ ok: true, started: 0 });
     expect(await queue()).toEqual([]);
   });
 

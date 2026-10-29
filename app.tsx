@@ -102,6 +102,7 @@ import { spawnInheritedGroupId } from "./lib/group-inheritance";
 import { maximizeComposerToMainView } from "./lib/compose-maximize";
 import { SnoozeDialog } from "./components/snooze-dialog";
 import {
+  presetWakeAt,
   snoozeMenuActions,
   snoozeWakeAtMs,
   type SnoozeMenuAction,
@@ -534,7 +535,8 @@ function BoardPage({ subPath }: { subPath: string }) {
     threads: JiraBoardValue["threads"]; pending: JiraBoardValue["pendingOps"];
     snapshotAge: number | null; error: string | null;
     suggestions: { threadId: string; key: string }[]; drift: DriftItem[]; autoLinks: { threadId: string; key: string }[];
-  }>({ enabled: false, stale: false, tickets: {}, threads: {}, pending: [], snapshotAge: null, error: null, suggestions: [], drift: [], autoLinks: [] });
+    next: NonNullable<JiraBoardValue["nextByThread"]>;
+  }>({ enabled: false, stale: false, tickets: {}, threads: {}, pending: [], snapshotAge: null, error: null, suggestions: [], drift: [], autoLinks: [], next: {} });
   const refetchJira = useCallback(() => {
     jiraRpc.call("jira_board_state", null).then(
       async (r) => {
@@ -551,6 +553,7 @@ function BoardPage({ subPath }: { subPath: string }) {
           suggestions: plan?.suggestions ?? [],
           drift: plan?.drift ?? [],
           autoLinks: plan?.autoLinks ?? [],
+          next: r.next,
         });
       },
       () => {}, // Jira is optional state; the board works without it.
@@ -570,6 +573,7 @@ function BoardPage({ subPath }: { subPath: string }) {
       ticketByKey: jiraState.tickets,
       threads: jiraState.threads,
       pendingOps: jiraState.pending,
+      nextByThread: jiraState.next,
       onAction: (kind, threadId, index, reason) => {
         jiraRpc.call("jira_card_action", { kind, threadId, ...(index === undefined ? {} : { index, reason }) }).then(refetchJira, () => {});
       },
@@ -1720,6 +1724,11 @@ function BoardPage({ subPath }: { subPath: string }) {
     () => boardDoneIds(doneIds, jiraState.enabled, jiraState.threads),
     [doneIds, jiraState.enabled, jiraState.threads],
   );
+  // Jira on: a card with a reason line (nudge, deeper check, failed Done check) reads as Needs you.
+  const jiraNeedsYou = useMemo(
+    () => (jiraState.enabled ? new Set(Object.keys(jiraState.threads).filter((id) => jiraState.threads[id]!.reason !== null)) : undefined),
+    [jiraState.enabled, jiraState.threads],
+  );
   const groupBoxPlan = useMemo(
     () =>
       planGroupBoxes(
@@ -1784,8 +1793,9 @@ function BoardPage({ subPath }: { subPath: string }) {
         ...[...hoverCapturesRef.current.values()].filter((capture) => capture.view === groupBy),
       ]),
       errorAcks: errorAckIds,
+      needsYou: jiraNeedsYou,
     });
-  }, [isParentGroupBy, searched, groupBy, groupContext, placedDoneIds, nestChildren, ranks, doneTimes, paneCapture, errorAckIds, hoverRebuildEpoch]);
+  }, [isParentGroupBy, searched, groupBy, groupContext, placedDoneIds, nestChildren, ranks, doneTimes, paneCapture, errorAckIds, hoverRebuildEpoch, jiraNeedsYou]);
   const columns = assembly?.columns ?? [];
   // The map that actually renders as nested rows (nesting rules applied, so a
   // promoted, un-nested, or cross-axis child is absent — expanding the card
@@ -1938,7 +1948,7 @@ function BoardPage({ subPath }: { subPath: string }) {
             ? sweepCandidatesForIdleColumn(
                 sweepable,
                 doneIds,
-                { idleArchiveMs: sweepConfig.idleArchiveMs, kept: idleKept },
+                { idleArchiveMs: sweepConfig.idleArchiveMs, kept: idleKept, jiraEnabled: jiraState.enabled },
                 now,
                 liveChildParentIds,
                 errorAckIds,
@@ -1953,7 +1963,7 @@ function BoardPage({ subPath }: { subPath: string }) {
           return [];
       }
     },
-    [doneIds, doneAgeSource, idleKept, liveChildParentIds, snoozedIds, sweepConfig, errorAckIds],
+    [doneIds, doneAgeSource, idleKept, liveChildParentIds, snoozedIds, sweepConfig, errorAckIds, jiraState.enabled],
   );
 
   const sweepCandidatesFor = useCallback(
@@ -2632,6 +2642,7 @@ function BoardPage({ subPath }: { subPath: string }) {
     };
     return {
       ...jiraValue,
+      onSnooze: (threadId) => snoozeUntil(threadId, presetWakeAt("tomorrow9", new Date())),
       column: {
         tickets: Object.values(jiraState.tickets).filter((t) => t.assignedToMe && t.statusCategory !== "done"),
         threadsByKey,
@@ -2648,7 +2659,7 @@ function BoardPage({ subPath }: { subPath: string }) {
         pending: jiraState.pending,
       },
     };
-  }, [jiraValue, jiraState, threads, jiraRpc, refetchJira, startJiraThread, openThreadCard]);
+  }, [jiraValue, jiraState, threads, jiraRpc, refetchJira, startJiraThread, openThreadCard, snoozeUntil]);
   const boardColumns = useMemo(() => withJiraColumn(columns, groupBy, jiraState.enabled), [columns, groupBy, jiraState.enabled]);
 
   const closeThreadPane = useCallback(() => {
@@ -3876,6 +3887,7 @@ function BoardPage({ subPath }: { subPath: string }) {
           idleArchiveUnit: settingValues?.idleArchiveUnit,
         }}
         onSetSweep={setSweepThreshold}
+        jiraEnabled={jiraState.enabled}
         onSetEscStopsRunningThread={setEscStopsRunningThread}
         onSetNewThreadShortcutKey={setNewThreadShortcutKey}
         cardTransport={cardTransport}
