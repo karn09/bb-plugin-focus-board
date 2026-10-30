@@ -20,6 +20,13 @@ fs.appendFileSync(path.join(dir, name + ".log"), JSON.stringify({ argv, file }) 
 const rp = path.join(dir, name + ".rules.json");
 const rules = fs.existsSync(rp) ? JSON.parse(fs.readFileSync(rp, "utf8")) : [];
 const line = argv.join(" ");
+// Real acli: \`workitem search --fields\` only accepts a fixed set (parent, updated, subtasks... are refused).
+const SEARCH_OK = new Set(["key", "summary", "status", "assignee", "issuetype", "description", "priority", "labels"]);
+const fi = argv.indexOf("--fields");
+if (name === "acli" && argv.includes("search") && fi >= 0) {
+  const bad = argv[fi + 1].split(",").filter((f) => !SEARCH_OK.has(f));
+  if (bad.length) { process.stderr.write("✗ Error: fields '" + bad.join(", ") + "' are not allowed"); process.exit(1); }
+}
 const r = rules.find((r) => line.includes(r.match)) || { stdout: "" };
 if (r.stderr) process.stderr.write(r.stderr);
 process.stdout.write(r.stdout ?? "");
@@ -81,7 +88,8 @@ describe("toTicket", () => {
       key: "ENG-1", summary: "s ENG-1", status: "In Progress", statusCategory: "indeterminate",
       assignee: { accountId: "me1", displayName: "Me" }, assignedToMe: true, issueType: "Task",
       isEpic: false, parentKey: "ENG-9", epicKey: "ENG-9", openChildren: 0,
-      url: "https://x.atlassian.net/browse/ENG-1",
+      // self points at an internal API host; browse links always use the site.
+      url: "https://growtherapy.atlassian.net/browse/ENG-1",
     });
     expect(toTicket(issue("ENG-2", { assignee: null }), "me1")).toMatchObject({ assignee: null, assignedToMe: false });
     expect(toTicket(issue("ENG-3", { issuetype: { name: "Epic" } }), "")).toMatchObject({ isEpic: true });
@@ -92,7 +100,7 @@ describe("jira-sync.mjs", () => {
   it("emits a snapshot that parses with the real schema", () => {
     rules("acli", [
       { match: "assignee = currentUser()", stdout: JSON.stringify([issue("ENG-1"), issue("ENG-2", { issuetype: { name: "Epic" } })]) },
-      { match: "parent in", stdout: JSON.stringify([issue("ENG-5", { parent: { key: "ENG-2" } })]) },
+      { match: "parent = ENG-2", stdout: JSON.stringify([{ key: "ENG-5" }]) },
     ]);
     run();
     const snap = JiraSnapshot.parse(ingested());
@@ -100,6 +108,18 @@ describe("jira-sync.mjs", () => {
     expect(snap.me.accountId).toBe("me1");
     expect(snap.tickets.find((t) => t.key === "ENG-2")!.openChildren).toBe(1);
     expect(snap.tickets.every((t) => t.assignedToMe)).toBe(true);
+  });
+
+  it("asks search only for fields acli allows, and gets parent/updated from view", () => {
+    rules("acli", [
+      { match: "assignee = currentUser()", stdout: JSON.stringify([issue("ENG-1", { updated: undefined })]) },
+      { match: "workitem view ENG-1", stdout: JSON.stringify(issue("ENG-1", { parent: { key: "ENG-9", fields: { issuetype: { name: "Epic" } } }, updated: "2026-10-20T10:00:00.000-0400" })) },
+      { match: "parent = ENG-1", stdout: JSON.stringify([{ key: "ENG-11" }, { key: "ENG-12" }]) },
+    ]);
+    run();
+    const snap = JiraSnapshot.parse(ingested());
+    expect(snap.ok).toBe(true);
+    expect(snap.tickets[0]).toMatchObject({ key: "ENG-1", parentKey: "ENG-9", epicKey: "ENG-9", updatedAt: "2026-10-20T10:00:00.000-0400", openChildren: 2, url: "https://growtherapy.atlassian.net/browse/ENG-1" });
   });
 
   it("fetches PRs and mentions", () => {

@@ -13,7 +13,10 @@ import { promisify } from "node:util";
 const exec = promisify(execFile);
 const KEY = /^[A-Z][A-Z0-9]+-\d+$/;
 const PROJ = /^[A-Z][A-Z0-9]+$/;
-const FIELDS = "key,summary,status,assignee,issuetype,parent,updated";
+// acli's search only returns a fixed set of fields (parent, updated, subtasks are refused);
+// those come from one `workitem view` per ticket (enrich below).
+const FIELDS = "key,summary,status,assignee,issuetype";
+const BASE = (process.env.JIRA_BASE_URL || "https://growtherapy.atlassian.net").replace(/\/$/, "");
 const run = async (cmd, args) => {
   try {
     return (await exec(cmd, args, { maxBuffer: 64 * 1024 * 1024, timeout: 60_000 })).stdout;
@@ -39,9 +42,6 @@ async function bbFile(sub, value) {
 
 // ---- acli JSON -> JiraTicket (REST v3 issue shape; defensive) ----
 const CATS = new Set(["new", "indeterminate", "done"]);
-const origin = (self) => {
-  try { return new URL(self).origin; } catch { return (process.env.JIRA_BASE_URL || "https://growtherapy.atlassian.net").replace(/\/$/, ""); }
-};
 const catByName = (n) =>
   /^(done|closed|resolved|invalid|n\/a)$/i.test(n) ? "done" : /^(to do|open|backlog)$/i.test(n) ? "new" : "indeterminate";
 export function toTicket(raw, meAccountId) {
@@ -63,7 +63,8 @@ export function toTicket(raw, meAccountId) {
     epicKey: parent && parent.fields?.issuetype?.name === "Epic" ? parent.key : null,
     openChildren: 0,
     updatedAt: f.updated ?? "",
-    url: `${origin(raw.self)}/browse/${raw.key}`,
+    // `self` points at an internal API host, never the browse site.
+    url: `${BASE}/browse/${raw.key}`,
   };
 }
 
@@ -122,6 +123,15 @@ async function drain() {
 }
 
 // ---- tickets ----
+/** map with at most `n` in flight, results in input order. */
+async function pool(items, n, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => {
+    while (next < items.length) { const i = next++; out[i] = await fn(items[i]); }
+  }));
+  return out;
+}
 async function fetchTickets(wanted) {
   const projects = wanted.projects.filter((p) => PROJ.test(p));
   const linked = wanted.linkedKeys.filter((k) => KEY.test(k));
@@ -132,14 +142,12 @@ async function fetchTickets(wanted) {
   const extra = linked.length ? (await search(`key in (${linked.join(",")})`)).filter((i) => !mineKeys.has(i.key)) : [];
   // `me` comes from the assignee of the currentUser() query; "" when we have no tickets (acli has no whoami).
   const me = mine.find((i) => i.fields?.assignee?.accountId)?.fields.assignee.accountId ?? "";
-  const tickets = [...mine, ...extra].map((i) => toTicket(i, me));
-  const parents = tickets.map((t) => t.key); // any ticket can be a parent
-  if (parents.length) {
-    const counts = {};
-    for (const c of await search(`parent in (${parents.join(",")}) AND resolution = Unresolved`))
-      if (c.fields?.parent?.key) counts[c.fields.parent.key] = (counts[c.fields.parent.key] ?? 0) + 1;
-    for (const t of tickets) t.openChildren = counts[t.key] ?? 0;
-  }
+  const tickets = await pool([...mine, ...extra], 5, async (i) => {
+    const v = json(await acli("view", i.key, "--fields", "parent,updated", "--json"));
+    const t = toTicket({ ...i, fields: { ...i.fields, ...v?.fields } }, me);
+    t.openChildren = (await search(`parent = ${i.key} AND resolution = Unresolved`)).length;
+    return t;
+  });
   return { me, tickets };
 }
 

@@ -14,6 +14,7 @@ import { readStoredText, writeStored } from "./preferences";
 export const JIRA_COLUMN_COLLAPSED_KEY = "focus-board:jiraColumnCollapsed";
 export const JIRA_HIDE_LINKED_KEY = "focus-board:jiraHideLinked";
 const NOT_CONNECTED = "Jira not connected: run `acli jira auth login --web`";
+const NO_DATA = "No Jira data yet: set up the sync script with `bb focus-board jira setup`";
 
 type ThreadRef = { id: string; title: string };
 
@@ -73,7 +74,8 @@ const FIX_LABEL: Record<DriftItem["kind"], string> = {
 function statusLine({ error, stale, snapshotAgeMs }: Pick<JiraColumnProps, "error" | "stale" | "snapshotAgeMs">): string | null {
   // An ok snapshot with some gh reads failed (scripts/jira-sync.mjs): Jira itself is connected.
   if (error !== null && /^gh: \d+ of \d+ /.test(error)) return error;
-  if ((error !== null && /unauthori[sz]ed|auth/i.test(error)) || (error === null && snapshotAgeMs === null)) return NOT_CONNECTED;
+  if (error !== null && /unauthori[sz]ed|not authenticated|auth login|\b401\b/i.test(error)) return NOT_CONNECTED;
+  if (error === null && snapshotAgeMs === null) return NO_DATA;
   if (error !== null) return `Jira refresh failed: ${error}`;
   if (stale && snapshotAgeMs !== null) return `data ${Math.floor(snapshotAgeMs / 60_000)} min old`;
   return null;

@@ -39,6 +39,17 @@ describe("JiraColumn", () => {
     expect(screen.getByText("Jira not connected: run `acli jira auth login --web`")).toBeTruthy();
   });
 
+  it("no data yet (no snapshot, no error) points at the sync script, not the login", () => {
+    render(<JiraColumn {...base()} snapshotAgeMs={null} error={null} />);
+    expect(screen.getByText("No Jira data yet: set up the sync script with `bb focus-board jira setup`")).toBeTruthy();
+    expect(screen.queryByText(/Jira not connected/)).toBeNull();
+  });
+
+  it("a refresh error that merely mentions 'author' is not read as a login problem", () => {
+    render(<JiraColumn {...base()} error="field 'author' unknown" />);
+    expect(screen.getByText("Jira refresh failed: field 'author' unknown")).toBeTruthy();
+  });
+
   it("a partial gh failure on an ok snapshot shows the gh line, not the login hint", () => {
     render(<JiraColumn {...base()} error="gh: 1 of 3 PRs unreadable (gh pr failed: run gh auth login)" />);
     expect(screen.getByText("gh: 1 of 3 PRs unreadable (gh pr failed: run gh auth login)")).toBeTruthy();
