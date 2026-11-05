@@ -7,17 +7,21 @@ import type { NewQueueOp } from "./jira-store";
 
 export const JIRA_VERDICT_TOOL = "focus_board_done_verdict";
 
-export type Mechanical = { verdict: "pass" | "fail" | "needs-agent" | "needs-operator"; reasons: string[] };
+export type Mechanical = { verdict: "pass" | "fail" | "needs-agent" | "needs-data"; reasons: string[] };
+
+/** The card's note while a Done check waits for fresh PR data. */
+export const CHECKING_PRS = "checking PRs";
+/** How long a Done check waits for fresh PR data before asking the operator. */
+export const DATA_WAIT_MS = 3 * 60_000;
+/** The Confirm done note when no fresh PR data arrived in time. */
+export const NO_PR_DATA = "Couldn't check PRs: confirm done";
 
 export function evaluateMechanical(input: { prs: GhPr[]; children: { id: string; title: string; linked: boolean }[]; snapshotStale: boolean }): Mechanical {
   const kids = input.children.filter((c) => !c.linked).map((c) => `child thread '${c.title}' has no ticket`);
-  // Stale data never passes: the operator decides.
-  if (input.snapshotStale) return { verdict: "needs-operator", reasons: ["PR status unavailable", ...kids] };
-  const reasons = [
-    ...input.prs.filter((p) => p.state === "closed").map((p) => `PR #${p.number} closed unmerged, confirm it's not needed`),
-    ...input.prs.filter((p) => p.state === "open").map((p) => `PR #${p.number} still open`),
-    ...kids,
-  ];
+  // Stale data never passes: refresh and re-check (the flow falls back to the operator).
+  if (input.snapshotStale) return { verdict: "needs-data", reasons: [CHECKING_PRS] };
+  // Merged and closed are both finished; only an open PR blocks.
+  const reasons = [...input.prs.filter((p) => p.state === "open").map((p) => `PR #${p.number} still open`), ...kids];
   if (reasons.length > 0) return { verdict: "fail", reasons };
   return input.prs.length > 0 ? { verdict: "pass", reasons: [] } : { verdict: "needs-agent", reasons: [] };
 }
@@ -37,11 +41,12 @@ const MAX_SUMMARY = 4000;
 export const DONE_SUMMARY_PREFIX = "Focus Board: thread ";
 
 /** The ticket comment: plain text, under 4,000 chars. */
-export function doneSummary(input: { title: string; prUrls: string[]; childKeys: string[]; skipped: boolean }): string {
+export function doneSummary(input: { title: string; prUrls: string[]; closedUrls?: string[]; childKeys: string[]; skipped: boolean }): string {
   const lines = [
     `${DONE_SUMMARY_PREFIX}"${input.title}" is Done.`,
     ...(input.skipped ? ["The operator marked it done without the Done check."] : []),
     ...(input.prUrls.length > 0 ? ["Pull requests:", ...input.prUrls.map((u) => `- ${u}`)] : []),
+    ...(input.closedUrls?.length ? ["Closed without merging:", ...input.closedUrls.map((u) => `- ${u}`)] : []),
     ...(input.childKeys.length > 0 ? [`Child tickets: ${input.childKeys.join(", ")}`] : []),
   ];
   const s = lines.join("\n");

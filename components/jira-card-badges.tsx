@@ -66,7 +66,7 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
       {record?.verifying ? (
         <span className={chip} data-jira-verifying="">
           <Icon name="Spinner" className="size-3 animate-spin" aria-hidden />
-          verifying
+          <span>{record.verifying.reasons?.[0] ?? "verifying"}</span>
         </span>
       ) : null}
       {record?.checkInWith ? (
@@ -83,6 +83,9 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
             Promote {(links.find((l) => l.role === "owner") ?? links[0]).key} to an epic?
           </button>
         </span>
+      ) : null}
+      {record?.doneCheck?.verdict === "pending-confirm" && record.doneCheck.reasons.length > 0 ? (
+        <span className="w-full truncate text-[10px] text-muted-foreground" data-jira-confirm-note="">{record.doneCheck.reasons[0]}</span>
       ) : null}
       {record?.doneCheck?.verdict === "pending-confirm" ? (
         <button type="button" className={cn(chip, "underline")} onClick={() => onAction("confirm-done", threadId)}>

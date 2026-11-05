@@ -20,11 +20,12 @@ const ticket = (over: Partial<JiraTicket> = {}): JiraTicket => ({
 
 describe("evaluateMechanical", () => {
   const ev = (over: Partial<Parameters<typeof evaluateMechanical>[0]> = {}) => evaluateMechanical({ prs: [], children: [], snapshotStale: false, ...over });
-  it("stale or missing PR data: needs-operator, PR status unavailable", () => {
-    expect(ev({ snapshotStale: true, prs: [pr(1, "merged")] })).toEqual({ verdict: "needs-operator", reasons: ["PR status unavailable"] });
+  it("stale or missing PR data: needs-data (refresh and re-check), never a pass", () => {
+    expect(ev({ snapshotStale: true, prs: [pr(1, "merged")] })).toEqual({ verdict: "needs-data", reasons: ["checking PRs"] });
   });
-  it("a PR closed unmerged fails", () => {
-    expect(ev({ prs: [pr(1, "merged"), pr(7, "closed")] })).toEqual({ verdict: "fail", reasons: ["PR #7 closed unmerged, confirm it's not needed"] });
+  it("merged and closed PRs are both finished; only an open PR blocks", () => {
+    expect(ev({ prs: [pr(1, "merged"), pr(7, "closed")] })).toEqual({ verdict: "pass", reasons: [] });
+    expect(ev({ prs: [pr(7, "closed")] })).toEqual({ verdict: "pass", reasons: [] });
   });
   it("an open PR fails", () => {
     expect(ev({ prs: [pr(8, "open")] })).toEqual({ verdict: "fail", reasons: ["PR #8 still open"] });
@@ -200,22 +201,86 @@ describe("Done check flow", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it("a Done drop while the snapshot is stale: 'PR status unavailable', no stamp, no ops", async () => {
+  const ingest = async (s: object) => {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const f = join(mkdtempSync(join((await import("node:os")).tmpdir(), "dc-")), "s.json");
+    writeFileSync(f, JSON.stringify(s));
+    expect((await harness.behavior.runCli(["jira", "ingest", "--file", f])).exitCode).toBe(0);
+    await flush();
+    await flush();
+  };
+  const staleSnap = (prs: GhPr[]) => snap({ prs, takenAt: "2020-01-01T00:00:00Z" });
+
+  it("stale PR data: the card stays in Done 'checking PRs', a refresh is requested, nothing bounces", async () => {
     seed("t1");
-    await load({ snapshot: snap({ prs: [pr(1, "merged")], takenAt: "2020-01-01T00:00:00Z" }) });
+    await load({ snapshot: staleSnap([pr(1, "open")]) });
     await doneSet("t1");
     expect(doneOf("t1")).toBeUndefined();
-    expect(jiraOf("t1")).toMatchObject({ verifying: null, reason: "PR status unavailable", doneCheck: { verdict: "fail", reasons: ["PR status unavailable"] } });
+    expect(jiraOf("t1")).toMatchObject({ verifying: { reasons: ["checking PRs"] }, reason: null, doneCheck: null });
+    expect(await bb.storage.kv.get("jira:refresh-requested-at")).toEqual(expect.any(Number));
+    expect(boardDoneIds(new Set(), true, { t1: jiraOf("t1") as never }).has("t1")).toBe(true);
+    expect(harness.inspection.realtimeSignals).not.toContainEqual({ channel: "done-changed", payload: { threadId: "t1", done: false } });
     expect(await ops()).toEqual([]);
-    expect(harness.inspection.realtimeSignals).toContainEqual({ channel: "done-changed", payload: { threadId: "t1", done: false } });
   });
 
-  it("no snapshot at all: also PR status unavailable", async () => {
+  it("fresh data arrives showing every PR merged or closed: Done, with the ticket update", async () => {
     seed("t1");
-    await load({ snapshot: null });
+    await load({ snapshot: staleSnap([pr(1, "open")]) });
     await doneSet("t1");
-    expect(jiraOf("t1")?.reason).toBe("PR status unavailable");
+    await ingest(snap({ prs: [pr(1, "merged"), pr(2, "closed")] }));
+    expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
+    expect(jiraOf("t1")).toMatchObject({ verifying: null, doneCheck: { verdict: "pass" } });
+    const o = await ops();
+    expect(o.map((x) => (x.op === "transition" ? `transition ${x.toCategory}` : x.op))).toEqual(["comment", "transition done"]);
+    expect(o[0]!.body).toContain("https://github.com/o/r/pull/1");
+    expect(o[0]!.body).toContain("Closed without merging:");
+    expect(o[0]!.body).toContain("https://github.com/o/r/pull/2");
+  });
+
+  it("fresh data shows a PR still open: back to Needs you with that reason", async () => {
+    seed("t1");
+    await load({ snapshot: staleSnap([pr(1, "merged")]) });
+    await doneSet("t1");
+    await ingest(snap({ prs: [pr(1, "open")] }));
     expect(doneOf("t1")).toBeUndefined();
+    expect(jiraOf("t1")).toMatchObject({ verifying: null, reason: "PR #1 still open", doneCheck: { verdict: "fail", reasons: ["PR #1 still open"] } });
+  });
+
+  it("no fresh data within 3 minutes: stays in Done waiting for Confirm done, which updates the ticket as usual", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      seed("t1");
+      await load({ snapshot: null });
+      await doneSet("t1");
+      expect(jiraOf("t1")?.verifying).toMatchObject({ reasons: ["checking PRs"] });
+      await vi.advanceTimersByTimeAsync(3 * 60_000 + 5_000);
+      await flush();
+      expect(jiraOf("t1")).toMatchObject({ verifying: null, reason: null, doneCheck: { verdict: "pending-confirm", reasons: ["Couldn't check PRs: confirm done"] } });
+      expect(doneOf("t1")).toBeUndefined();
+      expect(boardDoneIds(new Set(), true, { t1: jiraOf("t1") as never }).has("t1")).toBe(true);
+      expect(harness.inspection.realtimeSignals).not.toContainEqual({ channel: "done-changed", payload: { threadId: "t1", done: false } });
+      expect(await card("confirm-done")).toEqual({ ok: true });
+      expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
+      expect((await ops()).map((o) => o.op)).toEqual(["comment"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("no data, but the last known ticket is there: Confirm done also closes it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      seed("t1");
+      await load({ snapshot: staleSnap([pr(1, "open")]) });
+      await doneSet("t1");
+      await vi.advanceTimersByTimeAsync(3 * 60_000 + 5_000);
+      await flush();
+      expect(await card("confirm-done")).toEqual({ ok: true });
+      expect((await ops()).map((o) => (o.op === "transition" ? `transition ${o.toCategory}` : o.op))).toEqual(["comment", "transition done"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a thread Done before enrollment (skippedDone) never gets a doneCheck", async () => {
@@ -247,11 +312,11 @@ describe("Done check flow", () => {
     expect(doneOf("t1")).toBeUndefined();
   });
 
-  it("a closed-unmerged PR fails with the reason checklist; Not needed drops it, then Confirm done stamps", async () => {
+  it("an open PR fails with the reason checklist; Not needed drops it, then Confirm done stamps", async () => {
     seed("t1");
-    await load({ snapshot: snap({ prs: [pr(1, "merged"), pr(7, "closed")] }) });
+    await load({ snapshot: snap({ prs: [pr(1, "merged"), pr(7, "open")] }) });
     await doneSet("t1");
-    expect(jiraOf("t1")).toMatchObject({ verifying: null, doneCheck: { verdict: "fail", reasons: ["PR #7 closed unmerged, confirm it's not needed"] } });
+    expect(jiraOf("t1")).toMatchObject({ verifying: null, doneCheck: { verdict: "fail", reasons: ["PR #7 still open"] } });
     expect(doneOf("t1")).toBeUndefined();
     expect(await card("not-needed", "t1", 5)).toEqual({ ok: false, error: "no such reason" });
     expect(await card("not-needed", "t1", 0)).toEqual({ ok: true });

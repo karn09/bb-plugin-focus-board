@@ -121,4 +121,12 @@ describe("JiraCardBadges: the deeper check's next step (Task 11)", () => {
     expect(onSnooze).toHaveBeenCalledWith("t1");
     expect(onAction).toHaveBeenCalledWith("dismiss-reason", "t1");
   });
+
+  it("a Done check waiting on PR data says so; a no-data Confirm done shows why", () => {
+    const { rerender } = render(<JiraCardBadges {...props} record={rec({ verifying: { startedAt: "2026-11-05T00:00:00Z", reasons: ["checking PRs"] } })} />);
+    expect(screen.getByText("checking PRs")).toBeTruthy();
+    rerender(<JiraCardBadges {...props} record={rec({ doneCheck: { at: "2026-11-05T00:00:00Z", verdict: "pending-confirm", reasons: ["Couldn't check PRs: confirm done"] } })} />);
+    expect(screen.getByText("Couldn't check PRs: confirm done")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Confirm done" })).toBeTruthy();
+  });
 });

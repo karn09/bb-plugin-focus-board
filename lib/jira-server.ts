@@ -18,7 +18,7 @@ import { createIdleWaiters, sendIfIdle, type JobKind } from "./jira-idle";
 import { findTicketText, JIRA_AGENT_TOOLS, JIRA_LINK_TOOL, JIRA_SPAWN_TOOL, jiraConfigure, JiraLinkParams, promoteEpicText, SpawnChildParams, titleWithKey, trackedRegisterTool } from "./jira-agent";
 import { extractJiraKeys, jiraBrowseUrl } from "./jira-keys";
 import { fixQueued, livePrs, prUrl } from "./jira-drift";
-import { capReasons, DONE_SUMMARY_PREFIX, doneSummary, evaluateMechanical, JIRA_VERDICT_TOOL, spinOffText, ticketUpdate, verifyTurnText } from "./jira-done-check";
+import { capReasons, CHECKING_PRS, DATA_WAIT_MS, DONE_SUMMARY_PREFIX, doneSummary, evaluateMechanical, JIRA_VERDICT_TOOL, NO_PR_DATA, spinOffText, ticketUpdate, verifyTurnText } from "./jira-done-check";
 import { deepCheckFindings, NUDGE_TEXT, planReminders, replyLine, type DeepNext, type ReminderThread } from "./jira-reminders";
 import { applyReconcile, externalJiraKey, planReconcile, StoredReconcilePlan, threadPrsOf, type ReconThread } from "./jira-reconcile";
 import { DriftItem, JiraTicket, OpResult, QueueOp, ThreadJiraRecord } from "./jira-schema";
@@ -248,6 +248,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         if (!r.ok) return fail(`invalid snapshot: ${r.error}`);
         const failed = (raw as { ok?: unknown; error?: unknown }).ok === false;
         const why = (raw as { error?: unknown }).error;
+        if (!failed) await recheckWaiting();
         return { exitCode: 0, stdout: failed ? `ingested (failure: ${typeof why === "string" ? why : "snapshot not ok"})\n` : "ingested\n" };
       } catch (e) {
         return fail(`cannot store snapshot: ${(e as Error).message}`);
@@ -643,7 +644,9 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
 
   // Comment (and maybe transition) on every linked ticket, once: a second
   // Done while the first's Done ops are un-acked queues nothing.
-  const queueTicketUpdate = (threadId: string, skipped: boolean) =>
+  // operatorConfirmed: the operator vouched for the work (Confirm done after no fresh
+  // PR data), so the last known ticket data may close it; otherwise stale means comment only.
+  const queueTicketUpdate = (threadId: string, skipped: boolean, operatorConfirmed = false) =>
     onceQueued(
       (ops) =>
         ops.some(
@@ -656,13 +659,14 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         const summary = doneSummary({
           title: f.title,
           prUrls: f.prs.filter((p) => p.state !== "closed").map(prUrl),
+          closedUrls: f.prs.filter((p) => p.state === "closed").map(prUrl),
           childKeys: f.children.flatMap((c) => c.keys),
           skipped,
         });
         const live = f.rows.filter((r) => r.archivedAt === null);
         for (const l of rec.links) {
           // Unknown or stale ticket data: comment only, never a blind transition.
-          const t = f.stale ? undefined : f.snapshot?.tickets.find((x) => x.key === l.key);
+          const t = f.stale && !operatorConfirmed ? undefined : f.snapshot?.tickets.find((x) => x.key === l.key);
           let ops: NewQueueOp[] = [{ op: "comment", key: l.key, body: summary, threadId: null }];
           if (t) {
             const linkedThreadsDone: boolean[] = [];
@@ -677,9 +681,9 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
 
   /** The final Done: stamp, queue the ticket update, then record the verdict
    *  (a crash before the last write leaves `verifying`, so the resumed check re-queues; onceQueued dedupes). */
-  const finishDone = async (threadId: string, skipped: boolean) => {
+  const finishDone = async (threadId: string, skipped: boolean, operatorConfirmed = false) => {
     await markDone(threadId);
-    await queueTicketUpdate(threadId, skipped);
+    await queueTicketUpdate(threadId, skipped, operatorConfirmed);
     await store.updateThread(threadId, () => ({
       verifying: null,
       reason: null,
@@ -712,11 +716,45 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     // verifyTurn re-reads verifying itself and must stay outside perThread
     // (its waitFor can run this thread's jobs, which would wait on the lock).
     if (m.verdict === "needs-agent") return verifyTurn(threadId);
+    if (m.verdict === "needs-data") return waitForData(threadId, startedAt);
     await perThread(threadId, async () => {
       if (!(await stillChecking(threadId, startedAt, m.verdict === "pass" ? "Done stamp" : "fail"))) return;
       if (m.verdict === "pass") await finishDone(threadId, false);
       else await failCheck(threadId, m.reasons);
     });
+  };
+  // Out-of-date PR data never bounces the card: it stays in Done "checking PRs",
+  // a refresh is requested, and the check re-runs when fresh data lands (ingest)
+  // or at DATA_WAIT_MS; still no data then means Confirm done, still in Done.
+  const dataTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const waitForData = async (threadId: string, startedAt: string) => {
+    const left = DATA_WAIT_MS - (Date.now() - Date.parse(startedAt));
+    await perThread(threadId, async () => {
+      if (!(await stillChecking(threadId, startedAt, "data wait"))) return;
+      if (left > 0) {
+        await store.updateThread(threadId, () => ({ verifying: { startedAt, reasons: [CHECKING_PRS] } }));
+        await bb.storage.kv.set(REFRESH_KEY, Date.now());
+        bb.realtime.publish(JIRA_CHANGED, {});
+        clearTimeout(dataTimers.get(threadId));
+        dataTimers.set(threadId, setTimeout(() => {
+          dataTimers.delete(threadId);
+          void idle.waitFor(threadId, "done-check").catch((e) => bb.log.warn(`jira: Done check re-run on ${threadId} failed: ${(e as Error).message}`));
+        }, left + 1_000));
+      } else {
+        await store.updateThread(threadId, () => ({ verifying: null, reason: null, doneCheck: { at: isoNow(), verdict: "pending-confirm", reasons: [NO_PR_DATA] } }));
+        await setSent(threadId, null);
+      }
+    });
+  };
+  /** After a good ingest: re-run every Done check that was waiting on PR data. */
+  const recheckWaiting = async () => {
+    if (!(await enabled())) return;
+    for (const { id } of await deps.liveLinks()) {
+      if (!(await store.readThread(id)).verifying?.reasons?.includes(CHECKING_PRS)) continue;
+      clearTimeout(dataTimers.get(id));
+      dataTimers.delete(id);
+      await idle.waitFor(id, "done-check");
+    }
   };
   const registered = Promise.all([idle.register("done-check", runCheck), idle.register("verify-turn", verifyTurn)]);
 
@@ -750,7 +788,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     const rec = await store.readThread(threadId);
     if (rec.doneCheck?.verdict === "pass" && (await isDone(threadId))) return { ok: false, error: "already done" };
     if (!skip && rec.doneCheck?.verdict !== "pending-confirm") return { ok: false, error: "nothing to confirm" };
-    await finishDone(threadId, skip);
+    await finishDone(threadId, skip, !skip);
     return { ok: true };
   };
 
@@ -1171,6 +1209,9 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       if (gone.length === 0 || !(await store.readThread(threadId)).links.some((l) => gone.includes(l.key))) return;
       await store.removeLinks(threadId, gone);
     },
-    dispose() {},
+    dispose() {
+      for (const t of dataTimers.values()) clearTimeout(t);
+      dataTimers.clear();
+    },
   };
 }
