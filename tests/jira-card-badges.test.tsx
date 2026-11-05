@@ -64,6 +64,9 @@ describe("JiraCardBadges", () => {
     render(<JiraCardBadges {...props} onUndo={onUndo} pendingOps={[mine("o1"), mine("o2"), { ...mine("o3"), threadId: "t2" }]} record={rec()} />);
     const b = screen.getByRole("button", { name: "Undo Jira changes" });
     expect(b.tagName).toBe("BUTTON");
+    // Inside the chip, right after its "pending" marker.
+    expect(b.closest("[data-jira-chip]")?.getAttribute("data-jira-key")).toBe("PT-1");
+    expect(b.previousElementSibling?.textContent).toBe("pending");
     fireEvent.click(b);
     expect(onUndo).toHaveBeenCalledWith("t1", ["o1", "o2"]);
   });

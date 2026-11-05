@@ -44,7 +44,22 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
   const failed = record?.doneCheck?.verdict === "fail" ? record.doneCheck.reasons : [];
   const checkOpen = record?.verifying != null || record?.doneCheck?.verdict === "fail" || record?.doneCheck?.verdict === "pending-confirm";
   const pendingKeys = new Set(pendingOps.filter((o) => "key" in o).map((o) => (o as { key: string }).key));
-  const ownPending = pendingOps.filter((o) => o.threadId === threadId).map((o) => o.id);
+  const own = pendingOps.filter((o) => o.threadId === threadId);
+  const ownPending = own.map((o) => o.id);
+  // Undo sits on the first chip whose "pending" marker comes from this thread's own ops.
+  const undoKey = links.find((l) => own.some((o) => "key" in o && o.key === l.key))?.key;
+  const undoButton =
+    onUndo && ownPending.length > 0 ? (
+      <button
+        type="button"
+        aria-label="Undo Jira changes"
+        title="Cancel this thread's Jira changes before the next sync sends them"
+        className="underline"
+        onClick={() => onUndo(threadId, ownPending)}
+      >
+        Undo
+      </button>
+    ) : null;
   // A failed reason's ⋯ menu: which reason, and where it opens.
   const [menu, setMenu] = useState<{ index: number; x: number; y: number } | null>(null);
   const menuReason = menu === null ? undefined : failed[menu.index];
@@ -63,20 +78,12 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
             <span>{t ? `${l.key} · ${t.status}` : l.key}</span>
             {stale ? <span className="text-amber-600">stale</span> : null}
             {pendingKeys.has(l.key) ? <span className="italic text-muted-foreground">pending</span> : null}
+            {l.key === undoKey ? undoButton : null}
           </span>
         );
       })}
-      {onUndo && ownPending.length > 0 ? (
-        <button
-          type="button"
-          aria-label="Undo Jira changes"
-          title="Cancel this thread's Jira changes before the next sync sends them"
-          className={cn(chip, "underline")}
-          onClick={() => onUndo(threadId, ownPending)}
-        >
-          Undo
-        </button>
-      ) : null}
+      {/* An own op on no linked key (rare): Undo stands alone. */}
+      {undoKey === undefined && undoButton ? <span className={chip}>{undoButton}</span> : null}
       {links.length === 0 ? (
         <span className={chip} data-jira-chip="" data-tone="neutral">
           <span>No ticket</span>
