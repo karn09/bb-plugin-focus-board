@@ -153,6 +153,11 @@ export function JiraColumn(props: JiraColumnProps) {
       <header className="flex items-center gap-1.5 px-1 pb-1.5">
         <h2 className="text-xs font-semibold">Jira</h2>
         <span className="text-xs text-muted-foreground">{tickets.length}</span>
+        {props.pending.length > 0 ? (
+          <span className="text-[10px] italic text-muted-foreground" data-jira-waiting="" title="Sent to Jira on the next sync pass">
+            {props.pending.length} Jira {props.pending.length === 1 ? "change" : "changes"} waiting
+          </span>
+        ) : null}
         <button
           type="button"
           aria-label="Refresh Jira"

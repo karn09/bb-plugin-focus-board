@@ -34,14 +34,17 @@ export type JiraCardBadgesProps = {
   next?: { next: "done-check" | "open-pr" | "snooze"; prUrl?: string };
   /** The board's own snooze (the "snooze" next step). */
   onSnooze?: (threadId: string) => void;
+  /** Undo: cancel this thread's queued writes before a sync pass sends them (jira_undo). */
+  onUndo?: (threadId: string, opIds: string[]) => void;
 };
 
-export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, pendingOps, onAction, next, onSnooze }: JiraCardBadgesProps) {
+export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, pendingOps, onAction, next, onSnooze, onUndo }: JiraCardBadgesProps) {
   if (!enabled) return null;
   const links = record?.links ?? [];
   const failed = record?.doneCheck?.verdict === "fail" ? record.doneCheck.reasons : [];
   const checkOpen = record?.verifying != null || record?.doneCheck?.verdict === "fail" || record?.doneCheck?.verdict === "pending-confirm";
   const pendingKeys = new Set(pendingOps.filter((o) => "key" in o).map((o) => (o as { key: string }).key));
+  const ownPending = pendingOps.filter((o) => o.threadId === threadId).map((o) => o.id);
   // A failed reason's ⋯ menu: which reason, and where it opens.
   const [menu, setMenu] = useState<{ index: number; x: number; y: number } | null>(null);
   const menuReason = menu === null ? undefined : failed[menu.index];
@@ -63,6 +66,17 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
           </span>
         );
       })}
+      {onUndo && ownPending.length > 0 ? (
+        <button
+          type="button"
+          aria-label="Undo Jira changes"
+          title="Cancel this thread's Jira changes before the next sync sends them"
+          className={cn(chip, "underline")}
+          onClick={() => onUndo(threadId, ownPending)}
+        >
+          Undo
+        </button>
+      ) : null}
       {links.length === 0 ? (
         <span className={chip} data-jira-chip="" data-tone="neutral">
           <span>No ticket</span>

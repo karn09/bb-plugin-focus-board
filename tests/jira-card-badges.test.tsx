@@ -58,6 +58,23 @@ describe("JiraCardBadges", () => {
     render(<JiraCardBadges {...props} pendingOps={[op]} record={rec()} />);
     expect(screen.getByText("pending")).toBeTruthy();
   });
+  it("Undo next to pending for the thread's own queued writes: calls onUndo with the shown op ids; keyboard reachable", () => {
+    const onUndo = vi.fn();
+    const mine = (id: string) => ({ id, createdAt: "", threadId: "t1", op: "comment" as const, key: "PT-1", body: "x" });
+    render(<JiraCardBadges {...props} onUndo={onUndo} pendingOps={[mine("o1"), mine("o2"), { ...mine("o3"), threadId: "t2" }]} record={rec()} />);
+    const b = screen.getByRole("button", { name: "Undo Jira changes" });
+    expect(b.tagName).toBe("BUTTON");
+    fireEvent.click(b);
+    expect(onUndo).toHaveBeenCalledWith("t1", ["o1", "o2"]);
+  });
+  it("no Undo without the thread's own pending ops (another thread's or an unowned fix), nor with Jira off", () => {
+    const op = { id: "o", createdAt: "", threadId: null, op: "comment" as const, key: "PT-1", body: "x" };
+    const { rerender } = render(<JiraCardBadges {...props} onUndo={vi.fn()} pendingOps={[op, { ...op, id: "p", threadId: "t2" }]} record={rec()} />);
+    expect(screen.getByText("pending")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Undo Jira changes" })).toBeNull();
+    rerender(<JiraCardBadges {...props} enabled={false} onUndo={vi.fn()} pendingOps={[{ ...op, threadId: "t1" }]} record={rec()} />);
+    expect(screen.queryByRole("button", { name: "Undo Jira changes" })).toBeNull();
+  });
   it("no stale marker when fresh; no pending marker for another key", () => {
     const op = { id: "o", createdAt: "", threadId: null, op: "comment" as const, key: "PT-2", body: "x" };
     render(<JiraCardBadges {...props} pendingOps={[op]} record={rec()} />);

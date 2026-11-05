@@ -14,6 +14,7 @@ let wanted: SyncWanted;
 let acked: OpResult[][];
 let ingested: unknown[];
 let ackFails: boolean;
+let claim: (id: string) => boolean;
 
 // Real acli: `workitem search --fields` only accepts a fixed set (parent, updated, subtasks... are refused).
 const SEARCH_OK = new Set(["key", "summary", "status", "assignee", "issuetype", "description", "priority", "labels"]);
@@ -36,6 +37,7 @@ const core = () =>
     run,
     wanted: async () => wanted,
     pendingOps: async () => ops,
+    claim: async (id) => claim(id),
     ack: async (r) => {
       seq.push(`ack ${r.map((x) => x.id).join(",")}`);
       if (ackFails) throw new Error("ack down");
@@ -70,6 +72,7 @@ beforeEach(() => {
   acked = [];
   ingested = [];
   ackFails = false;
+  claim = (id) => ops.some((o) => o.id === id);
 });
 
 describe("toTicket", () => {
@@ -204,6 +207,7 @@ describe("sync pass", () => {
       },
       wanted: async () => wanted,
       pendingOps: async () => [],
+      claim: async () => true,
       ack: async () => {},
       ingest: async (s) => void ingested.push(s),
     }).pass();
@@ -376,6 +380,17 @@ describe("sync pass", () => {
     expect(lines[1]).toBe("ack o1");
     expect(lines[2]).toContain("ENG-2");
     expect(lines[3]).toBe("ack o2");
+  });
+
+  it("an op cancelled after the pass read the queue is not applied and not acked", async () => {
+    ops = [op({ id: "o1", op: "assign", key: "ENG-1", to: "me" }), op({ id: "o2", op: "assign", key: "ENG-2", to: "none" })];
+    // The undo lands while o1 is applying: o2 is gone from the store before its turn.
+    claim = (id) => {
+      if (id === "o1") ops = ops.filter((o) => o.id !== "o2");
+      return ops.some((o) => o.id === id);
+    };
+    await pass();
+    expect(seq.filter((l) => /workitem assign|^ack/.test(l))).toEqual([expect.stringContaining("ENG-1"), "ack o1"]);
   });
 
   it("replay after a failed ack does not duplicate comment, create, or transition", async () => {

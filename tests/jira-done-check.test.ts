@@ -632,6 +632,69 @@ describe("Done check flow", () => {
     expect(harness.inspection.realtimeSignals).not.toContainEqual({ channel: "done-changed", payload: { threadId: "t1", done: false } });
   });
 
+  // ---- Undo (jira_undo): queued writes cancelled before a sync pass sends them ----
+  const undo = (threadId = "t1", opIds?: string[]) =>
+    harness.behavior.callRpc("jira_undo", { threadId, ...(opIds ? { opIds } : {}) }) as Promise<{ ok: boolean; cancelled: number; tooLate: number; error?: string }>;
+  const passedDone = async () => {
+    seed("t1");
+    await load({ snapshot: snap({ prs: [pr(1, "merged")] }) });
+    await doneSet("t1");
+    expect(jiraOf("t1")?.doneCheck).toMatchObject({ verdict: "pass" });
+    expect((await ops()).length).toBe(2);
+  };
+
+  it("undo after a passed Done check: both ticket ops cancelled, Done un-stamped, doneCheck cleared", async () => {
+    await passedDone();
+    expect(await undo()).toEqual({ ok: true, cancelled: 2, tooLate: 0 });
+    expect(await ops()).toEqual([]);
+    expect(doneOf("t1")).toBeUndefined();
+    expect(jiraOf("t1")?.doneCheck).toBeNull();
+    expect(harness.inspection.realtimeSignals).toContainEqual({ channel: "done-changed", payload: { threadId: "t1", done: false } });
+  });
+
+  it("undo too late: the ops were already sent (acked), nothing changes", async () => {
+    await passedDone();
+    const ids = ((await bb.storage.kv.get("jira:queue")) as { id: string }[]).map((o) => o.id);
+    await bb.storage.kv.set("jira:queue", []); // a sync pass sent and acked them
+    expect(await undo("t1", ids)).toEqual({ ok: true, cancelled: 0, tooLate: 2 });
+    expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
+    expect(jiraOf("t1")?.doneCheck).toMatchObject({ verdict: "pass" });
+  });
+
+  it("undo while a pass is sending the first op: the rest is cancelled, Done stays", async () => {
+    await passedDone();
+    await harness.behavior.callRpc("jira_refresh", null); // the pass hangs inside the comment's acli call
+    for (let i = 0; i < 10; i++) await flush(); // fake host calls settle at once: the pass reaches its first acli call
+    expect(await undo()).toEqual({ ok: true, cancelled: 1, tooLate: 1 });
+    expect((await ops()).map((o) => o.op)).toEqual(["comment"]);
+    expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
+    expect(jiraOf("t1")?.doneCheck).toMatchObject({ verdict: "pass" });
+  });
+
+  it("undo of a non-Done op leaves the Done state alone; other threads' ops stay", async () => {
+    seed("t1");
+    seed("t2");
+    await load();
+    await bb.storage.kv.set("jira:queue", [
+      { id: "a", createdAt: "2026-10-01T00:00:00Z", threadId: "t1", op: "transition", key: "PT-1", toCategory: "indeterminate" },
+      { id: "b", createdAt: "2026-10-01T00:00:00Z", threadId: "t2", op: "comment", key: "PT-1", body: "x" },
+    ]);
+    expect(await undo("t1", ["b"])).toEqual({ ok: true, cancelled: 1, tooLate: 0 });
+    expect(((await bb.storage.kv.get("jira:queue")) as { id: string }[]).map((o) => o.id)).toEqual(["b"]);
+    expect(harness.inspection.realtimeSignals).not.toContainEqual({ channel: "done-changed", payload: { threadId: "t1", done: false } });
+  });
+
+  it("undo is refused with Jira off or for an unknown thread", async () => {
+    seed("t1");
+    await load({ enabled: false });
+    expect(await undo()).toMatchObject({ ok: false, cancelled: 0, tooLate: 0 });
+    await harness.lifecycle.dispose();
+    reset();
+    seed("t1");
+    await load();
+    expect(await undo("nope")).toMatchObject({ ok: false, error: "unknown thread" });
+  });
+
   it("a marker write before the stored markers load keeps the other threads' markers", async () => {
     seed("t1", { verifying: { startedAt: "s1" } });
     seed("t2", { doneCheck: { at: "x", verdict: "pending-confirm", reasons: [] } });

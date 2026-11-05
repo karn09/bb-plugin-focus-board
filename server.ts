@@ -4028,6 +4028,10 @@ export default async function plugin(bb: BbPluginApi) {
       await writeDoneRecord(threadId, true);
       bb.realtime.publish(DONE_CHANGED, { threadId, done: true });
     },
+    unmarkDone: async (threadId) => {
+      await writeDoneRecord(threadId, false);
+      bb.realtime.publish(DONE_CHANGED, { threadId, done: false });
+    },
     notDone: (threadId) => bb.realtime.publish(DONE_CHANGED, { threadId, done: false }),
     reminderThreads: async () => {
       const rows = (await bb.sdk.threads.list({})).filter((row) => row.archivedAt === null);

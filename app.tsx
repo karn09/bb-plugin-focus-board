@@ -582,6 +582,9 @@ function BoardPage({ subPath }: { subPath: string }) {
       onAction: (kind, threadId, index, reason) => {
         jiraRpc.call("jira_card_action", { kind, threadId, ...(index === undefined ? {} : { index, reason }) }).then(refetchJira, () => {});
       },
+      onUndo: (threadId, opIds) => {
+        jiraRpc.call("jira_undo", { threadId, opIds }).then(refetchJira, () => {});
+      },
     }),
     [jiraState, jiraRpc, refetchJira],
   );

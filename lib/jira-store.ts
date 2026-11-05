@@ -60,6 +60,8 @@ export function createJiraStore(
   };
 
   const log = opts?.log ?? (() => {});
+  // Ops a sync pass has started applying (claim) and not acked yet: too late to cancel.
+  const inFlight = new Set<string>();
   // Fired after every write (ingest, enqueue, ack, thread record) so the board refreshes.
   const changed = () => {
     try {
@@ -190,6 +192,7 @@ export function createJiraStore(
         const hits = [...new Map(results.filter((r) => known.has(r.id)).map((r) => [r.id, r])).values()];
         if (hits.length === 0) return;
         const done = new Set(hits.map((r) => r.id));
+        for (const id of done) inFlight.delete(id);
         // Results first: a crash between the writes leaves the op queued AND recorded.
         await kv.set(RESULTS_KEY, [...(await readResults()), ...hits].slice(-MAX_RESULTS));
         const raw = await rawQueue();
@@ -201,6 +204,35 @@ export function createJiraStore(
           }),
         );
         changed();
+      });
+    },
+
+    /** The sync pass is about to apply this op: false when it is gone (cancelled), else it is marked in flight. */
+    claim(opId: string): Promise<boolean> {
+      return locked(async () => {
+        if (!(await readQueue()).some((o) => o.id === opId)) return false;
+        inFlight.add(opId);
+        return true;
+      });
+    },
+
+    /** Drop ops not yet sent (the card's Undo). Acked, unknown or in-flight ids are tooLate. */
+    cancel(opIds: string[]): Promise<{ cancelled: string[]; tooLate: string[] }> {
+      return locked(async () => {
+        const queued = new Set((await readQueue()).map((o) => o.id));
+        const cancelled = opIds.filter((id) => queued.has(id) && !inFlight.has(id));
+        const tooLate = opIds.filter((id) => !cancelled.includes(id));
+        if (cancelled.length === 0) return { cancelled, tooLate };
+        const gone = new Set(cancelled);
+        await kv.set(
+          QUEUE_KEY,
+          (await rawQueue()).filter((x) => {
+            const p = QueueOp.safeParse(x);
+            return !(p.success && gone.has(p.data.id));
+          }),
+        );
+        changed();
+        return { cancelled, tooLate };
       });
     },
 

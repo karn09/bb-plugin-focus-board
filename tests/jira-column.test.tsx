@@ -54,6 +54,16 @@ describe("JiraColumn", () => {
     expect(b.textContent).toContain("Refreshing");
   });
 
+  it("the header counts queued Jira writes waiting for the next sync, only when there are some", () => {
+    const op = (id: string) => ({ id, createdAt: "", threadId: null, op: "comment" as const, key: "PT-1", body: "x" });
+    const { rerender } = render(<JiraColumn {...base()} />);
+    expect(screen.queryByText(/Jira changes? waiting/)).toBeNull();
+    rerender(<JiraColumn {...base()} pending={[op("a")]} />);
+    expect(screen.getByText("1 Jira change waiting")).toBeTruthy();
+    rerender(<JiraColumn {...base()} pending={[op("a"), op("b")]} />);
+    expect(screen.getByText("2 Jira changes waiting")).toBeTruthy();
+  });
+
   it("a request older than 3 minutes no longer blocks the button", () => {
     render(<JiraColumn {...base()} refreshRequestedAt={NOW - 4 * 60_000} />);
     expect((screen.getByRole("button", { name: "Refresh Jira" }) as HTMLButtonElement).disabled).toBe(false);

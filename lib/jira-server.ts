@@ -50,6 +50,8 @@ export type JiraDeps = {
   isDone?: (threadId: string) => Promise<boolean>;
   /** Stamp Done the upstream way (server.ts writeDoneRecord + done-changed). */
   markDone?: (threadId: string) => Promise<void>;
+  /** Clear the Done stamp the way done_set(false) does (write + done-changed): an undone Done check. */
+  unmarkDone?: (threadId: string) => Promise<void>;
   /** Publish done-changed { done: false }: a check ended without a stamp, so boards drop their optimistic Done. */
   notDone?: (threadId: string) => void;
   /** Live threads for the reminder pass: status, last activity (epoch ms), Done, snooze wake (epoch ms, null when not snoozed). */
@@ -117,6 +119,11 @@ export const jiraRpcContract = defineRpcContract({
       syncEnabled: z.boolean(),
     }),
   },
+  /** A card's Undo: cancel the thread's queued writes not sent yet (opIds: the ones the card showed, so already-sent ones count as tooLate). */
+  jira_undo: {
+    input: z.object({ threadId: z.string(), opIds: z.array(z.string()).optional() }),
+    output: z.object({ ok: z.boolean(), cancelled: z.number().int(), tooLate: z.number().int(), error: z.string().optional() }),
+  },
   /** Column Refresh: record the request and start a full pass now. */
   jira_refresh: { input: z.null(), output: z.object({ ok: z.boolean(), error: z.string().optional() }) },
   /** A card button press; kinds whose behavior lands later answer "not yet". */
@@ -149,6 +156,9 @@ export const jiraRpcContract = defineRpcContract({
     output: z.object({ ok: z.boolean(), error: z.string().optional(), alreadyQueued: z.literal(true).optional() }),
   },
 });
+
+/** A Done check's ticket write: the Done-summary comment or the transition to done. */
+const isDoneOp = (o: QueueOp) => (o.op === "comment" && o.body.startsWith(DONE_SUMMARY_PREFIX)) || (o.op === "transition" && o.toCategory === "done");
 
 const fail = (msg: string) => ({ exitCode: 1, stderr: `${msg}\n` });
 const out = (v: unknown) => ({ exitCode: 0, stdout: JSON.stringify(v, null, 2) + "\n" });
@@ -337,6 +347,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       return forceFull ? { ...w, fullSync: true } : w;
     },
     pendingOps: () => store.pendingOps(),
+    claim: (id) => store.claim(id),
     ack: async (results) => {
       if (disposed) return;
       for (const r of results) if (!r.ok) passErrors.push(`op ${r.id}: ${r.error}`);
@@ -575,7 +586,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   // keeps the per-thread Done dedupe matching it.
   const fixAllDone = (key: string): Promise<ColumnResult> =>
     onceQueued(
-      (ops) => ops.some((o) => "key" in o && o.key === key && ((o.op === "comment" && o.body.startsWith(DONE_SUMMARY_PREFIX)) || (o.op === "transition" && o.toCategory === "done"))),
+      (ops) => ops.some((o) => "key" in o && o.key === key && isDoneOp(o)),
       async () => {
         const { plan, links, threads, prs, snapshot } = await planWithInputs();
         const t = snapshot?.tickets.find((x) => x.key === key);
@@ -743,10 +754,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   // PR data), so the last known ticket data may close it; otherwise stale means comment only.
   const queueTicketUpdate = (threadId: string, skipped: boolean, operatorConfirmed = false) =>
     onceQueued(
-      (ops) =>
-        ops.some(
-          (o) => o.threadId === threadId && ((o.op === "comment" && o.body.startsWith(DONE_SUMMARY_PREFIX)) || (o.op === "transition" && o.toCategory === "done")),
-        ),
+      (ops) => ops.some((o) => o.threadId === threadId && isDoneOp(o)),
       async () => {
         const rec = await store.readThread(threadId);
         if (rec.links.length === 0) return { ok: true };
@@ -1224,6 +1232,26 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         syncRanAt: await num(SYNC_RAN_KEY),
         syncEnabled: s.sync,
       };
+    },
+    jira_undo: async ({ threadId, opIds }) => {
+      const none = { cancelled: 0, tooLate: 0 };
+      if (!(await enabled())) return { ok: false, error: OFF, ...none };
+      if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread", ...none };
+      return perThread(threadId, async () => {
+        const pending = await store.pendingOps();
+        const mine = pending.filter((o) => o.threadId === threadId);
+        const foreign = new Set(pending.filter((o) => o.threadId !== threadId).map((o) => o.id));
+        const ids = [...new Set([...mine.map((o) => o.id), ...(opIds ?? [])])].filter((id) => !foreign.has(id));
+        if (ids.length === 0) return { ok: true, ...none };
+        const { cancelled, tooLate } = await store.cancel(ids);
+        // Every Done write of a passed check cancelled: the Done itself is undone, the card returns to its lane.
+        const undoneDone = tooLate.length === 0 && mine.some((o) => cancelled.includes(o.id) && isDoneOp(o));
+        if (undoneDone && (await store.readThread(threadId)).doneCheck?.verdict === "pass") {
+          await deps.unmarkDone?.(threadId);
+          await store.writeThread(threadId, { doneCheck: null });
+        }
+        return { ok: true, cancelled: cancelled.length, tooLate: tooLate.length };
+      });
     },
     jira_refresh: async () => {
       if (!(await enabled())) return { ok: false, error: OFF };

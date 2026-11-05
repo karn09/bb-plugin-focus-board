@@ -21,6 +21,8 @@ export type SyncDeps = {
   run: ToolRunner;
   wanted: () => Promise<SyncWanted>;
   pendingOps: () => Promise<QueueOp[]>;
+  /** Re-checked right before each apply: false means the op was cancelled since the read (skip, no ack). */
+  claim: (opId: string) => Promise<boolean>;
   ack: (results: OpResult[]) => Promise<void>;
   ingest: (snapshot: SyncSnapshot) => Promise<void>;
 };
@@ -186,6 +188,7 @@ export function createSyncCore(deps: SyncDeps) {
   /** Apply then ack each op in order: a crash leaves at most one applied-but-unacked op, replay-safe above. */
   async function drain() {
     for (const op of await deps.pendingOps()) {
+      if (!(await deps.claim(op.id))) continue;
       let r: OpResult;
       try {
         r = { id: op.id, ok: true, error: null, createdKey: await applyOp(op) };

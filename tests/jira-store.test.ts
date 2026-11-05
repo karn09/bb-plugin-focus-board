@@ -130,6 +130,29 @@ describe("queue", () => {
   });
 });
 
+describe("cancel", () => {
+  const res = (id: string) => ({ id, ok: true, error: null, createdKey: null });
+  it("removes still-pending ops; acked or unknown ids are tooLate", async () => {
+    const { store } = setup();
+    const a = await store.enqueue(comment("PT-1"));
+    const b = await store.enqueue(comment("PT-2"));
+    const c = await store.enqueue(comment("PT-3"));
+    await store.ack([res(b.id)]);
+    expect(await store.cancel([a.id, b.id, "nope"])).toEqual({ cancelled: [a.id], tooLate: [b.id, "nope"] });
+    expect((await store.pendingOps()).map((o) => o.id)).toEqual([c.id]);
+  });
+  it("a claimed (in-flight) op is tooLate; claim of a cancelled op is false", async () => {
+    const { store } = setup();
+    const a = await store.enqueue(comment("PT-1"));
+    const b = await store.enqueue(comment("PT-2"));
+    expect(await store.claim(a.id)).toBe(true);
+    expect(await store.cancel([a.id, b.id])).toEqual({ cancelled: [b.id], tooLate: [a.id] });
+    expect(await store.claim(b.id)).toBe(false);
+    await store.ack([res(a.id)]);
+    expect(await store.pendingOps()).toEqual([]);
+  });
+});
+
 describe("ack hardening", () => {
   const res = (id: string) => ({ id, ok: true, error: null, createdKey: null });
   it("duplicate id in a batch records one result", async () => {
