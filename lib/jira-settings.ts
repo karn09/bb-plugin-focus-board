@@ -3,6 +3,8 @@
 // back to defaults.
 export type JiraSettings = {
   enabled: boolean;
+  /** Run the built-in acli/gh sync (only while enabled). Off: nothing runs on its own. */
+  sync: boolean;
   projects: string[];
   defaultProject: string;
   nudgeDays: number;
@@ -27,6 +29,7 @@ export function jiraSettings(raw: Record<string, unknown>): JiraSettings {
   const nudgeDays = num(raw, "nudgeDays", 2);
   return {
     enabled: pick("enabled") === true,
+    sync: pick("sync") !== false,
     projects: list.length > 0 ? list : ["PT", "SRE"],
     defaultProject: typeof d === "string" && /^[A-Z][A-Z0-9]+$/.test(d.trim().toUpperCase()) ? d.trim().toUpperCase() : "SRE",
     nudgeDays,

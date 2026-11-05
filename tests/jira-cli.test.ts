@@ -157,12 +157,8 @@ describe("bb focus-board jira CLI", () => {
     expect(bad.exitCode).toBe(1);
   });
 
-  it("setup prints the automation command", async () => {
+  it("setup is gone: no automation to create", async () => {
     await load();
-    const r = await harness.behavior.runCli(["jira", "setup"]);
-    // Every minute: idle passes only drain the queue; a full sync runs when due or on Refresh.
-    expect(r.stdout).toContain('--cron "* * * * *"');
-    expect(r.stdout).toContain("jira-sync.mjs");
-    expect(r.stdout).toContain("--project proj_personal");
+    expect((await harness.behavior.runCli(["jira", "setup"])).exitCode).not.toBe(0);
   });
 });

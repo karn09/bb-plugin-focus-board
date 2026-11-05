@@ -804,8 +804,14 @@ export default async function plugin(bb: BbPluginApi) {
     jiraEnabled: {
       type: "boolean",
       label: "Jira: enable integration",
-      description: "Link threads to Jira tickets and keep them in sync. Needs the companion script and an acli login.",
+      description: "Link threads to Jira tickets and keep them in sync. Needs acli and gh signed in.",
       default: false,
+    },
+    jiraSync: {
+      type: "boolean",
+      label: "Jira: sync automatically (runs acli and gh)",
+      description: "Every minute, send queued Jira writes and refresh tickets and PRs. Off: run `bb focus-board jira sync` by hand. Only while Jira is enabled.",
+      default: true,
     },
     jiraProjects: {
       type: "string",

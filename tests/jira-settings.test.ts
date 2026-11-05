@@ -4,9 +4,14 @@ import { jiraSettings } from "../lib/jira-settings";
 describe("jiraSettings", () => {
   it("defaults", () => {
     expect(jiraSettings({})).toEqual({
-      enabled: false, projects: ["PT", "SRE"], defaultProject: "SRE", nudgeDays: 2,
+      enabled: false, sync: true, projects: ["PT", "SRE"], defaultProject: "SRE", nudgeDays: 2,
       deepCheckDays: 5, staleTicketDays: 30, nudgeTurnsPerPass: 3, refreshMinutes: 2,
     });
+  });
+  it("sync is on unless explicitly turned off", () => {
+    expect(jiraSettings({ jiraSync: false }).sync).toBe(false);
+    expect(jiraSettings({ sync: false }).sync).toBe(false);
+    expect(jiraSettings({ jiraSync: "no" }).sync).toBe(true);
   });
   it("clamps deepCheckDays above nudgeDays", () => {
     expect(jiraSettings({ nudgeDays: 4, deepCheckDays: 3 }).deepCheckDays).toBe(5);

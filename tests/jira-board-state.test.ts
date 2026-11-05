@@ -134,11 +134,17 @@ describe("jira_board_state / jira_card_action", () => {
       expect((await wanted()).fullSync).toBe(true);
     });
 
-    it("the board learns when the sync script last checked in", async () => {
+    it("the board learns when sync last ran (a pass starts) and whether sync is on", async () => {
       await load({ jiraEnabled: true });
-      expect((await state()).scriptSeenAt).toBeNull();
-      await wanted();
-      expect((await state()).scriptSeenAt).toEqual(expect.any(Number));
+      expect((await state()).syncRanAt).toBeNull();
+      expect((await state()).syncEnabled).toBe(true);
+      await wanted(); // the debug read is not a pass
+      expect((await state()).syncRanAt).toBeNull();
+      await harness.behavior.callRpc("jira_refresh", null); // kicks a pass (the test runner never answers)
+      await new Promise((r) => setTimeout(r, 5));
+      expect((await state()).syncRanAt).toEqual(expect.any(Number));
+      await harness.behavior.setSettings({ jiraSync: false });
+      expect((await state()).syncEnabled).toBe(false);
     });
   });
 });

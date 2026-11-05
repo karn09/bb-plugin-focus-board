@@ -29,7 +29,8 @@ const base = () => ({
   onOpenThread: vi.fn(),
   pending: [] as QueueOp[],
   refreshRequestedAt: null as number | null,
-  scriptSeenAt: NOW - 30_000 as number | null,
+  syncRanAt: NOW - 30_000 as number | null,
+  syncEnabled: true,
   onRefresh: vi.fn(),
   allThreads: [
     { id: "a", title: "PT-3878 A: plan the cutover" },
@@ -58,13 +59,19 @@ describe("JiraColumn", () => {
     expect((screen.getByRole("button", { name: "Refresh Jira" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it("says so when the sync automation has not checked in for 3 minutes", () => {
-    const { rerender } = render(<JiraColumn {...base()} scriptSeenAt={null} />);
-    expect(screen.getByText("Sync automation isn't running: set it up with `bb focus-board jira setup`")).toBeTruthy();
-    rerender(<JiraColumn {...base()} scriptSeenAt={NOW - 4 * 60_000} />);
-    expect(screen.getByText(/Sync automation isn't running/)).toBeTruthy();
+  it("says so when sync has not run for 3 minutes", () => {
+    const { rerender } = render(<JiraColumn {...base()} syncRanAt={null} />);
+    expect(screen.getByText("Jira sync hasn't run: check `bb focus-board jira status`")).toBeTruthy();
+    rerender(<JiraColumn {...base()} syncRanAt={NOW - 4 * 60_000} />);
+    expect(screen.getByText(/Jira sync hasn't run/)).toBeTruthy();
     rerender(<JiraColumn {...base()} />);
-    expect(screen.queryByText(/Sync automation isn't running/)).toBeNull();
+    expect(screen.queryByText(/Jira sync hasn't run/)).toBeNull();
+  });
+
+  it("says how to turn sync on when the setting is off, ahead of any stale-data line", () => {
+    render(<JiraColumn {...base()} syncEnabled={false} syncRanAt={null} stale snapshotAgeMs={30 * 60_000} />);
+    expect(screen.getByText('Jira sync is off: turn on "Jira: sync automatically" in Focus Board settings')).toBeTruthy();
+    expect(screen.queryByText(/hasn't run|min old/)).toBeNull();
   });
 
   it("Link to thread: search the board's threads, pick one, and it links (already-linked threads are left out)", () => {
@@ -88,9 +95,9 @@ describe("JiraColumn", () => {
     expect(screen.getByText("Jira not connected: run `acli jira auth login --web`")).toBeTruthy();
   });
 
-  it("no data yet (no snapshot, no error) points at the sync script, not the login", () => {
+  it("no data yet (no snapshot, no error) points at `jira sync`, not the login", () => {
     render(<JiraColumn {...base()} snapshotAgeMs={null} error={null} />);
-    expect(screen.getByText("No Jira data yet: set up the sync script with `bb focus-board jira setup`")).toBeTruthy();
+    expect(screen.getByText("No Jira data yet: run `bb focus-board jira sync`")).toBeTruthy();
     expect(screen.queryByText(/Jira not connected/)).toBeNull();
   });
 

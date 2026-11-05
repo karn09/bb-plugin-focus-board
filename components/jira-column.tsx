@@ -14,7 +14,7 @@ import { readStoredText, writeStored } from "./preferences";
 export const JIRA_COLUMN_COLLAPSED_KEY = "focus-board:jiraColumnCollapsed";
 export const JIRA_HIDE_LINKED_KEY = "focus-board:jiraHideLinked";
 const NOT_CONNECTED = "Jira not connected: run `acli jira auth login --web`";
-const NO_DATA = "No Jira data yet: set up the sync script with `bb focus-board jira setup`";
+const NO_DATA = "No Jira data yet: run `bb focus-board jira sync`";
 
 type ThreadRef = { id: string; title: string };
 
@@ -39,18 +39,21 @@ export type JiraColumnData = {
   pending: readonly QueueOp[];
   /** An unanswered Refresh request (epoch ms), else null. */
   refreshRequestedAt: number | null;
-  /** When the sync script last checked in (epoch ms), else null. */
-  scriptSeenAt: number | null;
+  /** When a sync pass last started (epoch ms), else null. */
+  syncRanAt: number | null;
+  /** The jiraSync setting: off means nothing syncs on its own. */
+  syncEnabled: boolean;
   onRefresh: () => void;
   /** The board's live threads, for "Link to thread…". */
   allThreads: readonly ThreadRef[];
-  /** Clock for the Refresh/automation timeouts (tests). */
+  /** Clock for the Refresh/sync timeouts (tests). */
   now?: number;
 };
 
-/** A Refresh or a script check-in older than this counts as lapsed. */
+/** A Refresh or a sync pass older than this counts as lapsed. */
 const LAPSE_MS = 3 * 60_000;
-const NOT_RUNNING = "Sync automation isn't running: set it up with `bb focus-board jira setup`";
+const SYNC_OFF = 'Jira sync is off: turn on "Jira: sync automatically" in Focus Board settings';
+const NOT_RUNNING = "Jira sync hasn't run: check `bb focus-board jira status`";
 
 /**
  * Linked threads per key: thread-record links plus the reconcile plan's
@@ -85,7 +88,7 @@ const FIX_LABEL: Record<DriftItem["kind"], string> = {
 };
 
 function statusLine({ error, stale, snapshotAgeMs }: Pick<JiraColumnProps, "error" | "stale" | "snapshotAgeMs">): string | null {
-  // An ok snapshot with some gh reads failed (scripts/jira-sync.mjs): Jira itself is connected.
+  // An ok snapshot with some gh reads failed (lib/jira-sync-core.ts): Jira itself is connected.
   if (error !== null && /^gh: \d+ of \d+ /.test(error)) return error;
   if (error !== null && /unauthori[sz]ed|not authenticated|auth login|\b401\b/i.test(error)) return NOT_CONNECTED;
   if (error === null && snapshotAgeMs === null) return NO_DATA;
@@ -103,8 +106,9 @@ export function JiraColumn(props: JiraColumnProps) {
   const [query, setQuery] = useState("");
   const now = props.now ?? Date.now();
   const refreshing = props.refreshRequestedAt !== null && now - props.refreshRequestedAt < LAPSE_MS;
-  const scriptLapsed = props.scriptSeenAt === null || now - props.scriptSeenAt > LAPSE_MS;
-  const status = statusLine(props) ?? (scriptLapsed ? NOT_RUNNING : null);
+  const syncLapsed = props.syncRanAt === null || now - props.syncRanAt > LAPSE_MS;
+  // Sync off is the cause of any stale or missing data, so it goes first.
+  const status = !props.syncEnabled ? SYNC_OFF : (statusLine(props) ?? (syncLapsed ? NOT_RUNNING : null));
 
   if (collapsed) {
     return (
@@ -126,7 +130,7 @@ export function JiraColumn(props: JiraColumnProps) {
         <button
           type="button"
           aria-label="Refresh Jira"
-          title={refreshing ? "Waiting for the sync script" : "Fetch tickets now"}
+          title={refreshing ? "Syncing with Jira and GitHub" : "Fetch tickets now"}
           className={cn(btn, "ml-auto inline-flex items-center gap-1")}
           disabled={refreshing}
           onClick={props.onRefresh}

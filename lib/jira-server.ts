@@ -1,6 +1,7 @@
-// Jira integration wiring. This part: the `bb focus-board jira …` CLI bridge
-// the companion script (scripts/jira-sync.mjs) talks to. The commands work
-// whether or not jiraEnabled is set, and change no board behavior.
+// Jira integration wiring. This part: the built-in sync (lib/jira-sync-core.ts
+// run through lib/jira-exec.ts: the "jira-sync" schedule, `jira sync`) and the
+// `bb focus-board jira …` debug/compat CLI (status, queue, ack, ingest,
+// wanted). The debug commands work whether or not jiraEnabled is set.
 // Also: reconciliation (`jira reconcile`, the jira_reconcile_* RPCs, and the
 // one-time run when jiraEnabled flips on). And the Jira column's writes
 // (jira_column_action): Link / dismiss a suggestion, drift fixes, Start thread.
@@ -22,18 +23,19 @@ import { capReasons, CHECKING_PRS, DATA_WAIT_MS, DONE_SUMMARY_PREFIX, doneSummar
 import { deepCheckFindings, NUDGE_TEXT, planReminders, replyLine, type DeepNext, type ReminderThread } from "./jira-reminders";
 import { applyReconcile, externalJiraKey, planReconcile, StoredReconcilePlan, threadPrsOf, type ReconThread } from "./jira-reconcile";
 import { DriftItem, JiraTicket, OpResult, QueueOp, ThreadJiraRecord } from "./jira-schema";
-import { jiraSettings } from "./jira-settings";
+import { runTool } from "./jira-exec";
+import { jiraSettings, type JiraSettings } from "./jira-settings";
 import { createJiraStore, type JiraStore, type NewQueueOp } from "./jira-store";
+import { createSyncCore, type SyncWanted, type ToolRunner } from "./jira-sync-core";
 import { makeExternalLink, type ThreadLink } from "./link-metadata";
-import { BB_PERSONAL_PROJECT_ID } from "./new-thread-seed";
 
 export type JiraDeps = {
   /** Raw plugin settings values (jira* keys). */
   settings: () => Promise<Record<string, unknown>>;
   /** Linked items of every non-archived thread (server.ts's existing link reader). */
   liveLinks: () => Promise<{ id: string; links: ThreadLink[] }[]>;
-  /** Plugin source directory, when the host can say; else a placeholder is printed. */
-  repoDir?: string;
+  /** Runs acli/gh for the sync (tests inject a fake); default lib/jira-exec runTool. */
+  run?: ToolRunner;
   /** Live threads as reconcile input (title, branch, status, Done). */
   reconThreads: () => Promise<ReconThread[]>;
   /** One thread's board links (server.ts readLinkedIssues). */
@@ -69,8 +71,10 @@ const SNOOZE_SEEN_KEY = "jira:snooze-seen";
 const NEXT_STEPS_KEY = "jira:next-steps";
 /** Column Refresh: when the operator last asked; pending until a newer snapshot lands. */
 const REFRESH_KEY = "jira:refresh-requested-at";
-/** When the sync script last called `jira wanted` (is the automation running?). */
-const SCRIPT_SEEN_KEY = "jira:script-seen-at";
+/** When a sync pass last started (is sync running?). The key predates the built-in sync. */
+const SYNC_RAN_KEY = "jira:script-seen-at";
+/** A pass soon after load and after the sync turns on, so data is fresh without waiting a minute. */
+const SYNC_SOON_MS = 2_000;
 export const JIRA_RECONCILE_CHANGED = "jira-reconcile-changed";
 export const JIRA_CHANGED = "jira-changed";
 
@@ -105,10 +109,13 @@ export const jiraRpcContract = defineRpcContract({
       next: z.record(z.string(), NextStep),
       /** A Refresh request no snapshot has answered yet (epoch ms), else null. */
       refreshRequestedAt: z.number().nullable(),
-      scriptSeenAt: z.number().nullable(),
+      /** When a sync pass last started (epoch ms), else null. */
+      syncRanAt: z.number().nullable(),
+      /** The jiraSync setting: false means nothing syncs on its own. */
+      syncEnabled: z.boolean(),
     }),
   },
-  /** Column Refresh: ask the sync script for a full pass on its next (per-minute) run. */
+  /** Column Refresh: record the request and start a full pass now. */
   jira_refresh: { input: z.null(), output: z.object({ ok: z.boolean(), error: z.string().optional() }) },
   /** A card button press; kinds whose behavior lands later answer "not yet". */
   jira_card_action: {
@@ -141,12 +148,11 @@ export const jiraRpcContract = defineRpcContract({
   },
 });
 
-const PLACEHOLDER_REPO = "<path-to-bb-plugin-focus-board>";
 const fail = (msg: string) => ({ exitCode: 1, stderr: `${msg}\n` });
 const out = (v: unknown) => ({ exitCode: 0, stdout: JSON.stringify(v, null, 2) + "\n" });
 
 // ponytail: `-` (stdin) is not offered: plugin CLI handlers get no stdin from
-// the bb CLI (only a one-line 16 KiB `stdin: true` option). The script passes a file.
+// the bb CLI (only a one-line 16 KiB `stdin: true` option). Pass a file.
 function readJsonFile(path: string): unknown {
   if (path === "-") throw new Error("stdin is not supported by plugin CLI commands; pass a file path");
   return JSON.parse(readFileSync(path, "utf8"));
@@ -171,10 +177,15 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   // and on every change (off until the first read lands).
   let cfg = jiraSettings({});
   let cfgSeq = 0; // reads can resolve out of order: only the latest one lands
+  let syncOn = false; // jiraEnabled && jiraSync as last read: a false→true flip (or load) runs a pass soon
   const refreshCfg = () => {
     const seq = ++cfgSeq;
     return deps.settings().then((v) => {
-      if (seq === cfgSeq) cfg = jiraSettings(v);
+      if (seq !== cfgSeq) return;
+      cfg = jiraSettings(v);
+      const on = cfg.enabled && cfg.sync;
+      if (on && !syncOn) syncSoon();
+      syncOn = on;
     });
   };
   const cfgFailed = (e: unknown) => bb.log.warn(`jira settings read failed: ${(e as Error).message}`);
@@ -233,6 +244,13 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     file: { type: "string" as const, required: true as const, description: "JSON file path" },
   };
 
+  /** Store a snapshot; a good one re-runs the Done checks waiting on PR data. */
+  const ingestSnap = async (raw: unknown) => {
+    const r = await store.ingestSnapshot(raw);
+    if (r.ok && (raw as { ok?: unknown }).ok !== false) await recheckWaiting();
+    return r;
+  };
+
   const ingest = cliCommand({
     summary: "Validate a Jira snapshot file and store it",
     options: fileOpt,
@@ -244,11 +262,10 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         return fail(`cannot read ${input.options.file}: ${(e as Error).message}`);
       }
       try {
-        const r = await store.ingestSnapshot(raw);
+        const r = await ingestSnap(raw);
         if (!r.ok) return fail(`invalid snapshot: ${r.error}`);
         const failed = (raw as { ok?: unknown; error?: unknown }).ok === false;
         const why = (raw as { error?: unknown }).error;
-        if (!failed) await recheckWaiting();
         return { exitCode: 0, stdout: failed ? `ingested (failure: ${typeof why === "string" ? why : "snapshot not ok"})\n` : "ingested\n" };
       } catch (e) {
         return fail(`cannot store snapshot: ${(e as Error).message}`);
@@ -267,39 +284,89 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     return at !== null && !(taken >= at) ? at : null;
   };
 
+  /** What a pass must fetch, and whether it is due (a Refresh is pending, no snapshot, or the data is old). */
+  const computeWanted = async (s: JiraSettings): Promise<SyncWanted> => {
+    const keys = new Set<string>();
+    const prs = new Map<string, { repo: string; number: number }>();
+    for (const { id, links } of await deps.liveLinks()) {
+      for (const l of links) {
+        if (l.tracker === "external" && l.jira) keys.add(l.jira.key);
+        if (l.tracker === "github" && l.kind === "pull") prs.set(`${l.repo}#${l.issue}`, { repo: l.repo, number: l.issue });
+      }
+      for (const l of (await store.readThread(id)).links) keys.add(l.key);
+    }
+    // Exact keys in titles, branches and PR head refs (what reconcile auto-links), so
+    // tickets not assigned to the operator are fetched too. Branches are usually lowercase.
+    const add = (text: string | null | undefined, upper = false) => {
+      for (const k of text ? extractJiraKeys(upper ? text.toUpperCase() : text, s.projects) : []) keys.add(k);
+    };
+    for (const t of await deps.reconThreads()) {
+      if (t.archived) continue;
+      add(t.title);
+      add(t.branch, true);
+    }
+    for (const p of (await store.readSnapshot()).snapshot?.prs ?? []) if (prs.has(`${p.repo}#${p.number}`)) add(p.headRef, true);
+    // A pass runs every minute; only a due or requested one fetches from Jira/GitHub.
+    const { snapshot: snap, ageMs } = await store.readSnapshot();
+    const fullSync = (await refreshPending(snap)) !== null || ageMs === null || ageMs >= s.refreshMinutes * 60_000 - 15_000;
+    // branchHeads: thread rows expose no branch/repo pair cheaply, so none yet.
+    return { projects: s.projects, linkedKeys: [...keys].sort(), prRefs: [...prs.values()], branchHeads: [], fullSync };
+  };
+
   const wanted = cliCommand({
-    summary: "Jira keys and PRs the sync script must fetch",
+    summary: "Jira keys and PRs a sync pass would fetch (debug)",
     options: { json: { type: "boolean", description: "Emit machine-readable JSON" } },
     async run() {
-      const s = jiraSettings(await deps.settings());
-      const keys = new Set<string>();
-      const prs = new Map<string, { repo: string; number: number }>();
-      for (const { id, links } of await deps.liveLinks()) {
-        for (const l of links) {
-          if (l.tracker === "external" && l.jira) keys.add(l.jira.key);
-          if (l.tracker === "github" && l.kind === "pull") prs.set(`${l.repo}#${l.issue}`, { repo: l.repo, number: l.issue });
-        }
-        for (const l of (await store.readThread(id)).links) keys.add(l.key);
-      }
-      // Exact keys in titles, branches and PR head refs (what reconcile auto-links), so
-      // tickets not assigned to the operator are fetched too. Branches are usually lowercase.
-      const add = (text: string | null | undefined, upper = false) => {
-        for (const k of text ? extractJiraKeys(upper ? text.toUpperCase() : text, s.projects) : []) keys.add(k);
-      };
-      for (const t of await deps.reconThreads()) {
-        if (t.archived) continue;
-        add(t.title);
-        add(t.branch, true);
-      }
-      for (const p of (await store.readSnapshot()).snapshot?.prs ?? []) if (prs.has(`${p.repo}#${p.number}`)) add(p.headRef, true);
-      await bb.storage.kv.set(SCRIPT_SEEN_KEY, Date.now());
-      // The script runs every minute; only a due or requested pass fetches from Jira/GitHub.
-      const { snapshot: snap, ageMs } = await store.readSnapshot();
-      const fullSync = (await refreshPending(snap)) !== null || ageMs === null || ageMs >= s.refreshMinutes * 60_000 - 15_000;
-      // branchHeads: thread rows expose no branch/repo pair cheaply, so none yet.
-      return out({ projects: s.projects, linkedKeys: [...keys].sort(), prRefs: [...prs.values()], branchHeads: [], fullSync });
+      return out(await computeWanted(jiraSettings(await deps.settings())));
     },
   });
+
+  // ---- The built-in sync: one pass at a time, every minute while on. ----
+  let disposed = false;
+  let syncing: Promise<void> | null = null;
+  let forceFull = false; // `jira sync`: fetch even when not due
+  let passErrors: string[] = []; // failed ops of the current pass (for `jira sync`)
+  const realRun = deps.run ?? runTool;
+  const core = createSyncCore({
+    // After dispose nothing new runs and nothing is written: an applied op stays queued and replays safely.
+    run: (tool, args) => (disposed ? Promise.reject(new Error("plugin unloaded")) : realRun(tool, args)),
+    wanted: async () => {
+      const w = await computeWanted(jiraSettings(await deps.settings()));
+      return forceFull ? { ...w, fullSync: true } : w;
+    },
+    pendingOps: () => store.pendingOps(),
+    ack: async (results) => {
+      if (disposed) return;
+      for (const r of results) if (!r.ok) passErrors.push(`op ${r.id}: ${r.error}`);
+      await store.ack(results);
+    },
+    ingest: async (snap) => {
+      if (!disposed) await ingestSnap(snap);
+    },
+  });
+  /** One sync pass; a call while one runs joins it. manual: `jira sync` (runs with jiraSync off, always a full fetch). */
+  const syncPass = (manual = false): Promise<void> =>
+    (syncing ??= (async () => {
+      try {
+        const s = jiraSettings(await deps.settings());
+        if (disposed || !s.enabled || (!manual && !s.sync)) return;
+        forceFull = manual;
+        passErrors = [];
+        await bb.storage.kv.set(SYNC_RAN_KEY, Date.now());
+        await core.pass();
+      } finally {
+        syncing = null;
+      }
+    })());
+  const syncFailed = (e: unknown) => bb.log.warn(`jira sync failed: ${(e as Error).message}`);
+  /** Start a pass now without waiting for it (Refresh, a Done data wait). */
+  const kickSync = () => void syncPass().catch(syncFailed);
+  let soonTimer: ReturnType<typeof setTimeout> | undefined;
+  function syncSoon() {
+    clearTimeout(soonTimer);
+    soonTimer = setTimeout(kickSync, SYNC_SOON_MS);
+  }
+  bb.background.schedule("jira-sync", "* * * * *", () => syncPass().catch(syncFailed));
 
   const queue = cliCommand({
     summary: "Pending Jira write ops",
@@ -329,35 +396,39 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     },
   });
 
+  const statusText = async () => {
+    const { snapshot, ageMs, stale, error } = await store.readSnapshot();
+    const ops = await store.pendingOps();
+    const lines = [
+      snapshot === null
+        ? `snapshot: none${error ? ` (last refresh failed: ${error})` : ""}`
+        : `snapshot: ${snapshot.ok ? "ok" : `error: ${snapshot.error}`}${error ? ` (${error})` : ""}${stale ? " (stale)" : ""}, age ${ageMs === null ? "?" : `${Math.floor(ageMs / 1000)}s`}`,
+      `pending ops: ${ops.length}`,
+      ...(await store.recentResults(5)).map((r) => `result ${r.id}: ${r.ok ? `ok${r.createdKey ? ` ${r.createdKey}` : ""}` : `error ${r.error}`}`),
+    ];
+    return { text: lines.join("\n") + "\n", error };
+  };
+
   const status = cliCommand({
     summary: "Jira snapshot age, pending ops and recent results",
     async run() {
-      const s = jiraSettings(await deps.settings());
-      const { snapshot, ageMs, stale, error } = await store.readSnapshot();
-      const ops = await store.pendingOps();
-      const lines = [
-        snapshot === null
-          ? `snapshot: none${error ? ` (last refresh failed: ${error})` : ""}`
-          : `snapshot: ${snapshot.ok ? "ok" : `error: ${snapshot.error}`}${error ? ` (${error})` : ""}${stale ? " (stale)" : ""}, age ${ageMs === null ? "?" : `${Math.floor(ageMs / 1000)}s`}`,
-        `pending ops: ${ops.length}`,
-        ...(await store.recentResults(5)).map((r) => `result ${r.id}: ${r.ok ? `ok${r.createdKey ? ` ${r.createdKey}` : ""}` : `error ${r.error}`}`),
-      ];
-      return { exitCode: 0, stdout: lines.join("\n") + "\n" };
+      return { exitCode: 0, stdout: (await statusText()).text };
     },
   });
 
-  const setup = cliCommand({
-    summary: "Print (not run) the automation command that schedules the sync script",
+  const sync = cliCommand({
+    summary: "Run one Jira/GitHub sync pass now (acli and gh) and print the status",
     async run() {
-      const s = jiraSettings(await deps.settings());
-      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      const repo = deps.repoDir ?? PLACEHOLDER_REPO;
-      const cmd =
-        `bb automation create --project ${BB_PERSONAL_PROJECT_ID} --name "Focus Board Jira sync" ` +
-        `--cron "* * * * *" --timezone ${tz} ` +
-        `--script-file ${repo}/scripts/jira-sync.mjs --interpreter node ` +
-        `--working-directory automation-storage --timeout 5m`;
-      return { exitCode: 0, stdout: cmd + "\n" };
+      if (!(await enabled())) return fail(OFF);
+      try {
+        await syncing?.catch(() => undefined); // a running pass may not be a full one: run our own after it
+        await syncPass(true);
+      } catch (e) {
+        return fail(`jira sync failed: ${(e as Error).message}`);
+      }
+      const { text, error } = await statusText();
+      const problems = [...(error ? [error] : []), ...passErrors];
+      return problems.length ? { exitCode: 1, stdout: text, stderr: problems.join("\n") + "\n" } : { exitCode: 0, stdout: text };
     },
   });
 
@@ -735,6 +806,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         await store.updateThread(threadId, () => ({ verifying: { startedAt, reasons: [CHECKING_PRS] } }));
         await bb.storage.kv.set(REFRESH_KEY, Date.now());
         bb.realtime.publish(JIRA_CHANGED, {});
+        kickSync();
         clearTimeout(dataTimers.get(threadId));
         dataTimers.set(threadId, setTimeout(() => {
           dataTimers.delete(threadId);
@@ -1094,7 +1166,8 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       return reconcileApply();
     },
     jira_board_state: async () => {
-      if (!(await enabled())) return { enabled: false, snapshotAge: null, stale: false, error: null, tickets: [], threads: {}, pending: {}, next: {}, refreshRequestedAt: null, scriptSeenAt: null };
+      const s = jiraSettings(await deps.settings());
+      if (!s.enabled) return { enabled: false, snapshotAge: null, stale: false, error: null, tickets: [], threads: {}, pending: {}, next: {}, refreshRequestedAt: null, syncRanAt: null, syncEnabled: false };
       const { snapshot, ageMs, stale, error } = await store.readSnapshot();
       const threads: Record<string, ThreadJiraRecord> = {};
       for (const { id } of await deps.liveLinks()) threads[id] = await store.readThread(id);
@@ -1110,13 +1183,15 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         pending: Object.fromEntries((await store.pendingOps()).map((o) => [o.id, o])),
         next,
         refreshRequestedAt: await refreshPending(snapshot),
-        scriptSeenAt: await num(SCRIPT_SEEN_KEY),
+        syncRanAt: await num(SYNC_RAN_KEY),
+        syncEnabled: s.sync,
       };
     },
     jira_refresh: async () => {
       if (!(await enabled())) return { ok: false, error: OFF };
       await bb.storage.kv.set(REFRESH_KEY, Date.now());
       bb.realtime.publish(JIRA_CHANGED, {});
+      kickSync(); // not awaited: the pass lands in seconds and publishes jira-changed
       return { ok: true };
     },
     jira_card_action: async ({ kind, threadId, index, reason }) => {
@@ -1194,7 +1269,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   });
 
   return {
-    commands: { "jira reconcile": reconcile, "jira ingest": ingest, "jira wanted": wanted, "jira queue": queue, "jira ack": ack, "jira status": status, "jira setup": setup },
+    commands: { "jira reconcile": reconcile, "jira ingest": ingest, "jira wanted": wanted, "jira queue": queue, "jira ack": ack, "jira status": status, "jira sync": sync },
     store,
     idle,
     /** Whether jiraEnabled is on (done_set / done mark route through the check only then). */
@@ -1210,6 +1285,8 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       await store.removeLinks(threadId, gone);
     },
     dispose() {
+      disposed = true;
+      clearTimeout(soonTimer);
       for (const t of dataTimers.values()) clearTimeout(t);
       dataTimers.clear();
     },
