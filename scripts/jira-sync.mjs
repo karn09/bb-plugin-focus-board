@@ -205,6 +205,9 @@ async function fetchPrs(wanted, linkedKeys) {
 export async function main() {
   const wanted = json(await bb("wanted", "--json"));
   await drain();
+  // Runs every minute: queued writes always go out; Jira/GitHub are fetched only when
+  // the plugin says a pass is due or the operator pressed Refresh.
+  if (wanted.fullSync === false) return;
   const snap = { version: 1, takenAt: new Date().toISOString(), ok: true, error: null, me: { accountId: "" }, tickets: [], prs: [], mentions: [] };
   try {
     const { me, tickets } = await fetchTickets(wanted);

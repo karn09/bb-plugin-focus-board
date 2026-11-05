@@ -537,7 +537,8 @@ function BoardPage({ subPath }: { subPath: string }) {
     snapshotAge: number | null; error: string | null;
     suggestions: { threadId: string; key: string }[]; drift: DriftItem[]; autoLinks: { threadId: string; key: string }[];
     next: NonNullable<JiraBoardValue["nextByThread"]>;
-  }>({ enabled: false, stale: false, tickets: {}, threads: {}, pending: [], snapshotAge: null, error: null, suggestions: [], drift: [], autoLinks: [], next: {} });
+    refreshRequestedAt: number | null; scriptSeenAt: number | null;
+  }>({ enabled: false, stale: false, tickets: {}, threads: {}, pending: [], snapshotAge: null, error: null, suggestions: [], drift: [], autoLinks: [], next: {}, refreshRequestedAt: null, scriptSeenAt: null });
   const refetchJira = useCallback(() => {
     jiraRpc.call("jira_board_state", null).then(
       async (r) => {
@@ -555,6 +556,8 @@ function BoardPage({ subPath }: { subPath: string }) {
           drift: plan?.drift ?? [],
           autoLinks: plan?.autoLinks ?? [],
           next: r.next,
+          refreshRequestedAt: r.refreshRequestedAt,
+          scriptSeenAt: r.scriptSeenAt,
         });
       },
       () => {}, // Jira is optional state; the board works without it.
@@ -2663,6 +2666,12 @@ function BoardPage({ subPath }: { subPath: string }) {
         onFix: (d, opts) => act({ action: "fix", key: d.key, kind: d.kind, ...opts }),
         onOpenThread: openThreadCard,
         pending: jiraState.pending,
+        refreshRequestedAt: jiraState.refreshRequestedAt,
+        scriptSeenAt: jiraState.scriptSeenAt,
+        onRefresh: () => {
+          jiraRpc.call("jira_refresh", null).then(refetchJira, () => {});
+        },
+        allThreads: threads.filter((t) => t.archivedAt == null).map((t) => ({ id: t.id, title: t.displayTitle })),
       },
     };
   }, [jiraValue, jiraState, threads, jiraRpc, refetchJira, startJiraThread, openThreadCard, snoozeUntil]);

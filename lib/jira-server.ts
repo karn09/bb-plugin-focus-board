@@ -67,6 +67,10 @@ const NUDGE_TURNS_KEY = "jira:nudge-turns";
 const SNOOZE_SEEN_KEY = "jira:snooze-seen";
 /** threadId → the deeper check's next step, shown while the reason is still that check's. */
 const NEXT_STEPS_KEY = "jira:next-steps";
+/** Column Refresh: when the operator last asked; pending until a newer snapshot lands. */
+const REFRESH_KEY = "jira:refresh-requested-at";
+/** When the sync script last called `jira wanted` (is the automation running?). */
+const SCRIPT_SEEN_KEY = "jira:script-seen-at";
 export const JIRA_RECONCILE_CHANGED = "jira-reconcile-changed";
 export const JIRA_CHANGED = "jira-changed";
 
@@ -99,8 +103,13 @@ export const jiraRpcContract = defineRpcContract({
       pending: z.record(z.string(), QueueOp),
       /** Deeper-check next steps, only while the card's reason is still that check's. */
       next: z.record(z.string(), NextStep),
+      /** A Refresh request no snapshot has answered yet (epoch ms), else null. */
+      refreshRequestedAt: z.number().nullable(),
+      scriptSeenAt: z.number().nullable(),
     }),
   },
+  /** Column Refresh: ask the sync script for a full pass on its next (per-minute) run. */
+  jira_refresh: { input: z.null(), output: z.object({ ok: z.boolean(), error: z.string().optional() }) },
   /** A card button press; kinds whose behavior lands later answer "not yet". */
   jira_card_action: {
     input: z.object({
@@ -246,6 +255,17 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     },
   });
 
+  const num = async (k: string) => {
+    const v: unknown = await bb.storage.kv.get(k);
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  };
+  /** The open Refresh request, or null once a snapshot taken after it has landed. */
+  const refreshPending = async (snap: { takenAt: string } | null) => {
+    const at = await num(REFRESH_KEY);
+    const taken = snap ? Date.parse(snap.takenAt) : NaN;
+    return at !== null && !(taken >= at) ? at : null;
+  };
+
   const wanted = cliCommand({
     summary: "Jira keys and PRs the sync script must fetch",
     options: { json: { type: "boolean", description: "Emit machine-readable JSON" } },
@@ -271,8 +291,12 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         add(t.branch, true);
       }
       for (const p of (await store.readSnapshot()).snapshot?.prs ?? []) if (prs.has(`${p.repo}#${p.number}`)) add(p.headRef, true);
+      await bb.storage.kv.set(SCRIPT_SEEN_KEY, Date.now());
+      // The script runs every minute; only a due or requested pass fetches from Jira/GitHub.
+      const { snapshot: snap, ageMs } = await store.readSnapshot();
+      const fullSync = (await refreshPending(snap)) !== null || ageMs === null || ageMs >= s.refreshMinutes * 60_000 - 15_000;
       // branchHeads: thread rows expose no branch/repo pair cheaply, so none yet.
-      return out({ projects: s.projects, linkedKeys: [...keys].sort(), prRefs: [...prs.values()], branchHeads: [] });
+      return out({ projects: s.projects, linkedKeys: [...keys].sort(), prRefs: [...prs.values()], branchHeads: [], fullSync });
     },
   });
 
@@ -329,7 +353,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       const repo = deps.repoDir ?? PLACEHOLDER_REPO;
       const cmd =
         `bb automation create --project ${BB_PERSONAL_PROJECT_ID} --name "Focus Board Jira sync" ` +
-        `--cron "*/${s.refreshMinutes} * * * *" --timezone ${tz} ` +
+        `--cron "* * * * *" --timezone ${tz} ` +
         `--script-file ${repo}/scripts/jira-sync.mjs --interpreter node ` +
         `--working-directory automation-storage --timeout 5m`;
       return { exitCode: 0, stdout: cmd + "\n" };
@@ -1032,7 +1056,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       return reconcileApply();
     },
     jira_board_state: async () => {
-      if (!(await enabled())) return { enabled: false, snapshotAge: null, stale: false, error: null, tickets: [], threads: {}, pending: {}, next: {} };
+      if (!(await enabled())) return { enabled: false, snapshotAge: null, stale: false, error: null, tickets: [], threads: {}, pending: {}, next: {}, refreshRequestedAt: null, scriptSeenAt: null };
       const { snapshot, ageMs, stale, error } = await store.readSnapshot();
       const threads: Record<string, ThreadJiraRecord> = {};
       for (const { id } of await deps.liveLinks()) threads[id] = await store.readThread(id);
@@ -1047,7 +1071,15 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         threads,
         pending: Object.fromEntries((await store.pendingOps()).map((o) => [o.id, o])),
         next,
+        refreshRequestedAt: await refreshPending(snapshot),
+        scriptSeenAt: await num(SCRIPT_SEEN_KEY),
       };
+    },
+    jira_refresh: async () => {
+      if (!(await enabled())) return { ok: false, error: OFF };
+      await bb.storage.kv.set(REFRESH_KEY, Date.now());
+      bb.realtime.publish(JIRA_CHANGED, {});
+      return { ok: true };
     },
     jira_card_action: async ({ kind, threadId, index, reason }) => {
       if (!(await enabled())) return { ok: false, error: OFF };

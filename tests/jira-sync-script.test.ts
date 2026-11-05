@@ -110,6 +110,17 @@ describe("jira-sync.mjs", () => {
     expect(snap.tickets.every((t) => t.assignedToMe)).toBe(true);
   });
 
+  it("fullSync:false: drains the queue but fetches nothing and ingests nothing", () => {
+    rules("bb", [
+      { match: "jira wanted", stdout: JSON.stringify({ ...wanted, fullSync: false }) },
+      { match: "jira queue", stdout: JSON.stringify({ ops: [] }) },
+    ]);
+    run();
+    expect(calls("bb").some((c) => c.argv.includes("queue"))).toBe(true);
+    expect(calls("acli")).toHaveLength(0);
+    expect(calls("bb").some((c) => c.argv.includes("ingest"))).toBe(false);
+  });
+
   it("asks search only for fields acli allows, and gets parent/updated from view", () => {
     rules("acli", [
       { match: "assignee = currentUser()", stdout: JSON.stringify([issue("ENG-1", { updated: undefined })]) },

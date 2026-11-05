@@ -11,6 +11,7 @@ const ticket = (key: string, summary: string, over: Partial<JiraTicket> = {}): J
   issueType: "Task", isEpic: false, parentKey: null, epicKey: null, openChildren: 0,
   updatedAt: "2026-10-28T00:00:00Z", url: `https://growtherapy.atlassian.net/browse/${key}`, ...over,
 });
+const NOW = Date.parse("2026-11-05T15:00:00Z");
 const base = () => ({
   tickets: [ticket("PT-3570", "Automated Atlantis plan review"), ticket("PT-3878", "Atlantis migration")],
   threadsByKey: { "PT-3878": [{ id: "a", title: "PT-3878 A: plan the cutover" }] },
@@ -27,11 +28,59 @@ const base = () => ({
   onFix: vi.fn(),
   onOpenThread: vi.fn(),
   pending: [] as QueueOp[],
+  refreshRequestedAt: null as number | null,
+  scriptSeenAt: NOW - 30_000 as number | null,
+  onRefresh: vi.fn(),
+  allThreads: [
+    { id: "a", title: "PT-3878 A: plan the cutover" },
+    { id: "b", title: "Resolve WAF IP set drift" },
+    { id: "c", title: "Decommission UAT environment" },
+  ],
+  now: NOW,
 });
 
 afterEach(cleanup);
 
 describe("JiraColumn", () => {
+  it("Refresh asks for a sync; while it is pending the button reads Refreshing… and is disabled", () => {
+    const p = base();
+    const { rerender } = render(<JiraColumn {...p} />);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh Jira" }));
+    expect(p.onRefresh).toHaveBeenCalledTimes(1);
+    rerender(<JiraColumn {...p} refreshRequestedAt={NOW - 10_000} />);
+    const b = screen.getByRole("button", { name: "Refresh Jira" }) as HTMLButtonElement;
+    expect(b.disabled).toBe(true);
+    expect(b.textContent).toContain("Refreshing");
+  });
+
+  it("a request older than 3 minutes no longer blocks the button", () => {
+    render(<JiraColumn {...base()} refreshRequestedAt={NOW - 4 * 60_000} />);
+    expect((screen.getByRole("button", { name: "Refresh Jira" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("says so when the sync automation has not checked in for 3 minutes", () => {
+    const { rerender } = render(<JiraColumn {...base()} scriptSeenAt={null} />);
+    expect(screen.getByText("Sync automation isn't running: set it up with `bb focus-board jira setup`")).toBeTruthy();
+    rerender(<JiraColumn {...base()} scriptSeenAt={NOW - 4 * 60_000} />);
+    expect(screen.getByText(/Sync automation isn't running/)).toBeTruthy();
+    rerender(<JiraColumn {...base()} />);
+    expect(screen.queryByText(/Sync automation isn't running/)).toBeNull();
+  });
+
+  it("Link to thread: search the board's threads, pick one, and it links (already-linked threads are left out)", () => {
+    const p = base();
+    render(<JiraColumn {...p} />);
+    const card = screen.getByText("Atlantis migration").closest("article")!;
+    fireEvent.click(card.querySelector("[data-jira-link-thread]")!);
+    const box = screen.getByRole("searchbox", { name: "Find a thread to link to PT-3878" });
+    expect(screen.queryByRole("option", { name: "PT-3878 A: plan the cutover" })).toBeNull();
+    fireEvent.change(box, { target: { value: "waf" } });
+    expect(screen.queryByRole("option", { name: "Decommission UAT environment" })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: "Resolve WAF IP set drift" }));
+    expect(p.onLink).toHaveBeenCalledWith("PT-3878", "b");
+    expect(screen.queryByRole("searchbox")).toBeNull();
+  });
+
   it("stale shows the snapshot age; unauthorized shows the login hint", () => {
     const { rerender } = render(<JiraColumn {...base()} stale snapshotAgeMs={6 * 60_000 + 5_000} />);
     expect(screen.getByText("data 6 min old")).toBeTruthy();

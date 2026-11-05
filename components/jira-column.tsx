@@ -37,7 +37,20 @@ export type JiraColumnData = {
   onOpenThread: (threadId: string) => void;
   /** Un-acked queue ops: a fix already queued shows "queued" instead of its button. */
   pending: readonly QueueOp[];
+  /** An unanswered Refresh request (epoch ms), else null. */
+  refreshRequestedAt: number | null;
+  /** When the sync script last checked in (epoch ms), else null. */
+  scriptSeenAt: number | null;
+  onRefresh: () => void;
+  /** The board's live threads, for "Link to thread…". */
+  allThreads: readonly ThreadRef[];
+  /** Clock for the Refresh/automation timeouts (tests). */
+  now?: number;
 };
+
+/** A Refresh or a script check-in older than this counts as lapsed. */
+const LAPSE_MS = 3 * 60_000;
+const NOT_RUNNING = "Sync automation isn't running: set it up with `bb focus-board jira setup`";
 
 /**
  * Linked threads per key: thread-record links plus the reconcile plan's
@@ -86,7 +99,12 @@ const btn = "rounded px-1.5 py-0.5 text-[11px] font-medium hover:bg-accent focus
 export function JiraColumn(props: JiraColumnProps) {
   const { tickets, threadsByKey, suggestions, drift, hideLinked, onHideLinkedChange, collapsed = false, onCollapsedChange } = props;
   const [confirming, setConfirming] = useState<DriftItem | null>(null);
-  const status = statusLine(props);
+  const [linking, setLinking] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const now = props.now ?? Date.now();
+  const refreshing = props.refreshRequestedAt !== null && now - props.refreshRequestedAt < LAPSE_MS;
+  const scriptLapsed = props.scriptSeenAt === null || now - props.scriptSeenAt > LAPSE_MS;
+  const status = statusLine(props) ?? (scriptLapsed ? NOT_RUNNING : null);
 
   if (collapsed) {
     return (
@@ -105,7 +123,18 @@ export function JiraColumn(props: JiraColumnProps) {
       <header className="flex items-center gap-1.5 px-1 pb-1.5">
         <h2 className="text-xs font-semibold">Jira</h2>
         <span className="text-xs text-muted-foreground">{tickets.length}</span>
-        <label className="ml-auto flex items-center gap-1 text-[10px] text-muted-foreground">
+        <button
+          type="button"
+          aria-label="Refresh Jira"
+          title={refreshing ? "Waiting for the sync script" : "Fetch tickets now"}
+          className={cn(btn, "ml-auto inline-flex items-center gap-1")}
+          disabled={refreshing}
+          onClick={props.onRefresh}
+        >
+          <Icon name={refreshing ? "Spinner" : "RotateCcw"} className={cn("size-3", refreshing && "animate-spin")} aria-hidden />
+          {refreshing ? "Refreshing…" : null}
+        </button>
+        <label className="flex items-center gap-1 text-[10px] text-muted-foreground">
           <input type="checkbox" aria-label="Hide linked tickets" checked={hideLinked} onChange={(e) => onHideLinkedChange(e.target.checked)} />
           hide linked
         </label>
@@ -162,8 +191,49 @@ export function JiraColumn(props: JiraColumnProps) {
                   <button type="button" aria-label="Dismiss suggestion" className={btn} onClick={() => props.onDismiss(t.key, s.threadId)}>×</button>
                 </div>
               ))}
-              {linked.length === 0 ? (
-                <button type="button" className={cn(btn, "border border-border/60")} onClick={() => props.onStartThread(t)}>Start thread</button>
+              <div className="flex flex-wrap gap-1">
+                {linked.length === 0 ? (
+                  <button type="button" className={cn(btn, "border border-border/60")} onClick={() => props.onStartThread(t)}>Start thread</button>
+                ) : null}
+                <button
+                  type="button"
+                  data-jira-link-thread=""
+                  className={btn}
+                  onClick={() => { setLinking(linking === t.key ? null : t.key); setQuery(""); }}
+                >
+                  Link to thread…
+                </button>
+              </div>
+              {linking === t.key ? (
+                <div className="space-y-1">
+                  <input
+                    type="search"
+                    autoFocus
+                    aria-label={`Find a thread to link to ${t.key}`}
+                    placeholder="Search threads"
+                    className="w-full rounded border border-border/60 bg-background px-1.5 py-0.5 text-[11px]"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Escape") setLinking(null); }}
+                  />
+                  <ul role="listbox" aria-label={`Threads to link to ${t.key}`} className="max-h-40 overflow-y-auto">
+                    {props.allThreads
+                      .filter((th) => !linked.some((l) => l.id === th.id) && th.title.toLowerCase().includes(query.trim().toLowerCase()))
+                      .slice(0, 50)
+                      .map((th) => (
+                        <li
+                          key={th.id}
+                          role="option"
+                          aria-selected={false}
+                          aria-label={th.title}
+                          className="cursor-pointer truncate rounded px-1 py-0.5 hover:bg-muted"
+                          onClick={() => { setLinking(null); props.onLink(t.key, th.id); }}
+                        >
+                          {th.title}
+                        </li>
+                      ))}
+                  </ul>
+                </div>
               ) : null}
             </article>
           );

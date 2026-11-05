@@ -99,4 +99,46 @@ describe("jira_board_state / jira_card_action", () => {
     await s.ack([{ id: op.id, ok: true, error: null, createdKey: null }]);
     expect(n).toBe(4); // enqueue, ingest, thread write, ack of the queued op
   });
+
+  describe("manual refresh", () => {
+    const wanted = async () => JSON.parse((await harness.behavior.runCli(["jira", "wanted", "--json"])).stdout);
+
+    it("refused while Jira is off", async () => {
+      await load({ jiraEnabled: false });
+      expect(await harness.behavior.callRpc("jira_refresh", null)).toEqual({ ok: false, error: expect.stringMatching(/Jira is off/) });
+    });
+
+    it("a fresh snapshot is not due; a refresh request makes the next pass a full sync", async () => {
+      await load({ jiraEnabled: true, jiraRefreshMinutes: 10 });
+      expect((await wanted()).fullSync).toBe(false);
+      expect(await harness.behavior.callRpc("jira_refresh", null)).toEqual({ ok: true });
+      expect((await state()).refreshRequestedAt).toEqual(expect.any(Number));
+      expect((await wanted()).fullSync).toBe(true);
+    });
+
+    it("a snapshot taken after the request clears it", async () => {
+      await load({ jiraEnabled: true, jiraRefreshMinutes: 10 });
+      await harness.behavior.callRpc("jira_refresh", null);
+      await new Promise((r) => setTimeout(r, 5));
+      const { mkdtempSync, writeFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const f = join(mkdtempSync(join((await import("node:os")).tmpdir(), "jr-")), "s.json");
+      writeFileSync(f, JSON.stringify(snap(0)));
+      await harness.behavior.runCli(["jira", "ingest", "--file", f]);
+      expect((await state()).refreshRequestedAt).toBeNull();
+      expect((await wanted()).fullSync).toBe(false);
+    });
+
+    it("due by age: a snapshot older than the refresh interval (or none) is a full sync", async () => {
+      await load({ jiraEnabled: true, jiraRefreshMinutes: 2 });
+      expect((await wanted()).fullSync).toBe(true);
+    });
+
+    it("the board learns when the sync script last checked in", async () => {
+      await load({ jiraEnabled: true });
+      expect((await state()).scriptSeenAt).toBeNull();
+      await wanted();
+      expect((await state()).scriptSeenAt).toEqual(expect.any(Number));
+    });
+  });
 });
