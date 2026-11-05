@@ -11,6 +11,7 @@ import { cleanup, render, waitFor } from "@testing-library/react";
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import { ThreadCard } from "../components/thread-card";
 import { thread } from "./thread-fixture";
+import { JiraBoardContext } from "../components/jira-card-badges";
 
 const BASE = "https://github.com/owner/repo";
 
@@ -122,6 +123,34 @@ describe("linked store chips — distinct PR vs issue glyphs", () => {
     expect(chipEl.querySelector('[data-icon="PullRequest"]')).toBeNull();
     expect(chipEl.querySelector('[data-icon="GithubMark"]')).toBeNull();
     expect(chipEl.querySelector("img")).not.toBeNull();
+  });
+
+  describe("Jira-keyed external links", () => {
+    const jiraLink = {
+      tracker: "external" as const,
+      url: "https://x.atlassian.net/browse/PT-1",
+      hostname: "x.atlassian.net",
+      label: "PT-1",
+      jira: { key: "PT-1" },
+      createdAt: "2026-10-09T00:00:00.000Z",
+      source: "auto" as const,
+    };
+    const board = (enabled: boolean) =>
+      ({ enabled, stale: false, ticketByKey: {}, pendingOps: [], onAction: vi.fn(), threads: {} }) as never;
+    const renderWith = (enabled: boolean) =>
+      render(
+        <JiraBoardContext.Provider value={board(enabled)}>
+          <ThreadCard {...({ thread: thread({ id: "thr_j", displayTitle: "plain title", updatedAt: 5000 }), stateDot: null, isActive: false, isDone: false, projectName: "One", repoHrefBase: BASE, onOpen: vi.fn(), onOpenThread: vi.fn(), linkedIssues: [jiraLink] } as unknown as CardProps)} />
+        </JiraBoardContext.Provider>,
+      );
+    it("Jira on: no favicon chip for a jira-keyed link", () => {
+      renderWith(true);
+      expect(document.querySelector("[data-ticket-chip]")).toBeNull();
+    });
+    it("Jira off: the favicon chip renders as upstream", async () => {
+      renderWith(false);
+      await waitFor(() => expect(document.querySelector("[data-ticket-chip] img")).not.toBeNull());
+    });
   });
 
   it("a forgejo PR id leads with the PR glyph, beside the site favicon", async () => {

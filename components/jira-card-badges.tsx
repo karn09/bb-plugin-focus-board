@@ -14,11 +14,21 @@ export type JiraCardKind =
   | "run-done-check" | "dismiss-reason";
 
 const TONE = { new: "neutral", indeterminate: "info", done: "good" } as const;
-const TONE_CLASS = {
-  neutral: "text-muted-foreground",
-  info: "text-sky-600 dark:text-sky-400",
-  good: "text-emerald-600 dark:text-emerald-400",
+const LOZENGE = {
+  neutral: "bg-zinc-500/25 text-zinc-700 dark:text-zinc-300",
+  info: "bg-blue-500/20 text-blue-700 dark:text-blue-300",
+  good: "bg-emerald-500/20 text-emerald-700 dark:text-emerald-300",
 } as const;
+const lozengeText = (status: string) => {
+  const u = status.toUpperCase();
+  return u.length > 14 ? `${u.slice(0, 13)}…` : u;
+};
+/** Jira's mark, bundled so the chip never fetches an icon. */
+const JiraMark = () => (
+  <svg viewBox="0 0 24 24" className="size-3 shrink-0" fill="#2684FF" aria-hidden data-jira-mark="">
+    <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.94 4.34 4.34 4.35V2.84a.84.84 0 0 0-.84-.84zM6.77 6.8a4.36 4.36 0 0 0 4.34 4.34h1.8v1.72a4.36 4.36 0 0 0 4.34 4.34V7.63a.84.84 0 0 0-.83-.83zM2 11.6c0 2.4 1.95 4.34 4.35 4.34h1.78v1.72c0 2.4 1.94 4.34 4.34 4.34v-9.57a.84.84 0 0 0-.84-.83z" />
+  </svg>
+);
 const chip = "inline-flex max-w-full items-center gap-1 rounded border border-border/60 px-1.5 py-0.5 text-[10px] leading-none";
 
 export type JiraCardBadgesProps = {
@@ -69,19 +79,36 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
   };
   return (
     <div className="mt-1 flex flex-wrap items-center gap-1 px-3 pb-2 pl-1.5" data-jira-badges="">
-      {links.map((l) => {
-        const t = ticketByKey[l.key];
-        const tone = t ? TONE[t.statusCategory] : "neutral";
-        return (
-          <span key={l.key} className={chip} data-jira-chip="" data-tone={tone} data-jira-key={l.key}>
-            <span className={cn("inline-block size-1.5 rounded-full bg-current", TONE_CLASS[tone])} aria-hidden />
-            <span>{t ? `${l.key} · ${t.status}` : l.key}</span>
-            {stale ? <span className="text-amber-600">stale</span> : null}
-            {pendingKeys.has(l.key) ? <span className="italic text-muted-foreground">pending</span> : null}
-            {l.key === undoKey ? undoButton : null}
-          </span>
-        );
-      })}
+      {links.length > 0 ? (
+        <span className={cn(chip, "flex-wrap rounded bg-muted px-1 font-mono text-muted-foreground min-h-5 border-0 gap-x-1")} data-jira-chip="">
+          <JiraMark />
+          {links.map((l) => {
+            const t = ticketByKey[l.key];
+            const tone = t ? TONE[t.statusCategory] : "neutral";
+            return (
+              <span key={l.key} className="inline-flex items-center gap-1" data-tone={tone} data-jira-key={l.key}>
+                <a
+                  href={t?.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={t ? `${l.key} · ${t.status} · ${t.issueType}${stale ? " · stale" : ""}` : l.key}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {l.key}
+                </a>
+                {t ? (
+                  <span data-jira-lozenge="" className={cn("rounded px-1 font-sans text-[9px] font-semibold", LOZENGE[tone])}>
+                    {lozengeText(t.status)}
+                  </span>
+                ) : null}
+              </span>
+            );
+          })}
+          {stale ? <span className="text-amber-600">stale</span> : null}
+          {links.some((l) => pendingKeys.has(l.key)) ? <span className="italic text-muted-foreground">pending</span> : null}
+          {undoKey !== undefined ? undoButton : null}
+        </span>
+      ) : null}
       {/* An own op on no linked key (rare): Undo stands alone. */}
       {undoKey === undefined && undoButton ? <span className={chip}>{undoButton}</span> : null}
       {links.length === 0 ? (

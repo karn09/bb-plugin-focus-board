@@ -1,4 +1,4 @@
-import { isValidElement, memo, type DragEvent, type ReactNode, useState } from "react";
+import { isValidElement, memo, type DragEvent, type ReactNode, useContext, useState } from "react";
 import { createPortal } from "react-dom";
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import { attentionPulseRef } from "./attention-pulse-gate";
@@ -26,7 +26,7 @@ import { usePaneCoversBoard } from "./pane-sheet-coverage";
 import { ThreadCardMenu, type CardMenuAction } from "./thread-card-menu";
 import { useTicketChipFit } from "./use-ticket-chip-fit";
 import { useWallpaperActive } from "./wallpaper-contrast";
-import { JiraCardSlot } from "./jira-card-badges";
+import { JiraBoardContext, JiraCardSlot } from "./jira-card-badges";
 
 /**
  * The chip placement contract (issue #104): the issues block is held to the
@@ -1121,11 +1121,15 @@ export function ThreadCardImpl({
   // one row per provider, at most two chips per row (issues left, pulls
   // right), lib/ticket-chips.ts. The toolbar search matches the flat ref
   // set (app.tsx), so a "#38" query still finds every card with a #38 chip.
+  // Jira on: the Jira chip owns jira-keyed links, so the generic favicon chip is hidden.
+  const jiraOn = useContext(JiraBoardContext)?.enabled === true;
+  const withoutJira = (links: ThreadLink[] | undefined) =>
+    jiraOn ? links?.filter((l) => !(l.tracker === "external" && l.jira !== undefined)) : links;
   const ticketRefs = cardTicketRefs({
     title: thread.displayTitle,
     branch,
     ...(repoHrefBase !== undefined ? { repoHrefBase } : {}),
-    linkedIssues,
+    linkedIssues: withoutJira(linkedIssues),
     ...(validatedHrefs !== undefined ? { validatedHrefs } : {}),
   });
   const chipRows = ticketRefs.length === 0 || compact ? [] : ticketChipRows(ticketRefs);
@@ -1161,7 +1165,7 @@ export function ThreadCardImpl({
       title: child.displayTitle,
       branch: child.environment?.branchName ?? child.host?.name ?? "",
       ...(repoHrefBase !== undefined ? { repoHrefBase } : {}),
-      linkedIssues: childLinkedIssuesFor?.(child.id),
+      linkedIssues: withoutJira(childLinkedIssuesFor?.(child.id)),
       ...(validatedHrefs !== undefined ? { validatedHrefs } : {}),
     });
     return refs.length === 0 ? [] : ticketChipRows(refs);

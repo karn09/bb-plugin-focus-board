@@ -20,7 +20,41 @@ describe("JiraCardBadges", () => {
   });
   it.each([["new", "neutral"], ["indeterminate", "info"], ["done", "good"]] as const)("chip tone %s -> %s", (cat, tone) => {
     render(<JiraCardBadges {...props} ticketByKey={t(cat)} record={rec()} />);
-    expect(screen.getByText("PT-1 · Doing").closest("[data-jira-chip]")!.getAttribute("data-tone")).toBe(tone);
+    expect(screen.getByText("PT-1").closest("[data-jira-key]")!.getAttribute("data-tone")).toBe(tone);
+  });
+  it.each([["new", "bg-zinc-500/25"], ["indeterminate", "bg-blue-500/20"], ["done", "bg-emerald-500/20"]] as const)("lozenge %s: uppercase status, class %s", (cat, cls) => {
+    render(<JiraCardBadges {...props} ticketByKey={t(cat)} record={rec()} />);
+    const l = screen.getByText("DOING");
+    expect(l.className).toContain(cls);
+    expect(l.className).toContain("text-[9px]");
+  });
+  it("lozenge truncates at 14 chars with an ellipsis; the title keeps the full status", () => {
+    const tk = { "PT-1": { ...t("new")["PT-1"], status: "Waiting for customer" } };
+    render(<JiraCardBadges {...props} ticketByKey={tk} record={rec()} />);
+    expect(screen.getByText("WAITING FOR C…")).toBeTruthy();
+  });
+  it("unknown ticket: key only, no lozenge", () => {
+    render(<JiraCardBadges {...props} ticketByKey={{}} record={rec()} />);
+    expect(screen.getByText("PT-1").closest("[data-jira-chip]")!.querySelector("[data-jira-lozenge]")).toBeNull();
+  });
+  it("key links to the ticket url; title is KEY · Status · Type (+ stale)", () => {
+    const tk = { "PT-1": { ...t("new")["PT-1"], url: "https://j.example/browse/PT-1" } };
+    const { rerender } = render(<JiraCardBadges {...props} ticketByKey={tk} record={rec()} />);
+    const a = screen.getByText("PT-1") as HTMLAnchorElement;
+    expect(a.getAttribute("href")).toBe("https://j.example/browse/PT-1");
+    expect(a.getAttribute("target")).toBe("_blank");
+    expect(a.getAttribute("rel")).toBe("noreferrer");
+    expect(a.title).toBe("PT-1 · Doing · Task");
+    rerender(<JiraCardBadges {...props} stale ticketByKey={tk} record={rec()} />);
+    expect((screen.getByText("PT-1") as HTMLAnchorElement).title).toBe("PT-1 · Doing · Task · stale");
+  });
+  it("several keys share one chip", () => {
+    const tk = { ...t("new"), "PT-2": { ...t("done")["PT-1"], key: "PT-2", status: "Done" } };
+    const links = [{ key: "PT-1", role: "owner" as const, source: "auto" as const }, { key: "PT-2", role: "related" as const, source: "auto" as const }];
+    render(<JiraCardBadges {...props} ticketByKey={tk} record={rec({ links })} />);
+    expect(document.querySelectorAll("[data-jira-chip]")).toHaveLength(1);
+    expect(screen.getByText("PT-2").closest("[data-jira-chip]")).toBe(screen.getByText("PT-1").closest("[data-jira-chip]"));
+    expect(screen.getByText("DONE")).toBeTruthy();
   });
   it("stale marker", () => {
     render(<JiraCardBadges {...props} stale record={rec()} />);
@@ -65,7 +99,8 @@ describe("JiraCardBadges", () => {
     const b = screen.getByRole("button", { name: "Undo Jira changes" });
     expect(b.tagName).toBe("BUTTON");
     // Inside the chip, right after its "pending" marker.
-    expect(b.closest("[data-jira-chip]")?.getAttribute("data-jira-key")).toBe("PT-1");
+    expect(b.closest("[data-jira-chip]")?.contains(screen.getByText("PT-1"))).toBe(true);
+    expect(b.closest("[data-jira-chip]")?.contains(screen.getByText("PT-1"))).toBe(true);
     expect(b.previousElementSibling?.textContent).toBe("pending");
     fireEvent.click(b);
     expect(onUndo).toHaveBeenCalledWith("t1", ["o1", "o2"]);
