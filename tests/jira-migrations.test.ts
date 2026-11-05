@@ -60,8 +60,14 @@ describe("startup migration: old PR-status-unavailable failures", () => {
       run: () => new Promise(() => {}),
     });
     host.bb.onDispose(() => jira.dispose());
+    const published: string[] = [];
+    const realPublish = host.bb.realtime.publish.bind(host.bb.realtime);
+    host.bb.realtime.publish = ((topic: string, payload: unknown) => {
+      published.push(topic);
+      return realPublish(topic as never, payload as never);
+    }) as never;
     await flush();
-    return { record: (id: string) => metadata.get(id)?.jira, writes, marker: () => host.bb.storage.kv.get(MARKER) };
+    return { published, record: (id: string) => metadata.get(id)?.jira, writes, marker: () => host.bb.storage.kv.get(MARKER) };
   }
 
   it("clears exactly the single-reason PR status unavailable fails, nothing else, and marks the run", async () => {
@@ -72,6 +78,13 @@ describe("startup migration: old PR-status-unavailable failures", () => {
     expect(s.record("b")).toEqual(other);
     expect(s.record("c")).toEqual(two);
     expect(s.writes).toEqual(["a"]);
+    expect(await s.marker()).toBe(true);
+    expect(s.published).toContain("jira-changed");
+  });
+
+  it("nothing to clear: no jira-changed publish", async () => {
+    const s = await start({ b: fail(["PR #7 still open"]) });
+    expect(s.published).not.toContain("jira-changed");
     expect(await s.marker()).toBe(true);
   });
 
