@@ -29,7 +29,8 @@ const JiraMark = () => (
     <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.94 4.34 4.34 4.35V2.84a.84.84 0 0 0-.84-.84zM6.77 6.8a4.36 4.36 0 0 0 4.34 4.34h1.8v1.72a4.36 4.36 0 0 0 4.34 4.34V7.63a.84.84 0 0 0-.83-.83zM2 11.6c0 2.4 1.95 4.34 4.35 4.34h1.78v1.72c0 2.4 1.94 4.34 4.34 4.34v-9.57a.84.84 0 0 0-.84-.83z" />
   </svg>
 );
-const chip = "inline-flex max-w-full items-center gap-1 rounded border border-border/60 px-1.5 py-0.5 text-[10px] leading-none";
+// The card's chip shell, matching the GitHub chip (components/thread-card.tsx ProviderTicketChip).
+const chip = "inline-flex min-h-5 max-w-full items-center gap-1 rounded bg-muted px-1 py-0.5 font-mono text-[10px] leading-none text-muted-foreground";
 
 export type JiraCardBadgesProps = {
   threadId: string;
@@ -80,7 +81,7 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
   return (
     <div className="mt-1 flex flex-wrap items-center gap-1 px-3 pb-2 pl-1.5" data-jira-badges="">
       {links.length > 0 ? (
-        <span className={cn(chip, "flex-wrap rounded bg-muted px-1 font-mono text-muted-foreground min-h-5 border-0 gap-x-1")} data-jira-chip="">
+        <span className={cn(chip, "flex-wrap gap-x-1")} data-jira-chip="">
           <JiraMark />
           {links.map((l) => {
             const t = ticketByKey[l.key];
@@ -141,7 +142,7 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
         </span>
       ) : null}
       {record?.doneCheck?.verdict === "pending-confirm" && record.doneCheck.reasons.length > 0 ? (
-        <span className="w-full truncate text-[10px] text-muted-foreground" data-jira-confirm-note="">{record.doneCheck.reasons[0]}</span>
+        <span className={cn(chip, "w-full min-w-0 font-sans")} data-jira-confirm-note=""><span className="truncate">{record.doneCheck.reasons[0]}</span></span>
       ) : null}
       {record?.doneCheck?.verdict === "pending-confirm" ? (
         <button type="button" className={cn(chip, "underline")} onClick={() => onAction("confirm-done", threadId)}>
@@ -175,7 +176,7 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
           ))}
         </ul>
       ) : record?.reason ? (
-        <span className="w-full truncate text-[10px] text-muted-foreground">{record.reason}</span>
+        <span className={cn(chip, "w-full min-w-0 font-sans")} data-jira-reason=""><span className="truncate">{record.reason}</span></span>
       ) : null}
       {menuReason !== undefined ? (
         // The menu renders inside the card: its backdrop clicks must not reach the card's own handlers.

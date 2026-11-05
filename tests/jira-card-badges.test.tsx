@@ -205,4 +205,23 @@ describe("JiraCardBadges: the deeper check's next step (Task 11)", () => {
     expect(screen.getByText("Couldn't check PRs: confirm done")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Confirm done" })).toBeTruthy();
   });
+
+  it("No ticket, verifying, reason and the no-data note share the ticket chip's shell (muted fill, no border)", () => {
+    const shell = (el: Element | null) => {
+      expect(el).not.toBeNull();
+      const c = (el as HTMLElement).className;
+      expect(c).toContain("bg-muted");
+      expect(c).toContain("min-h-5");
+      expect(c).not.toMatch(/\bborder\b/);
+    };
+    const { container, rerender } = render(<JiraCardBadges {...props} record={rec({ links: [] })} />);
+    shell(screen.getByText("No ticket").closest("[data-jira-chip]"));
+    rerender(<JiraCardBadges {...props} record={rec({ verifying: { startedAt: "2026-11-05T00:00:00Z", reasons: ["checking PRs"] } })} />);
+    shell(container.querySelector("[data-jira-verifying]"));
+    rerender(<JiraCardBadges {...props} record={rec({ reason: "waiting on review (#645)" })} />);
+    shell(container.querySelector("[data-jira-reason]"));
+    rerender(<JiraCardBadges {...props} record={rec({ doneCheck: { at: "2026-11-05T00:00:00Z", verdict: "pending-confirm", reasons: ["Couldn't check PRs: confirm done"] } })} />);
+    shell(container.querySelector("[data-jira-confirm-note]"));
+    shell(container.querySelector("[data-jira-chip]"));
+  });
 });
