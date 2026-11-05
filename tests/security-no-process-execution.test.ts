@@ -10,14 +10,18 @@
 // lib/tracker-refresh.ts that only `npm run gates` saw) can never ship a
 // merge unnoticed again.
 //
-// Unlike the fetch backstop, the shipped-code rule here has NO exceptions
-// to share a seam table with: the gate scans raw lines, comments included
+// The rule has exactly ONE exception, the fork's deliberate one (operator
+// decision, 2026-11): lib/jira-exec.ts may run `acli` and `gh` (the Jira
+// sync), through execFile with an argument array, never a shell. The seam
+// and its shape check live once in scripts/security-seams.mjs, consumed by
+// both the gate and this test. The gate scans raw lines, comments included
 // (a comment naming `child_process` still trips the real gate), so this
-// test scans the same way — zero `child_process` occurrences across the
-// complete shipped file set, backstop code excluded.
+// test scans the same way: zero `child_process` occurrences across the
+// shipped file set outside the seam, backstop code excluded.
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { execSeamViolations, PROCESS_EXEC_SEAM, PROCESS_EXEC_TOOLS } from "../scripts/security-seams.mjs";
 
 function listFiles(dir: string, acc: string[] = []): string[] {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -51,9 +55,10 @@ describe("process-execution backstop (shipped code, suite-level)", () => {
     expect(CHILD_PROCESS.test('import { readFileSync } from "node:fs";')).toBe(false);
   });
 
-  it("shipped code never references child_process (the no-process law)", () => {
+  it("shipped code never references child_process outside the one seam (the no-process law)", () => {
     const failures: string[] = [];
     for (const file of shippedFiles) {
+      if (file === PROCESS_EXEC_SEAM) continue;
       const source = readFileSync(file, "utf8");
       source.split("\n").forEach((line, index) => {
         if (CHILD_PROCESS.test(line)) {
@@ -64,5 +69,35 @@ describe("process-execution backstop (shipped code, suite-level)", () => {
     // Backstop code (this test's own walker) is outside the shipped set:
     // `listFiles` runs from the repo root, so tests/ is never scanned.
     expect(failures).toEqual([]);
+  });
+
+  it("shell:true stays banned everywhere, the seam included", () => {
+    const hits = shippedFiles.filter((f) => /shell:\s*true/.test(readFileSync(f, "utf8")));
+    expect(hits).toEqual([]);
+  });
+
+  it("the seam is lib/jira-exec.ts, it exists, and it runs only acli and gh through execFile", () => {
+    expect(PROCESS_EXEC_SEAM).toBe("lib/jira-exec.ts");
+    expect(shippedFiles).toContain(PROCESS_EXEC_SEAM);
+    expect(PROCESS_EXEC_TOOLS).toEqual(["acli", "gh"]);
+    expect(execSeamViolations(readFileSync(PROCESS_EXEC_SEAM, "utf8"))).toEqual([]);
+  });
+
+  it("the seam check rejects a shell, other exec calls, and any third tool", () => {
+    const ok = readFileSync(PROCESS_EXEC_SEAM, "utf8");
+    expect(execSeamViolations(ok.replace("shell: false", "shell: true"))).not.toEqual([]);
+    expect(execSeamViolations(ok + "\nexec(cmd);\n")).not.toEqual([]);
+    expect(execSeamViolations(ok + "\nexecSync(cmd);\n")).not.toEqual([]);
+    expect(execSeamViolations(ok + "\nspawn(cmd);\n")).not.toEqual([]);
+    expect(execSeamViolations(ok.replace('["acli", "gh"]', '["acli", "gh", "bash"]'))).not.toEqual([]);
+    expect(execSeamViolations(ok.replace('"acli" | "gh"', '"acli" | "gh" | "bb"'))).not.toEqual([]);
+    expect(execSeamViolations(ok.replace(/execFile\(/g, "run("))).not.toEqual([]);
+  });
+
+  it("another shipped file mentioning child_process still fails the scan", () => {
+    const scan = (file: string, source: string) =>
+      file === PROCESS_EXEC_SEAM ? [] : source.split("\n").filter((l) => CHILD_PROCESS.test(l));
+    expect(scan("lib/jira-server.ts", 'import { execFile } from "node:child_process";')).toHaveLength(1);
+    expect(scan("lib/jira-sync-core.ts", "// child_process lives in jira-exec")).toHaveLength(1);
   });
 });

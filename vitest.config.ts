@@ -21,6 +21,9 @@ export default defineConfig({
     // idle versus 204-261s under a load average of 86-120. 20s keeps a
     // genuinely hung test failing, just later than it used to.
     testTimeout: 20_000,
+    // No test runs the real acli/gh: lib/jira-exec's runTool is mocked for
+    // every file (tests/helpers/no-real-tools.ts).
+    setupFiles: ["tests/helpers/no-real-tools.ts"],
     // Sibling worktrees live in `.worktrees/` and each carries the whole
     // repo's tests; without this exclude a run from a checkout that hosts
     // worktrees double-runs every suite against foreign working trees

@@ -10,7 +10,7 @@
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { seamForFetch } from "./security-seams.mjs";
+import { execSeamViolations, PROCESS_EXEC_SEAM, seamForFetch } from "./security-seams.mjs";
 import { notifyGateFailure } from "./release-notify.mjs";
 
 let failed = false;
@@ -97,9 +97,22 @@ for (const hit of iconSink) {
 }
 
 // Process execution: none in the plugin runtime (dev-only scripts excluded
-// from the scan set by construction).
+// from the scan set by construction), with exactly ONE exception: the
+// fork's Jira sync seam lib/jira-exec.ts (operator decision, 2026-11), which
+// may run only `acli` and `gh` through execFile with an argument array. Its
+// shape is checked by execSeamViolations (scripts/security-seams.mjs, shared
+// with tests/security-no-process-execution.test.ts). shell:true stays
+// banned everywhere, the seam included (the scan below).
 for (const hit of findLines("child_process")) {
+  if (hit.startsWith(`${PROCESS_EXEC_SEAM}:`)) continue;
   violation(`child_process in shipped code → ${hit}`);
+}
+const seamSource = sources.find(({ file }) => file === PROCESS_EXEC_SEAM)?.source;
+if (seamSource === undefined) {
+  violation(`process-exec seam ${PROCESS_EXEC_SEAM} not found — the scan may be broken`);
+} else {
+  for (const v of execSeamViolations(seamSource)) violation(`${PROCESS_EXEC_SEAM}: ${v}`);
+  report(`process-exec seam checked (acli and gh via execFile only): ${PROCESS_EXEC_SEAM}`);
 }
 for (const hit of findLines("shell:\\s*true")) {
   violation(`shell:true in shipped code → ${hit}`);

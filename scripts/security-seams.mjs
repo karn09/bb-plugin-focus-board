@@ -51,3 +51,42 @@ export function seamForFetch(file, lineText) {
   }
   return null;
 }
+/**
+ * The one shipped file allowed to run a process: the fork's deliberate
+ * exception (operator decision, 2026-11). The built-in Jira sync runs
+ * exactly `acli` and `gh` through it. Every other shipped file must not
+ * mention child_process at all, and `shell: true` is banned everywhere,
+ * this file included. Consumed by scripts/security-gates.mjs and
+ * tests/security-no-process-execution.test.ts.
+ */
+export const PROCESS_EXEC_SEAM = "lib/jira-exec.ts";
+export const PROCESS_EXEC_TOOLS = ["acli", "gh"];
+
+/**
+ * What is wrong with the seam's source, as violation lines ([] = ok): it
+ * must call execFile (argument array, no shell), never any other way of
+ * starting a process, and name exactly the two tools above (its tool type
+ * and its runtime allowlist both).
+ */
+export function execSeamViolations(source) {
+  const out = [];
+  if (!/\bexecFile\(/.test(source)) out.push("no execFile( call");
+  for (const [re, what] of [
+    [/shell:\s*true/, "shell: true"],
+    [/shell:(?!\s*false\b)/, "a shell option other than false"],
+    [/\bexec\(/, "exec("],
+    [/\bexecSync\b|\bexecFileSync\b|\bspawnSync\b/, "a synchronous exec"],
+    [/\bspawn\b/, "spawn"],
+    [/\bfork\(/, "fork("],
+  ]) {
+    if (re.test(source)) out.push(`uses ${what}`);
+  }
+  const imports = source.match(/^import .*child_process.*$/gm) ?? [];
+  if (imports.length !== 1 || !/^import \{ execFile \} from "node:child_process";$/.test(imports[0])) {
+    out.push(`child_process import must be exactly \`import { execFile } from "node:child_process";\` (found ${imports.length})`);
+  }
+  const quoted = PROCESS_EXEC_TOOLS.map((t) => `"${t}"`);
+  if (!new RegExp(`export type JiraTool = ${quoted.join(" \\| ")};`).test(source)) out.push(`JiraTool type must be exactly ${quoted.join(" | ")}`);
+  if (!new RegExp(`const TOOLS: readonly string\\[\\] = \\[${quoted.join(", ")}\\];`).test(source)) out.push(`TOOLS allowlist must be exactly [${quoted.join(", ")}]`);
+  return out;
+}
