@@ -119,6 +119,18 @@ describe("descriptionText", () => {
     expect(descriptionText({ foo: 1 })).toBeUndefined();
     expect(descriptionText({ type: "doc", content: [] })).toBeUndefined();
   });
+  it("a 10,000-deep tree is cut at the depth cap instead of blowing the stack", () => {
+    let deep: Record<string, unknown> = { type: "text", text: "bottom" };
+    for (let i = 0; i < 10_000; i++) deep = { type: "blockquote", content: [deep] };
+    expect(() => descriptionText({ type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "top" }] }, deep] })).not.toThrow();
+    expect(descriptionText({ type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "top" }] }, deep] })).toBe("top");
+  });
+  it("a description that throws costs only the description, not the fetch", () => {
+    const evil = { type: "doc", get content() { throw new Error("bad tree"); } };
+    const t = toTicket(issue("ENG-1", { description: evil }), "me1");
+    expect(t.key).toBe("ENG-1");
+    expect(t).not.toHaveProperty("description");
+  });
   it("caps at 2,000 chars with …", () => {
     const d = descriptionText("x".repeat(5_000))!;
     expect(d).toHaveLength(2_000);

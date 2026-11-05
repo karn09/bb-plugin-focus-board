@@ -55,7 +55,12 @@ export function toTicket(raw: Raw, meAccountId: string): JiraTicket {
   const a = f.assignee;
   const parent = f.parent?.key && KEY.test(f.parent.key) ? f.parent : null;
   const type = f.issuetype?.name ?? "";
-  const desc = descriptionText(f.description);
+  let desc: string | undefined;
+  try {
+    desc = descriptionText(f.description);
+  } catch {
+    desc = undefined; // a bad description costs only itself, never the fetch
+  }
   return {
     key: raw.key,
     summary: f.summary ?? "",
@@ -76,13 +81,14 @@ export function toTicket(raw: Raw, meAccountId: string): JiraTicket {
 }
 
 const DESC_MAX = 2_000;
-/** Plain text of one ADF node: blocks end in a blank line, list items read "- ". */
-function adfText(n: Raw): string {
-  if (!n || typeof n !== "object") return "";
+const ADF_MAX_DEPTH = 50;
+/** Plain text of one ADF node: blocks end in a blank line, list items read "- ". Deeper than the cap is dropped. */
+function adfText(n: Raw, depth = 0): string {
+  if (!n || typeof n !== "object" || depth > ADF_MAX_DEPTH) return "";
   if (n.type === "text") return typeof n.text === "string" ? n.text : "";
   if (n.type === "hardBreak") return "\n";
   if (n.type === "mention") return typeof n.attrs?.text === "string" ? n.attrs.text : "";
-  const inner = Array.isArray(n.content) ? n.content.map(adfText).join("") : "";
+  const inner = Array.isArray(n.content) ? n.content.map((c: Raw) => adfText(c, depth + 1)).join("") : "";
   if (n.type === "listItem") return `- ${inner.trim()}\n`;
   if (n.type === "paragraph" || n.type === "heading" || n.type === "codeBlock" || n.type === "blockquote") return `${inner}\n\n`;
   if (n.type === "bulletList" || n.type === "orderedList") return `${inner}\n`;
