@@ -1263,9 +1263,15 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         const ids = [...new Set([...mine.map((o) => o.id), ...(opIds ?? [])])].filter((id) => !foreign.has(id));
         if (ids.length === 0) return { ok: true, ...none };
         const { cancelled, tooLate } = await store.cancel(ids);
-        // Every Done write of a passed check cancelled: the Done itself is undone, the card returns to its lane.
-        const undoneDone = tooLate.length === 0 && mine.some((o) => cancelled.includes(o.id) && isDoneOp(o));
-        if (undoneDone && (await store.readThread(threadId)).doneCheck?.verdict === "pass") {
+        // Every linked ticket's Done writes cancelled now (none already sent or being sent): the Done itself
+        // is undone and the card returns to its lane. A key with no pending Done op had its writes sent.
+        const rec = await store.readThread(threadId);
+        const doneOps = mine.filter(isDoneOp);
+        const keyUndone = (key: string) => {
+          const ops = doneOps.filter((o) => "key" in o && o.key === key);
+          return ops.length > 0 && ops.every((o) => cancelled.includes(o.id));
+        };
+        if (rec.links.length > 0 && rec.links.every((l) => keyUndone(l.key)) && rec.doneCheck?.verdict === "pass") {
           await deps.unmarkDone?.(threadId);
           await store.writeThread(threadId, { doneCheck: null });
         }

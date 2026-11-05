@@ -684,6 +684,21 @@ describe("Done check flow", () => {
     expect(harness.inspection.realtimeSignals).not.toContainEqual({ channel: "done-changed", payload: { threadId: "t1", done: false } });
   });
 
+  it("undo with two linked tickets where A's Done ops were already sent: B's are cancelled, Done stays", async () => {
+    seed("t1", { links: [{ key: "PT-1", role: "owner", source: "auto" }, { key: "PT-2", role: "owner", source: "auto" }] });
+    metadata.get("t1")![DONE_METADATA_KEY] = { doneAt: "2026-10-01T00:00:00.000Z" };
+    metadata.get("t1")!.jira = { ...(metadata.get("t1")!.jira as object), doneCheck: { at: "x", verdict: "pass", reasons: [] } };
+    await load();
+    // PT-1's comment and transition were acked by an earlier pass; only PT-2's are still queued.
+    await bb.storage.kv.set("jira:queue", [
+      { id: "b1", createdAt: "2026-10-01T00:00:00Z", threadId: "t1", op: "comment", key: "PT-2", body: "Focus Board: thread done.\nx" },
+      { id: "b2", createdAt: "2026-10-01T00:00:00Z", threadId: "t1", op: "transition", key: "PT-2", toCategory: "done" },
+    ]);
+    expect(await undo()).toEqual({ ok: true, cancelled: 2, tooLate: 0 });
+    expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
+    expect(jiraOf("t1")?.doneCheck).toMatchObject({ verdict: "pass" });
+  });
+
   it("undo is refused with Jira off or for an unknown thread", async () => {
     seed("t1");
     await load({ enabled: false });
