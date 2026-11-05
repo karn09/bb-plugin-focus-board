@@ -75,6 +75,8 @@ const REFRESH_KEY = "jira:refresh-requested-at";
 const SYNC_RAN_KEY = "jira:script-seen-at";
 /** A pass soon after load and after the sync turns on, so data is fresh without waiting a minute. */
 const SYNC_SOON_MS = 2_000;
+/** Set once the old "PR status unavailable" failed checks were cleared (a one-time startup migration). */
+const MIGRATED_PR_UNAVAILABLE_KEY = "jira:migrated-pr-unavailable";
 export const JIRA_RECONCILE_CHANGED = "jira-reconcile-changed";
 export const JIRA_CHANGED = "jira-changed";
 
@@ -877,6 +879,20 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     }
   };
   resumeChecks().catch((e) => bb.log.warn(`jira: resuming Done checks failed: ${(e as Error).message}`));
+
+  // Before finished PRs stopped bouncing a Done drop, a check without PR data
+  // failed with this one reason. Clear those once (only while on; marked after).
+  const oldPrFail = (r: ThreadJiraRecord) =>
+    r.doneCheck?.verdict === "fail" && r.doneCheck.reasons.length === 1 && r.doneCheck.reasons[0] === "PR status unavailable";
+  const migratePrUnavailable = async () => {
+    if (!(await enabled()) || (await bb.storage.kv.get(MIGRATED_PR_UNAVAILABLE_KEY)) === true) return;
+    for (const { id } of await deps.liveLinks()) {
+      if (!oldPrFail(await store.readThread(id))) continue;
+      await store.updateThread(id, (cur) => (oldPrFail(cur) ? { doneCheck: null, reason: null } : {}));
+    }
+    await bb.storage.kv.set(MIGRATED_PR_UNAVAILABLE_KEY, true);
+  };
+  migratePrUnavailable().catch((e) => bb.log.warn(`jira: clearing old PR-status failures failed: ${(e as Error).message}`));
 
   const confirmDone = async (threadId: string, skip: boolean): Promise<{ ok: boolean; error?: string }> => {
     const rec = await store.readThread(threadId);
