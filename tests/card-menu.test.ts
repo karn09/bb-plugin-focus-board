@@ -72,6 +72,25 @@ function action(inputs: CardMenuInputs, id: string, handlers = makeHandlers()) {
 	return found!;
 }
 
+describe("card menu: Jira's Don't nudge toggle", () => {
+	it("absent with Jira off (noNudge undefined)", () => {
+		const ids = cardMenuActions(makeInputs(), makeHandlers()).map((entry) => entry.id);
+		expect(ids).not.toContain("no-nudge");
+	});
+	it("with Jira on it joins the state group after Group; the label flips and runs the toggle", () => {
+		const handlers = { ...makeHandlers(), toggleNoNudge: vi.fn(noop) };
+		const on = cardMenuActions({ ...makeInputs(), noNudge: false }, handlers);
+		const ids = on.map((entry) => entry.id);
+		expect(ids.indexOf("no-nudge")).toBe(ids.indexOf("group") + 1);
+		const entry = on.find((x) => x.id === "no-nudge")!;
+		expect(entry.label).toBe("Don't nudge this thread");
+		expect(entry.dividerAbove).toBeUndefined();
+		entry.run();
+		expect(handlers.toggleNoNudge).toHaveBeenCalledTimes(1);
+		expect(action({ ...makeInputs(), noNudge: true }, "no-nudge", handlers).label).toBe("Allow nudges");
+	});
+});
+
 describe("card menu grouping", () => {
 	it("the base thread's actions sit in the group order: destinations, state, lineage, lifecycle", () => {
 		const ids = cardMenuActions(makeInputs(), makeHandlers()).map((entry) => entry.id);

@@ -4051,6 +4051,7 @@ export default async function plugin(bb: BbPluginApi) {
             branch: row.environmentBranchName ?? null,
             done: (await readDoneRecord(row.id)) !== null,
             snoozeWakeAt,
+            pinned: row.pinnedAt !== null,
           };
         }),
       );

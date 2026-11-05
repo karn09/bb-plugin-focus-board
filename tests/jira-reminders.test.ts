@@ -190,6 +190,7 @@ describe("reminders on a fake host", () => {
   const metadata = new Map<string, Record<string, unknown>>();
   const status = new Map<string, string>();
   const updatedAt = new Map<string, number>();
+  const pinned = new Set<string>();
   let send: ReturnType<typeof vi.fn>;
   let markUnread: ReturnType<typeof vi.fn>;
   let failWrite: ((set: Record<string, any> | undefined) => boolean) | null = null;
@@ -202,7 +203,7 @@ describe("reminders on a fake host", () => {
       return {};
     });
     const row = (id: string) =>
-      makeThreadResponse({ id, title: `title ${id}`, status: (status.get(id) ?? "idle") as never, updatedAt: updatedAt.get(id) ?? Date.now(), environmentBranchName: null } as never);
+      makeThreadResponse({ id, title: `title ${id}`, status: (status.get(id) ?? "idle") as never, updatedAt: updatedAt.get(id) ?? Date.now(), environmentBranchName: null, pinnedAt: pinned.has(id) ? Date.now() : null } as never);
     const host = createFakePluginHost({
       pluginId: "focus-board",
       settings: { jiraEnabled: opts.enabled ?? true } as never,
@@ -238,6 +239,7 @@ describe("reminders on a fake host", () => {
     metadata.clear();
     status.clear();
     updatedAt.clear();
+    pinned.clear();
   });
   const seed = (id: string, quietDays: number, over: object = {}) => {
     updatedAt.set(id, Date.now() - quietDays * DAY);
@@ -355,6 +357,48 @@ describe("reminders on a fake host", () => {
     vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * DAY + 60_000 }); // wake + nudgeDays
     await tick();
     expect(sentTo()).toEqual(["t1"]);
+  });
+
+  it("a pinned thread is never nudged nor deep-checked", async () => {
+    seed("quiet", 3);
+    seed("deep", 6, { nudgedAt: iso(Date.now() - 4 * DAY) });
+    pinned.add("quiet");
+    pinned.add("deep");
+    await load();
+    await tick();
+    expect(send).not.toHaveBeenCalled();
+    expect(jiraOf("deep").deepCheckedAt).toBeNull();
+    pinned.delete("quiet");
+    await tick();
+    expect(sentTo()).toEqual(["quiet"]);
+  });
+
+  it("Don't nudge: jira_set_no_nudge round-trips through board state; excluded threads get no nudge and no deep check", async () => {
+    seed("quiet", 3);
+    seed("deep", 6, { nudgedAt: iso(Date.now() - 4 * DAY) });
+    await load();
+    const set = (threadId: string, value: boolean) => harness.behavior.callRpc("jira_set_no_nudge", { threadId, value });
+    expect(await set("quiet", true)).toEqual({ ok: true });
+    expect(await set("deep", true)).toEqual({ ok: true });
+    expect(await set("deep", true)).toEqual({ ok: true }); // idempotent
+    expect(await bb.storage.kv.get("jira:no-nudge")).toEqual({ quiet: true, deep: true });
+    expect(((await harness.behavior.callRpc("jira_board_state", null)) as { noNudge: string[] }).noNudge).toEqual(["quiet", "deep"]);
+    await tick();
+    expect(send).not.toHaveBeenCalled();
+    expect(jiraOf("deep").deepCheckedAt).toBeNull();
+    expect(jiraOf("deep").reason).toBeNull();
+    expect(await set("quiet", false)).toEqual({ ok: true });
+    expect(((await harness.behavior.callRpc("jira_board_state", null)) as { noNudge: string[] }).noNudge).toEqual(["deep"]);
+    await tick();
+    expect(sentTo()).toEqual(["quiet"]);
+    expect(await set("nope", true)).toMatchObject({ ok: false, error: "unknown thread" });
+  });
+
+  it("jira_set_no_nudge is refused with Jira off", async () => {
+    seed("quiet", 3);
+    await load({ enabled: false });
+    expect(await harness.behavior.callRpc("jira_set_no_nudge", { threadId: "quiet", value: true })).toMatchObject({ ok: false });
+    expect(await bb.storage.kv.get("jira:no-nudge")).toBeUndefined();
   });
 
   it("day 5: the deep check writes findings plugin-side, no turn; the board gets the next step", async () => {

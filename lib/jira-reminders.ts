@@ -21,6 +21,8 @@ export type ReminderThread = Stamps & {
   id: string; archived: boolean; done: boolean; snoozed: boolean; status: string; verifying: boolean;
   /** A failed Done check: its card is already in Needs you with the checklist. */
   checkFailed?: boolean;
+  /** Pinned, or the operator's Don't nudge: never nudged nor deep-checked. */
+  muted?: boolean;
 };
 
 /** The latest of the non-null stamps (epoch ms). */
@@ -40,7 +42,7 @@ export function planReminders(input: { threads: ReminderThread[]; now: number; n
   const deepCheck: string[] = [];
   for (const t of input.threads) {
     // Not enrolled yet: the pass enrolls it now, so the grace period applies.
-    if (t.archived || t.done || t.snoozed || t.verifying || t.checkFailed || t.enrolledAt === null || RUNNING.has(t.status)) continue;
+    if (t.archived || t.done || t.snoozed || t.muted || t.verifying || t.checkFailed || t.enrolledAt === null || RUNNING.has(t.status)) continue;
     // The stretch starts at the last real change; our own nudge and check
     // mark it ("done for this stretch") without restarting it.
     const start = quietSince({ ...t, nudgedAt: null, deepCheckedAt: null });

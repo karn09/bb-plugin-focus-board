@@ -538,13 +538,14 @@ function BoardPage({ subPath }: { subPath: string }) {
     suggestions: { threadId: string; key: string }[]; drift: DriftItem[]; autoLinks: { threadId: string; key: string }[];
     next: NonNullable<JiraBoardValue["nextByThread"]>;
     refreshRequestedAt: number | null; syncRanAt: number | null; syncEnabled: boolean;
-  }>({ enabled: false, stale: false, tickets: {}, threads: {}, pending: [], snapshotAge: null, error: null, suggestions: [], drift: [], autoLinks: [], next: {}, refreshRequestedAt: null, syncRanAt: null, syncEnabled: true });
+    noNudge: ReadonlySet<string>;
+  }>({ enabled: false, stale: false, tickets: {}, threads: {}, pending: [], snapshotAge: null, error: null, suggestions: [], drift: [], autoLinks: [], next: {}, refreshRequestedAt: null, syncRanAt: null, syncEnabled: true, noNudge: new Set() });
   const refetchJira = useCallback(() => {
     jiraRpc.call("jira_board_state", null).then(
       async (r) => {
         // The Jira column's suggestions and drift ride the stored reconcile plan.
         const plan = r.enabled ? await jiraRpc.call("jira_reconcile_plan", null).catch(() => null) : null;
-        setJiraState({
+        setJiraState((prev) => ({
           enabled: r.enabled,
           stale: r.stale,
           tickets: Object.fromEntries(r.tickets.map((t) => [t.key, t])),
@@ -559,7 +560,9 @@ function BoardPage({ subPath }: { subPath: string }) {
           refreshRequestedAt: r.refreshRequestedAt,
           syncRanAt: r.syncRanAt,
           syncEnabled: r.syncEnabled,
-        });
+          // Same members keep the same Set: the card menu builder depends on it.
+          noNudge: prev.noNudge.size === r.noNudge.length && r.noNudge.every((id) => prev.noNudge.has(id)) ? prev.noNudge : new Set(r.noNudge),
+        }));
       },
       () => {}, // Jira is optional state; the board works without it.
     );
@@ -3272,6 +3275,7 @@ function BoardPage({ subPath }: { subPath: string }) {
             threadState(thread, errorAckIds) === "attention" &&
             !thread.hasPendingInteraction &&
             !errorAckIds.has(thread.id),
+          noNudge: jiraState.enabled ? jiraState.noNudge.has(thread.id) : undefined,
         },
         {
           revealBrowserTabs: () => {
@@ -3293,6 +3297,11 @@ function BoardPage({ subPath }: { subPath: string }) {
             void window.open(url, "_blank", "noopener");
           },
           openNewChild: () => openNewChildThread(thread.id),
+          toggleNoNudge: () => {
+            jiraRpc
+              .call("jira_set_no_nudge", { threadId: thread.id, value: !jiraState.noNudge.has(thread.id) })
+              .then(refetchJira, () => {});
+          },
           zoomToFamily: () => {
             // Zoom to family (issue #170): the Parent view scoped to the
             // card's OWN family root — a nested row's write names the
@@ -3430,7 +3439,7 @@ function BoardPage({ subPath }: { subPath: string }) {
         },
       }));
     },
-    [actions, applyUnreadStateEffects, clearParkPin, clearSnooze, doneAgeSource, doneIds, exitPinnedLane, familyIndex, filter, groupAssignments, openNewChildThread, pendingStateClaimsRef, persistFilter, persistGroupBy, releaseAttentionFor, requestReveal, restoreParkedPin, runBrowserReveal, rpc, setBrowserNotice, setDoneExtras, setDoneIds, setGroupDialogFor, setSnoozeDialogFor, snoozedIds, sdk],
+    [actions, applyUnreadStateEffects, clearParkPin, clearSnooze, doneAgeSource, doneIds, exitPinnedLane, familyIndex, filter, groupAssignments, openNewChildThread, pendingStateClaimsRef, persistFilter, persistGroupBy, releaseAttentionFor, requestReveal, restoreParkedPin, runBrowserReveal, rpc, setBrowserNotice, setDoneExtras, setDoneIds, setGroupDialogFor, setSnoozeDialogFor, snoozedIds, sdk, jiraState.enabled, jiraState.noNudge, jiraRpc, refetchJira],
   );
 
   if (sidebarStatus === "loading" && threads.length === 0) {

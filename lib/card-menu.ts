@@ -70,6 +70,8 @@ export interface CardMenuInputs {
    * entry's shape.
    */
   inFamily: boolean;
+  /** Jira on: whether the operator turned nudges off for this thread; undefined (Jira off) shows no entry. */
+  noNudge?: boolean;
 }
 
 export interface CardMenuHandlers {
@@ -102,6 +104,8 @@ export interface CardMenuHandlers {
    * browser: the system browser on desktop, a detached tab on the web).
    */
   openInBrowser: (href: string) => void;
+  /** Jira's Don't nudge / Allow nudges (jira_set_no_nudge). */
+  toggleNoNudge?: () => void;
 }
 
 export function cardMenuActions(
@@ -189,6 +193,16 @@ export function cardMenuActions(
     },
     ...snoozeEntries,
     ...groupEntries,
+    ...(inputs.noNudge !== undefined && handlers.toggleNoNudge
+      ? [
+          {
+            id: "no-nudge",
+            label: inputs.noNudge ? "Allow nudges" : "Don't nudge this thread",
+            icon: inputs.noNudge ? "BellDot" : "BellOff",
+            run: handlers.toggleNoNudge,
+          } satisfies CardMenuAction,
+        ]
+      : []),
     ...(inFamily
       ? [
           {

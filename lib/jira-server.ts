@@ -55,7 +55,7 @@ export type JiraDeps = {
   /** Publish done-changed { done: false }: a check ended without a stamp, so boards drop their optimistic Done. */
   notDone?: (threadId: string) => void;
   /** Live threads for the reminder pass: status, last activity (epoch ms), Done, snooze wake (epoch ms, null when not snoozed). */
-  reminderThreads?: () => Promise<{ id: string; status: string; updatedAt: number; branch: string | null; done: boolean; snoozeWakeAt: number | null }[]>;
+  reminderThreads?: () => Promise<{ id: string; status: string; updatedAt: number; branch: string | null; done: boolean; snoozeWakeAt: number | null; pinned?: boolean }[]>;
 };
 
 const PLAN_KEY = "jira:reconcile-plan";
@@ -69,6 +69,8 @@ const VERIFY_SENT_KEY = "jira:verify-sent";
 const NUDGE_TURNS_KEY = "jira:nudge-turns";
 /** threadId → the snooze wake seen (epoch ms): the quiet clock restarts there. */
 const SNOOZE_SEEN_KEY = "jira:snooze-seen";
+/** threadId → true: the operator's Don't nudge (the card menu); no nudge turn, no deeper check. */
+const NO_NUDGE_KEY = "jira:no-nudge";
 /** threadId → the deeper check's next step, shown while the reason is still that check's. */
 const NEXT_STEPS_KEY = "jira:next-steps";
 /** Column Refresh: when the operator last asked; pending until a newer snapshot lands. */
@@ -117,12 +119,19 @@ export const jiraRpcContract = defineRpcContract({
       syncRanAt: z.number().nullable(),
       /** The jiraSync setting: false means nothing syncs on its own. */
       syncEnabled: z.boolean(),
+      /** Threads the operator excluded from nudges (Don't nudge). */
+      noNudge: z.array(z.string()),
     }),
   },
   /** A card's Undo: cancel the thread's queued writes not sent yet (opIds: the ones the card showed, so already-sent ones count as tooLate). */
   jira_undo: {
     input: z.object({ threadId: z.string(), opIds: z.array(z.string()).optional() }),
     output: z.object({ ok: z.boolean(), cancelled: z.number().int(), tooLate: z.number().int(), error: z.string().optional() }),
+  },
+  /** The card menu's Don't nudge / Allow nudges. */
+  jira_set_no_nudge: {
+    input: z.object({ threadId: z.string(), value: z.boolean() }),
+    output: z.object({ ok: z.boolean(), error: z.string().optional() }),
   },
   /** Column Refresh: record the request and start a full pass now. */
   jira_refresh: { input: z.null(), output: z.object({ ok: z.boolean(), error: z.string().optional() }) },
@@ -1038,6 +1047,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   const nudgeTurns = persisted<NudgeTurn>(NUDGE_TURNS_KEY);
   const snoozeSeen = persisted<number>(SNOOZE_SEEN_KEY);
   const nextSteps = persisted<z.infer<typeof NextStep>>(NEXT_STEPS_KEY);
+  const noNudge = persisted<true>(NO_NUDGE_KEY);
 
   /** A failed Done check owns the card while its reason shows; once activity clears the reason, normal reminders resume. */
   const checkHolds = (r: ThreadJiraRecord) => r.verifying !== null || (r.doneCheck?.verdict === "fail" && r.reason !== null);
@@ -1124,7 +1134,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       if (!s.enabled || !deps.reminderThreads) return;
       // Not until the enable's reconcile (the enrollment reset) has landed: a stale enrolledAt would nudge at once.
       if ((await bb.storage.kv.get(ENABLED_SEEN_KEY)) !== true) return;
-      await Promise.all([nudgeTurns.loaded, snoozeSeen.loaded, nextSteps.loaded]);
+      await Promise.all([nudgeTurns.loaded, snoozeSeen.loaded, nextSteps.loaded, noNudge.loaded]);
       const now = Date.now();
       const { snapshot, stale } = await store.readSnapshot();
       const allPrs = snapshot?.prs ?? [];
@@ -1154,6 +1164,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         facts.set(row.id, { rec, prs, missing, lastActivityAt });
         threads.push({
           id: row.id, archived: false, done: row.done, snoozed, status: row.status, verifying: rec.verifying !== null,
+          muted: row.pinned === true || noNudge.map.has(row.id),
           checkFailed: rec.doneCheck?.verdict === "fail" && rec.reason !== null,
           // The later of the record's and the marker's nudge: a marker is a sent nudge even when its nudgedAt write failed.
           lastActivityAt, enrolledAt: ms(rec.enrolledAt), nudgedAt: laterOf(ms(rec.nudgedAt), marker?.at), deepCheckedAt: ms(rec.deepCheckedAt),
@@ -1213,11 +1224,11 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     },
     jira_board_state: async () => {
       const s = jiraSettings(await deps.settings());
-      if (!s.enabled) return { enabled: false, snapshotAge: null, stale: false, error: null, tickets: [], threads: {}, pending: {}, next: {}, refreshRequestedAt: null, syncRanAt: null, syncEnabled: false };
+      if (!s.enabled) return { enabled: false, snapshotAge: null, stale: false, error: null, tickets: [], threads: {}, pending: {}, next: {}, refreshRequestedAt: null, syncRanAt: null, syncEnabled: false, noNudge: [] };
       const { snapshot, ageMs, stale, error } = await store.readSnapshot();
       const threads: Record<string, ThreadJiraRecord> = {};
       for (const { id } of await deps.liveLinks()) threads[id] = await store.readThread(id);
-      await nextSteps.loaded;
+      await Promise.all([nextSteps.loaded, noNudge.loaded]);
       const next = Object.fromEntries([...nextSteps.map].filter(([id, n]) => threads[id]?.reason === n.reason));
       return {
         enabled: true,
@@ -1231,7 +1242,15 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         refreshRequestedAt: await refreshPending(snapshot),
         syncRanAt: await num(SYNC_RAN_KEY),
         syncEnabled: s.sync,
+        noNudge: [...noNudge.map.keys()],
       };
+    },
+    jira_set_no_nudge: async ({ threadId, value }) => {
+      if (!(await enabled())) return { ok: false, error: OFF };
+      if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread" };
+      await noNudge.set(threadId, value ? true : undefined);
+      bb.realtime.publish(JIRA_CHANGED, {});
+      return { ok: true };
     },
     jira_undo: async ({ threadId, opIds }) => {
       const none = { cancelled: 0, tooLate: 0 };
