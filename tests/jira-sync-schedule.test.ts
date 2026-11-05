@@ -158,6 +158,47 @@ describe("built-in Jira sync", () => {
     expect((await state()).refreshRequestedAt).toBeNull();
   });
 
+  it("Refresh during a drain-only pass: a full fetch follows at once, without the next tick", async () => {
+    await load();
+    await harness.runSchedule("jira-sync"); // fresh data: the next pass only drains
+    await new Promise((r) => setTimeout(r, 5));
+    await jira.store.enqueue({ op: "assign", key: "PT-1", to: "me", threadId: null });
+    hold();
+    const drain = harness.runSchedule("jira-sync"); // stuck on the assign call
+    await flush();
+    expect(await harness.behavior.callRpc("jira_refresh", null)).toEqual({ ok: true }); // joins the drain-only pass
+    await flush();
+    release!();
+    await drain;
+    await flush();
+    expect(searches()).toBe(2); // the joined kick still got its full fetch
+    expect((await state()).refreshRequestedAt).toBeNull();
+  });
+
+  it("Refresh with jiraSync off still runs a pass (the banner's Run sync now)", async () => {
+    await load({ jiraEnabled: true, jiraSync: false });
+    await harness.behavior.callRpc("jira_refresh", null);
+    await flush();
+    expect(searches()).toBe(1);
+  });
+
+  it("`jira sync` waits out running passes (and their reruns) and then runs its own full one", async () => {
+    await load();
+    await harness.runSchedule("jira-sync");
+    await new Promise((r) => setTimeout(r, 5));
+    await jira.store.enqueue({ op: "assign", key: "PT-1", to: "me", threadId: null });
+    hold();
+    const drain = harness.runSchedule("jira-sync");
+    await flush();
+    await harness.behavior.callRpc("jira_refresh", null); // a rerun is now owed after the drain
+    const cli = harness.behavior.runCli(["jira", "sync"]);
+    await flush();
+    release!();
+    await drain;
+    expect((await cli).exitCode).toBe(0);
+    expect(searches()).toBe(3); // first pass, the Refresh rerun, then the CLI's own
+  });
+
   it("a Done check waiting on PR data kicks a pass", async () => {
     await load();
     await harness.runSchedule("jira-sync");

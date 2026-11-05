@@ -167,6 +167,19 @@ describe("sync pass", () => {
     expect(acliCalls().some((a) => a.join(" ").includes("project in (ENG)"))).toBe(true);
   });
 
+  it("a malformed key in a search result is never viewed or put into JQL", async () => {
+    wanted = { ...wanted, linkedKeys: ["ENG-7"] };
+    rules.acli = [
+      { match: "assignee = currentUser()", stdout: JSON.stringify([issue("ENG-1"), issue("ENG-1) OR project = X OR (key = ENG-2")]) },
+      { match: "key in (ENG-7)", stdout: JSON.stringify([issue("eng 7; drop"), issue("ENG-7")]) },
+    ];
+    await pass();
+    expect(snap().tickets.map((t) => t.key)).toEqual(["ENG-1", "ENG-7"]);
+    const lines = acliCalls().map((a) => a.join(" "));
+    expect(lines.some((l) => l.includes("OR project = X"))).toBe(false);
+    expect(lines.some((l) => l.includes("drop"))).toBe(false);
+  });
+
   it("fetches PRs and mentions", async () => {
     wanted = { ...wanted, linkedKeys: ["ENG-1"], prRefs: [{ repo: "o/r", number: 7 }] };
     rules.acli = [{ match: "search", stdout: JSON.stringify([issue("ENG-1")]) }];

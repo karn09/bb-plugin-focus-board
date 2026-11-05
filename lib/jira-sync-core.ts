@@ -166,11 +166,13 @@ export function createSyncCore(deps: SyncDeps) {
   async function fetchTickets(wanted: SyncWanted) {
     const projects = wanted.projects.filter((p) => PROJ.test(p));
     const linked = wanted.linkedKeys.filter((k) => KEY.test(k));
-    const mine = await search(
+    // A result key goes into `view <key>` and `parent = <key>`: only well-formed keys get that far.
+    const wellFormed = (list: Raw[]) => list.filter((i) => typeof i?.key === "string" && KEY.test(i.key));
+    const mine = wellFormed(await search(
       `assignee = currentUser() AND resolution = Unresolved${projects.length ? ` AND project in (${projects.join(",")})` : ""}`,
-    );
+    ));
     const mineKeys = new Set(mine.map((i) => i.key));
-    const extra = linked.length ? (await search(`key in (${linked.join(",")})`)).filter((i) => !mineKeys.has(i.key)) : [];
+    const extra = linked.length ? wellFormed(await search(`key in (${linked.join(",")})`)).filter((i) => !mineKeys.has(i.key)) : [];
     // `me` comes from the assignee of the currentUser() query; "" when we have no tickets (acli has no whoami).
     const me: string = mine.find((i) => i.fields?.assignee?.accountId)?.fields.assignee.accountId ?? "";
     const tickets = await pool([...mine, ...extra], 5, async (i) => {

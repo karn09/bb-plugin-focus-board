@@ -344,9 +344,23 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       if (!disposed) await ingestSnap(snap);
     },
   });
-  /** One sync pass; a call while one runs joins it. manual: `jira sync` (runs with jiraSync off, always a full fetch). */
-  const syncPass = (manual = false): Promise<void> =>
-    (syncing ??= (async () => {
+  // A kick that joins a running pass came after that pass read what it wants
+  // (maybe drain-only): one more pass runs right after it.
+  let rerun = false;
+  let rerunManual = false;
+  /**
+   * One sync pass; a call while one runs joins it (a kick also owes a rerun).
+   * manual: `jira sync` and Refresh (run with jiraSync off, always a full fetch).
+   */
+  const syncPass = (manual = false, kick = false): Promise<void> => {
+    if (syncing) {
+      if (kick || manual) {
+        rerun = true;
+        rerunManual ||= manual;
+      }
+      return syncing;
+    }
+    return (syncing = (async () => {
       try {
         const s = jiraSettings(await deps.settings());
         if (disposed || !s.enabled || (!manual && !s.sync)) return;
@@ -356,15 +370,22 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         await core.pass();
       } finally {
         syncing = null;
+        if (rerun && !disposed) {
+          const again = rerunManual;
+          rerun = rerunManual = false;
+          void syncPass(again).catch(syncFailed);
+        }
       }
     })());
+  };
   const syncFailed = (e: unknown) => bb.log.warn(`jira sync failed: ${(e as Error).message}`);
-  /** Start a pass now without waiting for it (Refresh, a Done data wait). */
-  const kickSync = () => void syncPass().catch(syncFailed);
+  /** Start a pass now without waiting for it (a Done data wait; manual: Refresh). */
+  const kickSync = (manual = false) => void syncPass(manual, true).catch(syncFailed);
   let soonTimer: ReturnType<typeof setTimeout> | undefined;
   function syncSoon() {
+    if (disposed) return;
     clearTimeout(soonTimer);
-    soonTimer = setTimeout(kickSync, SYNC_SOON_MS);
+    soonTimer = setTimeout(() => kickSync(), SYNC_SOON_MS);
   }
   bb.background.schedule("jira-sync", "* * * * *", () => syncPass().catch(syncFailed));
 
@@ -421,7 +442,8 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     async run() {
       if (!(await enabled())) return fail(OFF);
       try {
-        await syncing?.catch(() => undefined); // a running pass may not be a full one: run our own after it
+        // A running pass (or the rerun it starts) may not be a full one: never join it, run our own after.
+        while (syncing) await syncing.catch(() => undefined);
         await syncPass(true);
       } catch (e) {
         return fail(`jira sync failed: ${(e as Error).message}`);
@@ -1191,7 +1213,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       if (!(await enabled())) return { ok: false, error: OFF };
       await bb.storage.kv.set(REFRESH_KEY, Date.now());
       bb.realtime.publish(JIRA_CHANGED, {});
-      kickSync(); // not awaited: the pass lands in seconds and publishes jira-changed
+      kickSync(true); // not awaited: the pass lands in seconds and publishes jira-changed; runs with jiraSync off too
       return { ok: true };
     },
     jira_card_action: async ({ kind, threadId, index, reason }) => {

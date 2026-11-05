@@ -39,6 +39,16 @@ function listFiles(dir: string, acc: string[] = []): string[] {
 const shippedFiles = ["server.ts", "app.tsx", ...listFiles("lib"), ...listFiles("components")];
 const CHILD_PROCESS = /child_process/;
 
+/** The scan the law test runs: every line naming child_process, outside the one seam. */
+function childProcessHits(file: string, source: string): string[] {
+  if (file === PROCESS_EXEC_SEAM) return [];
+  const hits: string[] = [];
+  source.split("\n").forEach((line, index) => {
+    if (CHILD_PROCESS.test(line)) hits.push(`${file}:${index + 1}: ${line.trim()}`);
+  });
+  return hits;
+}
+
 describe("process-execution backstop (shipped code, suite-level)", () => {
   it("scanned the expected shipped files", () => {
     expect(shippedFiles).toContain("server.ts");
@@ -56,16 +66,7 @@ describe("process-execution backstop (shipped code, suite-level)", () => {
   });
 
   it("shipped code never references child_process outside the one seam (the no-process law)", () => {
-    const failures: string[] = [];
-    for (const file of shippedFiles) {
-      if (file === PROCESS_EXEC_SEAM) continue;
-      const source = readFileSync(file, "utf8");
-      source.split("\n").forEach((line, index) => {
-        if (CHILD_PROCESS.test(line)) {
-          failures.push(`${file}:${index + 1}: ${line.trim()}`);
-        }
-      });
-    }
+    const failures = shippedFiles.flatMap((file) => childProcessHits(file, readFileSync(file, "utf8")));
     // Backstop code (this test's own walker) is outside the shipped set:
     // `listFiles` runs from the repo root, so tests/ is never scanned.
     expect(failures).toEqual([]);
@@ -94,10 +95,17 @@ describe("process-execution backstop (shipped code, suite-level)", () => {
     expect(execSeamViolations(ok.replace(/execFile\(/g, "run("))).not.toEqual([]);
   });
 
+  it("the seam check rejects a dynamic import or require, and child_process off its one import line", () => {
+    const ok = readFileSync(PROCESS_EXEC_SEAM, "utf8");
+    expect(ok).toMatch(/^\/\/.*child_process/m); // a comment naming it stays allowed
+    expect(execSeamViolations(ok + '\nconst cp = await import("node:" + "child_" + "process");\n')).toContain("uses import(");
+    expect(execSeamViolations(ok + '\nconst cp = require("node:child_process");\n')).toContain("uses require(");
+    expect(execSeamViolations(ok + '\nconst m = "node:child_process"; void m;\n')).not.toEqual([]);
+  });
+
   it("another shipped file mentioning child_process still fails the scan", () => {
-    const scan = (file: string, source: string) =>
-      file === PROCESS_EXEC_SEAM ? [] : source.split("\n").filter((l) => CHILD_PROCESS.test(l));
-    expect(scan("lib/jira-server.ts", 'import { execFile } from "node:child_process";')).toHaveLength(1);
-    expect(scan("lib/jira-sync-core.ts", "// child_process lives in jira-exec")).toHaveLength(1);
+    expect(childProcessHits("lib/jira-server.ts", 'import { execFile } from "node:child_process";')).toHaveLength(1);
+    expect(childProcessHits("lib/jira-sync-core.ts", "// child_process lives in jira-exec")).toHaveLength(1);
+    expect(childProcessHits(PROCESS_EXEC_SEAM, 'import { execFile } from "node:child_process";')).toEqual([]);
   });
 });

@@ -65,8 +65,10 @@ export const PROCESS_EXEC_TOOLS = ["acli", "gh"];
 /**
  * What is wrong with the seam's source, as violation lines ([] = ok): it
  * must call execFile (argument array, no shell), never any other way of
- * starting a process, and name exactly the two tools above (its tool type
- * and its runtime allowlist both).
+ * starting a process or loading a module at runtime (no import( / require(),
+ * name child_process only on its one static import line (comment lines
+ * aside), and name exactly the two tools above (its tool type and its
+ * runtime allowlist both).
  */
 export function execSeamViolations(source) {
   const out = [];
@@ -78,6 +80,8 @@ export function execSeamViolations(source) {
     [/\bexecSync\b|\bexecFileSync\b|\bspawnSync\b/, "a synchronous exec"],
     [/\bspawn\b/, "spawn"],
     [/\bfork\(/, "fork("],
+    [/\bimport\s*\(/, "import("],
+    [/\brequire\s*\(/, "require("],
   ]) {
     if (re.test(source)) out.push(`uses ${what}`);
   }
@@ -85,6 +89,10 @@ export function execSeamViolations(source) {
   if (imports.length !== 1 || !/^import \{ execFile \} from "node:child_process";$/.test(imports[0])) {
     out.push(`child_process import must be exactly \`import { execFile } from "node:child_process";\` (found ${imports.length})`);
   }
+  // Anywhere else (a string, a second import) is a way around the shape check; comment lines are fine.
+  const IMPORT_LINE = 'import { execFile } from "node:child_process";';
+  const stray = source.split("\n").filter((l) => /child_process/.test(l) && l !== IMPORT_LINE && !/^\s*(\/\/|\/\*|\*)/.test(l));
+  if (stray.length) out.push(`child_process outside its import line: ${stray[0].trim()}`);
   const quoted = PROCESS_EXEC_TOOLS.map((t) => `"${t}"`);
   if (!new RegExp(`export type JiraTool = ${quoted.join(" \\| ")};`).test(source)) out.push(`JiraTool type must be exactly ${quoted.join(" | ")}`);
   if (!new RegExp(`const TOOLS: readonly string\\[\\] = \\[${quoted.join(", ")}\\];`).test(source)) out.push(`TOOLS allowlist must be exactly [${quoted.join(", ")}]`);
