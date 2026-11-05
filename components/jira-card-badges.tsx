@@ -1,11 +1,12 @@
 // Jira chips and badges on a thread card. JiraCardBadges is pure; the board
 // publishes its state through JiraBoardContext and JiraCardSlot (rendered by
 // the card) reads it, so no prop is threaded through board/parent-lane/card.
-import { createContext, useContext } from "react";
+import { createContext, useContext, useState } from "react";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import type { JiraTicket, QueueOp, ThreadJiraRecord } from "../lib/jira-schema";
 import type { JiraColumnData } from "./jira-column";
+import { MenuPopover, MenuPopoverEntry } from "./menu-popover";
 
 export type JiraCardKind =
   | "find-ticket" | "confirm-done" | "skip-done" | "spin-off"
@@ -41,6 +42,13 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
   const failed = record?.doneCheck?.verdict === "fail" ? record.doneCheck.reasons : [];
   const checkOpen = record?.verifying != null || record?.doneCheck?.verdict === "fail" || record?.doneCheck?.verdict === "pending-confirm";
   const pendingKeys = new Set(pendingOps.filter((o) => "key" in o).map((o) => (o as { key: string }).key));
+  // A failed reason's ⋯ menu: which reason, and where it opens.
+  const [menu, setMenu] = useState<{ index: number; x: number; y: number } | null>(null);
+  const menuReason = menu === null ? undefined : failed[menu.index];
+  const runOnReason = (kind: "spin-off" | "not-needed") => {
+    if (menu !== null && menuReason !== undefined) onAction(kind, threadId, menu.index, menuReason);
+    setMenu(null);
+  };
   return (
     <div className="mt-1 flex flex-wrap items-center gap-1 px-3 pb-2 pl-1.5" data-jira-badges="">
       {links.map((l) => {
@@ -92,7 +100,7 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
           Confirm done
         </button>
       ) : null}
-      {record?.verifying != null || record?.doneCheck?.verdict === "pending-confirm" ? (
+      {checkOpen ? (
         <button type="button" className={cn(chip, "underline")} onClick={() => onAction("keep-working", threadId)}>
           Keep working
         </button>
@@ -100,16 +108,31 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
       {failed.length > 0 ? (
         <ul className="w-full text-[10px] text-muted-foreground" data-jira-reasons="">
           {failed.map((r, i) => (
-            <li key={i} className="flex flex-wrap items-center gap-1">
-              <span className="truncate">{r}</span>
-              <button type="button" className="underline" onClick={() => onAction("spin-off", threadId, i, r)}>Spin off</button>
-              <button type="button" className="underline" onClick={() => onAction("keep-working", threadId)}>Keep working</button>
-              <button type="button" className="underline" onClick={() => onAction("not-needed", threadId, i, r)}>Not needed</button>
+            <li key={i} className="flex items-center gap-1">
+              <span className="min-w-0 truncate">{r}</span>
+              <button
+                type="button"
+                aria-label={`More for: ${r}`}
+                title="Spin off or mark not needed"
+                className="shrink-0 rounded px-0.5 leading-none hover:bg-accent"
+                onClick={(e) => setMenu({ index: i, x: e.clientX, y: e.clientY })}
+              >
+                ⋯
+              </button>
             </li>
           ))}
         </ul>
       ) : record?.reason ? (
         <span className="w-full truncate text-[10px] text-muted-foreground">{record.reason}</span>
+      ) : null}
+      {menuReason !== undefined ? (
+        // The menu renders inside the card: its backdrop clicks must not reach the card's own handlers.
+        <span onClick={(e) => e.stopPropagation()} onContextMenu={(e) => e.stopPropagation()}>
+          <MenuPopover open={menu} onClose={() => setMenu(null)} label="Done check reason" title={menuReason}>
+            <MenuPopoverEntry label="Spin off" icon="GitBranch" onRun={() => runOnReason("spin-off")} />
+            <MenuPopoverEntry label="Not needed" icon="X" onRun={() => runOnReason("not-needed")} />
+          </MenuPopover>
+        </span>
       ) : null}
       {record?.reason && failed.length === 0 && next?.next === "done-check" ? (
         <button type="button" className={cn(chip, "underline")} onClick={() => onAction("run-done-check", threadId)}>

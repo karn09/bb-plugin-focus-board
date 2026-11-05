@@ -64,18 +64,25 @@ describe("JiraCardBadges", () => {
     expect(screen.queryByText("stale")).toBeNull();
     expect(screen.queryByText("pending")).toBeNull();
   });
-  it("failed Done check: a checklist with Spin off / Keep working / Not needed per reason, rendered as text", () => {
+  it("failed Done check: reasons as plain lines, one Keep working, and a ⋯ menu per reason with Spin off / Not needed", () => {
     const onAction = vi.fn();
     const reasons = ["PR #7 still open", "<b>x</b>"];
     render(<JiraCardBadges {...props} onAction={onAction} record={rec({ reason: reasons.join("; "), doneCheck: { at: "x", verdict: "fail", reasons } })} />);
     expect(screen.getByText("<b>x</b>")).toBeTruthy();
     expect(document.querySelector("b")).toBeNull();
     expect(screen.queryByText(reasons.join("; "))).toBeNull(); // the checklist replaces the reason line
-    fireEvent.click(screen.getAllByText("Spin off")[1]!);
+    expect(screen.getAllByText("Keep working")).toHaveLength(1);
+    expect(screen.queryByText("Spin off")).toBeNull(); // one click deep
+    expect(screen.queryByText("Not needed")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "More for: <b>x</b>" }));
+    expect(screen.getByRole("menu").textContent).toContain("<b>x</b>");
+    fireEvent.click(screen.getByRole("menuitem", { name: "Spin off" }));
     expect(onAction).toHaveBeenCalledWith("spin-off", "t1", 1, "<b>x</b>");
-    fireEvent.click(screen.getAllByText("Not needed")[0]!);
+    expect(screen.queryByRole("menu")).toBeNull(); // running an entry closes the menu
+    fireEvent.click(screen.getByRole("button", { name: "More for: PR #7 still open" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Not needed" }));
     expect(onAction).toHaveBeenCalledWith("not-needed", "t1", 0, "PR #7 still open");
-    fireEvent.click(screen.getAllByText("Keep working")[0]!);
+    fireEvent.click(screen.getByText("Keep working"));
     expect(onAction).toHaveBeenCalledWith("keep-working", "t1");
     fireEvent.click(screen.getByText("Mark done anyway"));
     expect(onAction).toHaveBeenCalledWith("skip-done", "t1");
