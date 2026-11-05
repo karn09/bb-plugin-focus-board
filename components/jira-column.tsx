@@ -301,19 +301,30 @@ export function JiraColumnSlot() {
  * while Jira is on and sync can't run, with Run sync now (jira_refresh).
  * Dismissing hides that message for the session; a new one shows again.
  */
+const STARTUP_GRACE_MS = 10_000;
+
 export function JiraSyncBannerSlot() {
   const v = useContext(JiraBoardContext);
   const [dismissed, setDismissed] = useState<string | null>(null);
   const [clock, setClock] = useState(() => Date.now());
+  const [graceOver, setGraceOver] = useState(false);
   const col = v !== null && v.enabled ? v.column : undefined;
   const on = col !== undefined;
   // The no-pass condition comes with time alone: re-check while Jira is on.
   useEffect(() => {
     if (!on) return;
     const t = setInterval(() => setClock(Date.now()), 30_000);
-    return () => clearInterval(t);
+    const grace = setTimeout(() => setGraceOver(true), STARTUP_GRACE_MS);
+    return () => {
+      clearInterval(t);
+      clearTimeout(grace);
+    };
   }, [on]);
-  const message = col === undefined ? null : jiraSyncBannerMessage(col, col.now ?? clock);
+  const now = col?.now ?? clock;
+  const raw = col === undefined ? null : jiraSyncBannerMessage(col, now);
+  // The load pass lands about 2 s in: "hasn't run" waits out a startup grace
+  // so it never flashes (or gets dismissed into a false quiet). Others show at once.
+  const message = raw === NOT_RUNNING && !graceOver ? null : raw;
   // A cleared condition re-arms the dismissal, so the same message can come back.
   useEffect(() => {
     if (message === null) setDismissed(null);

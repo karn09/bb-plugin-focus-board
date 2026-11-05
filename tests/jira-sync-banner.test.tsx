@@ -100,10 +100,50 @@ describe("the board's Jira sync banner", () => {
   it.each([
     ["a failed pass", { error: "boom" }, "Jira refresh failed: boom"],
     ["a missing tool", { error: "acli not found on PATH" }, "acli not found on PATH"],
-    ["no pass for 3 minutes", { syncRanAt: NOW - 4 * 60_000 }, NOT_RUNNING],
   ] as const)("%s raises it", (_, over, text) => {
     board(value(column(over)));
     expect(banner()?.textContent).toContain(text);
+  });
+
+  it("no pass for 3 minutes raises it (once the startup grace is over)", () => {
+    vi.useFakeTimers();
+    try {
+      board(value(column({ syncRanAt: NOW - 4 * 60_000 })));
+      expect(banner()).toBeNull();
+      act(() => vi.advanceTimersByTime(10_000));
+      expect(banner()?.textContent).toContain(NOT_RUNNING);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("no pass for 3 minutes raises it, after a 10 s startup grace (no flash before the first pass)", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(NOW);
+      board(value(column({ now: undefined, syncRanAt: null })));
+      expect(banner()).toBeNull(); // the load pass lands about 2 s in
+      act(() => vi.advanceTimersByTime(9_000));
+      expect(banner()).toBeNull();
+      act(() => vi.advanceTimersByTime(2_000));
+      expect(banner()?.textContent).toContain(NOT_RUNNING);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the grace holds back only the no-pass line: sync off and errors show at once", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(NOW);
+      board(value(column({ now: undefined, syncRanAt: null, syncEnabled: false })));
+      expect(banner()?.textContent).toContain(OFF);
+      cleanup();
+      board(value(column({ now: undefined, syncRanAt: null, error: "boom" })));
+      expect(banner()?.textContent).toContain("Jira refresh failed: boom");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("healthy sync: no banner", () => {
