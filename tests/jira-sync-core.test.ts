@@ -3,7 +3,7 @@
 // and reproduces acli's search field allowlist (refused fields fail the call).
 import { beforeEach, describe, expect, it } from "vitest";
 import { JiraSnapshot, OpResult, type QueueOp } from "../lib/jira-schema";
-import { createSyncCore, toTicket, type SyncWanted } from "../lib/jira-sync-core";
+import { createSyncCore, descriptionText, toTicket, type SyncWanted } from "../lib/jira-sync-core";
 
 type Rule = { match: string; stdout?: string; fail?: string };
 let rules: Record<"acli" | "gh", Rule[]>;
@@ -94,7 +94,51 @@ describe("toTicket", () => {
   });
 });
 
+// A representative Jira REST v3 description (Atlassian Document Format).
+const ADF = {
+  type: "doc", version: 1,
+  content: [
+    { type: "heading", attrs: { level: 2 }, content: [{ type: "text", text: "Goal" }] },
+    { type: "paragraph", content: [{ type: "text", text: "Move the " }, { type: "text", text: "WAF", marks: [{ type: "strong" }] }, { type: "text", text: " rules." }] },
+    { type: "bulletList", content: [
+      { type: "listItem", content: [{ type: "paragraph", content: [{ type: "text", text: "plan" }] }] },
+      { type: "listItem", content: [{ type: "paragraph", content: [{ type: "text", text: "apply" }, { type: "hardBreak" }, { type: "text", text: "then verify" }] }] },
+    ] },
+    { type: "paragraph", content: [{ type: "mention", attrs: { id: "x", text: "@Sam" } }, { type: "text", text: " owns it" }] },
+  ],
+};
+
+describe("descriptionText", () => {
+  it("turns ADF into plain text: blocks on their own lines, list items as '- '", () => {
+    expect(descriptionText(ADF)).toBe("Goal\n\nMove the WAF rules.\n\n- plan\n- apply\nthen verify\n\n@Sam owns it");
+  });
+  it("strings pass through; anything else (or empty) is omitted", () => {
+    expect(descriptionText("  plain text  ")).toBe("plain text");
+    expect(descriptionText(null)).toBeUndefined();
+    expect(descriptionText(42)).toBeUndefined();
+    expect(descriptionText({ foo: 1 })).toBeUndefined();
+    expect(descriptionText({ type: "doc", content: [] })).toBeUndefined();
+  });
+  it("caps at 2,000 chars with …", () => {
+    const d = descriptionText("x".repeat(5_000))!;
+    expect(d).toHaveLength(2_000);
+    expect(d.endsWith("…")).toBe(true);
+  });
+});
+
 describe("sync pass", () => {
+  it("views ask for the description and the ticket carries it as plain text", async () => {
+    rules.acli = [
+      { match: "assignee = currentUser()", stdout: JSON.stringify([issue("ENG-1"), issue("ENG-2")]) },
+      { match: "workitem view ENG-1", stdout: JSON.stringify(issue("ENG-1", { description: ADF })) },
+    ];
+    await pass();
+    expect(acliCalls().filter((a) => a[3] === "view").every((a) => a.join(" ").includes("--fields parent,updated,description"))).toBe(true);
+    const [one, two] = snap().tickets;
+    expect(one!.description).toBe(descriptionText(ADF));
+    expect(two).not.toHaveProperty("description");
+  });
+
   it("ingests a snapshot that parses with the real schema", async () => {
     rules.acli = [
       { match: "assignee = currentUser()", stdout: JSON.stringify([issue("ENG-1"), issue("ENG-2", { issuetype: { name: "Epic" } })]) },

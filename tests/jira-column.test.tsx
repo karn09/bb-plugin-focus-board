@@ -230,6 +230,7 @@ describe("jiraStartThreadSeed", () => {
     const now = Date.parse("2026-10-29T12:00:00Z");
     const seed = jiraStartThreadSeed({ ...ticket("PT-3570", "Automated Atlantis plan review"), description: "Wire it up." }, now);
     expect(seed.prompt).toBe("PT-3570: Automated Atlantis plan review\n\nhttps://growtherapy.atlassian.net/browse/PT-3570\n\nWire it up.");
+    expect(jiraStartThreadSeed(ticket("PT-1", "No body"), now).prompt).toBe("PT-1: No body\n\nhttps://growtherapy.atlassian.net/browse/PT-1");
     expect(seed.pluginMetadata).toEqual({
       jira: expect.objectContaining({
         links: [{ key: "PT-3570", role: "owner", source: "operator" }],

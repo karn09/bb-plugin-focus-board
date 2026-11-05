@@ -16,6 +16,11 @@ describe("JiraSnapshot", () => {
   it("rejects version 2", () => {
     expect(JiraSnapshot.safeParse({ ...snap, version: 2 }).success).toBe(false);
   });
+  it("a ticket description is optional: old snapshots (none) stay valid; one over 2,000 chars is refused", () => {
+    expect(JiraSnapshot.parse(snap).tickets[0]!.description).toBeUndefined();
+    expect(JiraSnapshot.parse({ ...snap, tickets: [{ ...ticket, description: "Wire it up." }] }).tickets[0]!.description).toBe("Wire it up.");
+    expect(JiraSnapshot.safeParse({ ...snap, tickets: [{ ...ticket, description: "x".repeat(2_001) }] }).success).toBe(false);
+  });
   it("rejects a ticket missing key", () => {
     const { key: _k, ...bad } = ticket;
     expect(JiraSnapshot.safeParse({ ...snap, tickets: [bad] }).success).toBe(false);

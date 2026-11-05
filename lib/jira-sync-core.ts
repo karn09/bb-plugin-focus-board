@@ -38,7 +38,7 @@ export type SyncSnapshot = {
 const KEY = /^[A-Z][A-Z0-9]+-\d+$/;
 const PROJ = /^[A-Z][A-Z0-9]+$/;
 // acli's search only returns a fixed set of fields (parent, updated, subtasks are refused);
-// those come from one `workitem view` per ticket (fetchTickets).
+// those (and the description) come from one `workitem view` per ticket (fetchTickets).
 const FIELDS = "key,summary,status,assignee,issuetype";
 const msg = (e: unknown) => String((e as Error)?.message ?? e);
 type Raw = any;
@@ -55,6 +55,7 @@ export function toTicket(raw: Raw, meAccountId: string): JiraTicket {
   const a = f.assignee;
   const parent = f.parent?.key && KEY.test(f.parent.key) ? f.parent : null;
   const type = f.issuetype?.name ?? "";
+  const desc = descriptionText(f.description);
   return {
     key: raw.key,
     summary: f.summary ?? "",
@@ -70,7 +71,33 @@ export function toTicket(raw: Raw, meAccountId: string): JiraTicket {
     updatedAt: f.updated ?? "",
     // `self` points at an internal API host, never the browse site.
     url: jiraBrowseUrl(raw.key),
+    ...(desc === undefined ? {} : { description: desc }),
   };
+}
+
+const DESC_MAX = 2_000;
+/** Plain text of one ADF node: blocks end in a blank line, list items read "- ". */
+function adfText(n: Raw): string {
+  if (!n || typeof n !== "object") return "";
+  if (n.type === "text") return typeof n.text === "string" ? n.text : "";
+  if (n.type === "hardBreak") return "\n";
+  if (n.type === "mention") return typeof n.attrs?.text === "string" ? n.attrs.text : "";
+  const inner = Array.isArray(n.content) ? n.content.map(adfText).join("") : "";
+  if (n.type === "listItem") return `- ${inner.trim()}\n`;
+  if (n.type === "paragraph" || n.type === "heading" || n.type === "codeBlock" || n.type === "blockquote") return `${inner}\n\n`;
+  if (n.type === "bulletList" || n.type === "orderedList") return `${inner}\n`;
+  return inner;
+}
+/**
+ * A ticket description as plain text: Jira REST v3 sends Atlassian Document
+ * Format (an object tree), a string passes through, anything else is
+ * omitted. Capped at 2,000 chars with "…".
+ */
+export function descriptionText(v: unknown): string | undefined {
+  const raw = typeof v === "string" ? v : v && typeof v === "object" && typeof (v as Raw).type === "string" ? adfText(v) : "";
+  const text = raw.replace(/\n{3,}/g, "\n\n").trim();
+  if (!text) return undefined;
+  return text.length > DESC_MAX ? `${text.slice(0, DESC_MAX - 1)}…` : text;
 }
 
 /** map with at most `n` in flight, results in input order. */
@@ -176,7 +203,7 @@ export function createSyncCore(deps: SyncDeps) {
     // `me` comes from the assignee of the currentUser() query; "" when we have no tickets (acli has no whoami).
     const me: string = mine.find((i) => i.fields?.assignee?.accountId)?.fields.assignee.accountId ?? "";
     const tickets = await pool([...mine, ...extra], 5, async (i) => {
-      const v = json(await acli("view", i.key, "--fields", "parent,updated", "--json"));
+      const v = json(await acli("view", i.key, "--fields", "parent,updated,description", "--json"));
       const t = toTicket({ ...i, fields: { ...i.fields, ...v?.fields } }, me);
       t.openChildren = (await search(`parent = ${i.key} AND resolution = Unresolved`)).length;
       return t;

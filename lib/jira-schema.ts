@@ -23,6 +23,8 @@ export const JiraTicket = z.object({
   openChildren: z.number().int().min(0),
   updatedAt: Iso,
   url: z.string(),
+  /** Plain text (lib/jira-sync-core.ts descriptionText); absent in older snapshots. */
+  description: z.string().max(2_000).optional(),
 });
 export type JiraTicket = z.infer<typeof JiraTicket>;
 
