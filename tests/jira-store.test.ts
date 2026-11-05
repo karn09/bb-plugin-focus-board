@@ -153,6 +153,26 @@ describe("cancel", () => {
   });
 });
 
+describe("claims survive a restart (jira:in-flight)", () => {
+  const res = (id: string) => ({ id, ok: true, error: null, createdKey: null });
+  it("a claim made before an unload is still tooLate for a re-created store; the next pass re-claims, and its ack clears it", async () => {
+    const { store, kv, meta } = setup();
+    const a = await store.enqueue(comment("PT-1"));
+    expect(await store.claim(a.id)).toBe(true); // applied, then the plugin unloaded before the ack
+    expect(kv.get("jira:in-flight")).toEqual([a.id]);
+    const again = createJiraStore(
+      { get: async (k: string) => kv.get(k), set: async (k: string, v: unknown) => void kv.set(k, v) },
+      { getPluginMetadata: async ({ threadId }) => meta.get(threadId) ?? {}, updatePluginMetadata: async () => {} },
+      () => T0,
+    );
+    expect(await again.cancel([a.id])).toEqual({ cancelled: [], tooLate: [a.id] });
+    expect(await again.claim(a.id)).toBe(true); // the next pass re-applies (replay-safe) and acks
+    await again.ack([res(a.id)]);
+    expect(kv.get("jira:in-flight")).toEqual([]);
+    expect(await again.pendingOps()).toEqual([]);
+  });
+});
+
 describe("ack hardening", () => {
   const res = (id: string) => ({ id, ok: true, error: null, createdKey: null });
   it("duplicate id in a batch records one result", async () => {

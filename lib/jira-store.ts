@@ -24,6 +24,8 @@ const SNAPSHOT_KEY = "jira:snapshot";
 const QUEUE_KEY = "jira:queue";
 const SNAPSHOT_FAILURE_KEY = "jira:snapshot-failure";
 const RESULTS_KEY = "jira:results";
+/** Op ids a sync pass claimed (is applying) and has not acked: too late to cancel, across restarts too. */
+const IN_FLIGHT_KEY = "jira:in-flight";
 const MAX_RESULTS = 200;
 
 const emptyRecord = (): ThreadJiraRecord => ({
@@ -60,8 +62,10 @@ export function createJiraStore(
   };
 
   const log = opts?.log ?? (() => {});
-  // Ops a sync pass has started applying (claim) and not acked yet: too late to cancel.
-  const inFlight = new Set<string>();
+  const readInFlight = async (): Promise<Set<string>> => {
+    const raw = await kv.get(IN_FLIGHT_KEY);
+    return new Set(Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string") : []);
+  };
   // Fired after every write (ingest, enqueue, ack, thread record) so the board refreshes.
   const changed = () => {
     try {
@@ -192,7 +196,6 @@ export function createJiraStore(
         const hits = [...new Map(results.filter((r) => known.has(r.id)).map((r) => [r.id, r])).values()];
         if (hits.length === 0) return;
         const done = new Set(hits.map((r) => r.id));
-        for (const id of done) inFlight.delete(id);
         // Results first: a crash between the writes leaves the op queued AND recorded.
         await kv.set(RESULTS_KEY, [...(await readResults()), ...hits].slice(-MAX_RESULTS));
         const raw = await rawQueue();
@@ -203,6 +206,8 @@ export function createJiraStore(
             return !(p.success && done.has(p.data.id));
           }),
         );
+        // Last: a crash before this leaves a claim on a gone op, which reads as tooLate anyway.
+        await kv.set(IN_FLIGHT_KEY, [...(await readInFlight())].filter((id) => !done.has(id)));
         changed();
       });
     },
@@ -210,8 +215,10 @@ export function createJiraStore(
     /** The sync pass is about to apply this op: false when it is gone (cancelled), else it is marked in flight. */
     claim(opId: string): Promise<boolean> {
       return locked(async () => {
-        if (!(await readQueue()).some((o) => o.id === opId)) return false;
-        inFlight.add(opId);
+        const queued = new Set((await readQueue()).map((o) => o.id));
+        if (!queued.has(opId)) return false;
+        // A claim stored before a restart stays: this pass re-applies (replay-safe) and its ack clears it.
+        await kv.set(IN_FLIGHT_KEY, [...new Set([...(await readInFlight()), opId])].filter((id) => queued.has(id)));
         return true;
       });
     },
@@ -220,6 +227,7 @@ export function createJiraStore(
     cancel(opIds: string[]): Promise<{ cancelled: string[]; tooLate: string[] }> {
       return locked(async () => {
         const queued = new Set((await readQueue()).map((o) => o.id));
+        const inFlight = await readInFlight();
         const cancelled = opIds.filter((id) => queued.has(id) && !inFlight.has(id));
         const tooLate = opIds.filter((id) => !cancelled.includes(id));
         if (cancelled.length === 0) return { cancelled, tooLate };
