@@ -3,7 +3,7 @@
 // thread lane: no cards, no drag, no rank key. JiraColumn is pure; the board
 // renders JiraColumnSlot, which reads JiraBoardContext and keeps the
 // collapsed / hide-linked toggles in the board's stored preferences.
-import { useContext, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { fixQueued } from "../lib/jira-drift";
@@ -87,14 +87,42 @@ const FIX_LABEL: Record<DriftItem["kind"], string> = {
   "stale-unlinked": "Give back",
 };
 
-function statusLine({ error, stale, snapshotAgeMs }: Pick<JiraColumnProps, "error" | "stale" | "snapshotAgeMs">): string | null {
-  // An ok snapshot with some gh reads failed (lib/jira-sync-core.ts): Jira itself is connected.
-  if (error !== null && /^gh: \d+ of \d+ /.test(error)) return error;
-  if (error !== null && /unauthori[sz]ed|not authenticated|auth login|\b401\b/i.test(error)) return NOT_CONNECTED;
-  if (error === null && snapshotAgeMs === null) return NO_DATA;
-  if (error !== null) return `Jira refresh failed: ${error}`;
-  if (stale && snapshotAgeMs !== null) return `data ${Math.floor(snapshotAgeMs / 60_000)} min old`;
-  return null;
+/** An ok snapshot with some gh reads failed (lib/jira-sync-core.ts): Jira itself is connected. */
+const GH_PARTIAL = /^gh: \d+ of \d+ /;
+/** lib/jira-exec.ts runTool's message when a tool isn't installed (also inside a gh partial line). */
+const TOOL_MISSING = /\b(acli|gh) not found on PATH\b/;
+
+function errorLine(error: string | null): string | null {
+  if (error === null) return null;
+  const missing = error.match(TOOL_MISSING);
+  if (missing) return missing[0];
+  if (GH_PARTIAL.test(error)) return error;
+  if (/unauthori[sz]ed|not authenticated|auth login|\b401\b/i.test(error)) return NOT_CONNECTED;
+  return `Jira refresh failed: ${error}`;
+}
+
+type SyncState = Pick<JiraColumnData, "error" | "stale" | "snapshotAgeMs" | "syncRanAt" | "syncEnabled">;
+const syncLapsed = (s: SyncState, now: number) => s.syncRanAt === null || now - s.syncRanAt > LAPSE_MS;
+
+/** The column's status lines: an error first, then sync off; else no data, old data, or sync not running. */
+export function jiraStatusLines(s: SyncState, now: number): string[] {
+  const err = errorLine(s.error);
+  if (err !== null || !s.syncEnabled) return [err, s.syncEnabled ? null : SYNC_OFF].filter((l): l is string => l !== null);
+  if (s.snapshotAgeMs === null) return [NO_DATA];
+  if (s.stale) return [`data ${Math.floor(s.snapshotAgeMs / 60_000)} min old`];
+  return syncLapsed(s, now) ? [NOT_RUNNING] : [];
+}
+
+/**
+ * The board banner's message when sync can't run, else null: the last pass
+ * failed (a partial gh failure stays in the column), sync is off, or no pass
+ * started for 3 minutes. Same strings as the column's lines.
+ */
+export function jiraSyncBannerMessage(s: SyncState, now: number): string | null {
+  const err = errorLine(s.error);
+  if (err !== null && !GH_PARTIAL.test(err)) return err;
+  if (!s.syncEnabled) return SYNC_OFF;
+  return syncLapsed(s, now) ? NOT_RUNNING : null;
 }
 
 const btn = "rounded px-1.5 py-0.5 text-[11px] font-medium hover:bg-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring";
@@ -106,9 +134,7 @@ export function JiraColumn(props: JiraColumnProps) {
   const [query, setQuery] = useState("");
   const now = props.now ?? Date.now();
   const refreshing = props.refreshRequestedAt !== null && now - props.refreshRequestedAt < LAPSE_MS;
-  const syncLapsed = props.syncRanAt === null || now - props.syncRanAt > LAPSE_MS;
-  // Sync off is the cause of any stale or missing data, so it goes first.
-  const status = !props.syncEnabled ? SYNC_OFF : (statusLine(props) ?? (syncLapsed ? NOT_RUNNING : null));
+  const status = jiraStatusLines(props, now);
 
   if (collapsed) {
     return (
@@ -146,7 +172,7 @@ export function JiraColumn(props: JiraColumnProps) {
           <Icon name="ChevronLeft" className="size-3.5" aria-hidden />
         </button>
       </header>
-      {status !== null ? <p className="px-1 pb-1 text-[11px] text-amber-600 dark:text-amber-400">{status}</p> : null}
+      {status.map((line) => <p key={line} className="px-1 pb-1 text-[11px] text-amber-600 dark:text-amber-400">{line}</p>)}
       <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto rounded-lg bg-muted/30 p-1.5">
         {shown.map((t) => {
           const linked = threadsByKey[t.key] ?? [];
@@ -267,5 +293,51 @@ export function JiraColumnSlot() {
       hideLinked={hideLinked}
       onHideLinkedChange={persist(JIRA_HIDE_LINKED_KEY, setHideLinked)}
     />
+  );
+}
+
+/**
+ * The board banner row's Jira line (components/board.tsx): one slim banner
+ * while Jira is on and sync can't run, with Run sync now (jira_refresh).
+ * Dismissing hides that message for the session; a new one shows again.
+ */
+export function JiraSyncBannerSlot() {
+  const v = useContext(JiraBoardContext);
+  const [dismissed, setDismissed] = useState<string | null>(null);
+  const [clock, setClock] = useState(() => Date.now());
+  const col = v !== null && v.enabled ? v.column : undefined;
+  const on = col !== undefined;
+  // The no-pass condition comes with time alone: re-check while Jira is on.
+  useEffect(() => {
+    if (!on) return;
+    const t = setInterval(() => setClock(Date.now()), 30_000);
+    return () => clearInterval(t);
+  }, [on]);
+  const message = col === undefined ? null : jiraSyncBannerMessage(col, col.now ?? clock);
+  // A cleared condition re-arms the dismissal, so the same message can come back.
+  useEffect(() => {
+    if (message === null) setDismissed(null);
+  }, [message]);
+  if (col === undefined || message === null || message === dismissed) return null;
+  return (
+    <div
+      role="status"
+      data-testid="jira-sync-banner"
+      className="mx-3 mb-1 flex items-center justify-between gap-2 rounded border border-amber-500/40 bg-amber-50 dark:bg-amber-950 px-2 py-1 text-[11px] text-amber-700 dark:text-amber-400"
+    >
+      <p className="min-w-0">{message}</p>
+      <div className="flex shrink-0 items-center gap-1">
+        <button type="button" className={btn} onClick={col.onRefresh}>Run sync now</button>
+        <button
+          type="button"
+          onClick={() => setDismissed(message)}
+          aria-label="Dismiss Jira sync notice"
+          title="Dismiss"
+          className="rounded p-0.5 text-amber-700/70 transition-colors hover:bg-amber-500/10 hover:text-amber-700 focus-visible:outline focus-visible:outline-1 focus-visible:outline-amber-600 dark:text-amber-400/70 dark:hover:text-amber-400"
+        >
+          <Icon name="X" className="size-3" aria-hidden />
+        </button>
+      </div>
+    </div>
   );
 }

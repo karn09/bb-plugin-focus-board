@@ -88,6 +88,26 @@ describe("JiraColumn", () => {
     expect(screen.queryByRole("searchbox")).toBeNull();
   });
 
+  it("an error status shows ahead of the sync-off line (auth, gh partial, refresh failed)", () => {
+    const lines = () => [...document.querySelectorAll("[data-jira-column] header ~ p")].map((p) => p.textContent);
+    const off = 'Jira sync is off: turn on "Jira: sync automatically" in Focus Board settings';
+    const { rerender } = render(<JiraColumn {...base()} syncEnabled={false} error="unauthorized" />);
+    expect(lines()).toEqual(["Jira not connected: run `acli jira auth login --web`", off]);
+    rerender(<JiraColumn {...base()} syncEnabled={false} error="gh: 1 of 3 PRs unreadable (x)" />);
+    expect(lines()).toEqual(["gh: 1 of 3 PRs unreadable (x)", off]);
+    rerender(<JiraColumn {...base()} syncEnabled={false} error="boom" />);
+    expect(lines()).toEqual(["Jira refresh failed: boom", off]);
+    rerender(<JiraColumn {...base()} syncEnabled={false} />);
+    expect(lines()).toEqual([off]);
+  });
+
+  it("a missing tool reads as that tool not found on PATH", () => {
+    const { rerender } = render(<JiraColumn {...base()} error="acli not found on PATH" />);
+    expect(screen.getByText("acli not found on PATH")).toBeTruthy();
+    rerender(<JiraColumn {...base()} error="gh: 2 of 2 PRs unreadable (gh not found on PATH)" />);
+    expect(screen.getByText("gh not found on PATH")).toBeTruthy();
+  });
+
   it("stale shows the snapshot age; unauthorized shows the login hint", () => {
     const { rerender } = render(<JiraColumn {...base()} stale snapshotAgeMs={6 * 60_000 + 5_000} />);
     expect(screen.getByText("data 6 min old")).toBeTruthy();

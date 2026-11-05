@@ -9,7 +9,7 @@ import {
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import type { BoardColumn, GroupBy, LaneHideOutcome } from "./grouping";
 import { JIRA_COLUMN_ID, THREAD_STATE_LABELS, threadState } from "./grouping";
-import { JiraColumnSlot } from "./jira-column";
+import { JiraColumnSlot, JiraSyncBannerSlot } from "./jira-column";
 import {
   sweepColumnKind,
   sweepDestination,
@@ -2203,6 +2203,7 @@ export function Board({
             #233) — the same lesson the context menu's popover learned (the
             menu moved to a full-strength surface, PR #221). Text carries its
             contrast; the tinted border keeps the surface's tone. */}
+        <JiraSyncBannerSlot />
         {rankError !== null ? (
           <div
             role="status"
