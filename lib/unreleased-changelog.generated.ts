@@ -3,5 +3,9 @@ export const UNRELEASED_ITEMS: readonly { text: string; children: string[]; grou
   {
     "text": "**Optional Jira integration, off by default (`jiraEnabled`).** Threads link to Jira tickets, the Attention view gets a Jira column, and Done becomes a checked request, with Jira and GitHub sync built in. Setup and rollout are in `docs/fork-notes.md`.",
     "children": []
+  },
+  {
+    "text": "**Escape on an open card, group or reason menu only closes the menu.** It used to also reach the thread pane behind it, which could stop a running thread or close the pane.",
+    "children": []
   }
 ];

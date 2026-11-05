@@ -13,6 +13,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Escape on an open card, group or reason menu only closes the menu.** It used to also reach the thread pane behind it, which could stop a running thread or close the pane.
+
 ## [1.7.2] - 2026-10-29
 
 ### Added
