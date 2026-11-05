@@ -115,7 +115,11 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
                 aria-label={`More for: ${r}`}
                 title="Spin off or mark not needed"
                 className="shrink-0 rounded px-0.5 leading-none hover:bg-accent"
-                onClick={(e) => setMenu({ index: i, x: e.clientX, y: e.clientY })}
+                onClick={(e) => {
+                  // Enter/Space clicks carry no pointer position (detail 0): open under the button.
+                  const r = e.detail === 0 ? e.currentTarget.getBoundingClientRect() : null;
+                  setMenu({ index: i, x: r ? r.left : e.clientX, y: r ? r.bottom : e.clientY });
+                }}
               >
                 ⋯
               </button>

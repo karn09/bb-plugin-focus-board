@@ -87,6 +87,20 @@ describe("JiraCardBadges", () => {
     fireEvent.click(screen.getByText("Mark done anyway"));
     expect(onAction).toHaveBeenCalledWith("skip-done", "t1");
   });
+  it("the ⋯ menu opened from the keyboard anchors under the button; Escape closes it and refocuses the button", () => {
+    const reasons = ["PR #7 still open"];
+    render(<JiraCardBadges {...props} record={rec({ doneCheck: { at: "x", verdict: "fail", reasons } })} />);
+    const more = screen.getByRole("button", { name: "More for: PR #7 still open" });
+    more.getBoundingClientRect = () => ({ left: 300, bottom: 200, top: 190, right: 310, width: 10, height: 10, x: 300, y: 190 }) as DOMRect;
+    more.focus();
+    fireEvent.click(more, { detail: 0, clientX: 0, clientY: 0 }); // Enter/Space: a click with no pointer position
+    const menu = screen.getByRole("menu");
+    expect([menu.style.left, menu.style.top]).toEqual(["300px", "200px"]);
+    expect(document.activeElement).toBe(screen.getByRole("menuitem", { name: "Spin off" }));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(more);
+  });
   it("pending confirm: a Confirm done button; Mark done anyway sits one click deep", () => {
     const onAction = vi.fn();
     render(<JiraCardBadges {...props} onAction={onAction} record={rec({ doneCheck: { at: "x", verdict: "pending-confirm", reasons: [] } })} />);

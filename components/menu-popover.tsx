@@ -1,4 +1,4 @@
-import { type ReactNode } from "react";
+import { type ReactNode, useEffect, useRef } from "react";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 
@@ -32,6 +32,25 @@ export function MenuPopover({
   title: ReactNode;
   children: ReactNode;
 }) {
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  const isOpen = open !== null;
+  // Keyboard: focus the first entry on open; Escape closes and hands focus
+  // back to whatever held it when the menu opened (the opener, usually).
+  useEffect(() => {
+    if (!isOpen) return;
+    const before = document.activeElement;
+    menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeRef.current();
+      if (before instanceof HTMLElement && before.isConnected) before.focus();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [isOpen]);
   if (open === null) return null;
   return (
     <>
@@ -62,6 +81,7 @@ export function MenuPopover({
           overflowY: "auto",
         }}
         ref={(node) => {
+          menuRef.current = node;
           if (node === null) return;
           const rect = node.getBoundingClientRect();
           const clampedX = Math.min(open.x, window.innerWidth - rect.width - 8);

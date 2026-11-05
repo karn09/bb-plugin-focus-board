@@ -3,6 +3,7 @@
 // must use whatever height the window leaves it — a fixed pixel cap cuts a
 // long menu to a partial-height popover even on a tall window — and it must
 // read as a raised menu, not as one more card on the board.
+import { useState } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MenuPopover } from "../components/menu-popover";
@@ -54,5 +55,29 @@ describe("menu shell stands apart from cards", () => {
     renderOpenMenu();
     const header = screen.getByText("One thread");
     expect(header.className).toContain("border-b");
+  });
+});
+describe("menu shell keyboard", () => {
+  it("moves focus to the first entry on open; Escape closes and refocuses what had focus", () => {
+    function Harness() {
+      const [open, setOpen] = useState<{ x: number; y: number } | null>(null);
+      return (
+        <>
+          <button type="button" onClick={() => setOpen({ x: 5, y: 5 })}>Opener</button>
+          <MenuPopover open={open} onClose={() => setOpen(null)} label="Thread actions" title="One">
+            <button type="button" role="menuitem">First</button>
+            <button type="button" role="menuitem">Second</button>
+          </MenuPopover>
+        </>
+      );
+    }
+    render(<Harness />);
+    const opener = screen.getByText("Opener");
+    opener.focus();
+    fireEvent.click(opener);
+    expect(document.activeElement).toBe(screen.getByRole("menuitem", { name: "First" }));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(opener);
   });
 });
