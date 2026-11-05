@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement, type ReactNode } from "react";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { ThreadPane } from "../components/thread-pane";
+import { MenuPopover, MenuPopoverEntry } from "../components/menu-popover";
 import { CompactViewportOverrideProvider } from "../components/ui/hooks/use-compact-viewport";
 
 const stop = vi.fn();
@@ -274,5 +275,32 @@ describe("Escape stands down while an overlay owns the key (composer modal open)
     );
     pressEscape();
     expect(onClose).not.toHaveBeenCalled();
+  });
+});
+describe("Escape on an open menu stays with the menu", () => {
+  function PaneWithMenu({ menuOpen, onMenuClose }: { menuOpen: boolean; onMenuClose: () => void }) {
+    return createElement(
+      "div",
+      null,
+      paneElement({ id: "thr_test", displayTitle: "Test thread", status: "active", isUnread: false, isPinned: false, projectName: null, branchName: null }),
+      createElement(
+        MenuPopover,
+        { open: menuOpen ? { x: 10, y: 10 } : null, onClose: onMenuClose, label: "Thread actions", title: "t" },
+        createElement(MenuPopoverEntry, { label: "Pin", icon: "Pin", onRun: noop }),
+      ),
+    );
+  }
+
+  it("closes the menu without stopping the thread; the next Escape reaches the pane undebounced", () => {
+    const onMenuClose = vi.fn();
+    const { rerender } = render(createElement(PaneWithMenu, { menuOpen: true, onMenuClose }));
+    // Fired on the focused menu entry, as a real keydown would be.
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect(onMenuClose).toHaveBeenCalledTimes(1);
+    expect(stop).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    rerender(createElement(PaneWithMenu, { menuOpen: false, onMenuClose }));
+    pressEscape();
+    expect(stop).toHaveBeenCalledTimes(1);
   });
 });

@@ -45,11 +45,14 @@ export function MenuPopover({
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
+      // The thread pane listens on document in the capture phase (stop /
+      // close): window capture runs first, so the menu's Escape never reaches it.
+      event.stopPropagation();
       closeRef.current();
       if (before instanceof HTMLElement && before.isConnected) before.focus();
     };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, { capture: true });
+    return () => window.removeEventListener("keydown", onKey, { capture: true });
   }, [isOpen]);
   if (open === null) return null;
   return (
