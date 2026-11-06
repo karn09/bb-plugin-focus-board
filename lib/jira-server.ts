@@ -846,10 +846,15 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     await perThread(threadId, async () => {
       if (!(await stillChecking(threadId, startedAt, "data wait"))) return;
       if (left > 0) {
+        // Ask for a sync once per check: a PR the sync can't read would otherwise
+        // re-request a full pass after every ingest until DATA_WAIT_MS.
+        const firstWait = !(await store.readThread(threadId)).verifying?.reasons?.includes(CHECKING_PRS);
         await store.updateThread(threadId, () => ({ verifying: { startedAt, reasons: [CHECKING_PRS] } }));
-        await bb.storage.kv.set(REFRESH_KEY, Date.now());
-        bb.realtime.publish(JIRA_CHANGED, {});
-        kickSync();
+        if (firstWait) {
+          await bb.storage.kv.set(REFRESH_KEY, Date.now());
+          bb.realtime.publish(JIRA_CHANGED, {});
+          kickSync();
+        }
         clearTimeout(dataTimers.get(threadId));
         dataTimers.set(threadId, setTimeout(() => {
           dataTimers.delete(threadId);

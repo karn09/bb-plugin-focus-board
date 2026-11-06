@@ -258,9 +258,12 @@ describe("built-in Jira sync", () => {
   it("`jira sync` and a Done check data wait re-run mention searches the scheduled pass just made", async () => {
     await load();
     metadata.set("t1", { jira: rec() });
-    await harness.runSchedule("jira-sync");
     const mentionSearches = () => calls.filter((c) => c.startsWith("gh search prs PT-1")).length;
-    expect(mentionSearches()).toBe(1);
+    // The plugin's own startup pass fires ~2 s after load; let it land first so it
+    // can't interleave with the steps below on a slow machine (it was flaky).
+    await vi.waitFor(() => expect(mentionSearches()).toBe(1), { timeout: 10_000, interval: 50 });
+    await harness.runSchedule("jira-sync");
+    expect(mentionSearches()).toBe(1); // scheduled pass: the 30-min mention cache holds
     expect((await harness.behavior.runCli(["jira", "sync"])).exitCode).toBe(0);
     expect(mentionSearches()).toBe(2);
     await new Promise((r) => setTimeout(r, 5)); // the data wait's request must be newer than that snapshot
@@ -268,6 +271,20 @@ describe("built-in Jira sync", () => {
     await jira.startDoneCheck("t1");
     await flush();
     expect(mentionSearches()).toBe(3);
+  });
+
+  it("a Done check waiting on a PR the sync can't read asks for ONE sync, not a pass after every ingest", async () => {
+    await load();
+    metadata.set("t1", { jira: rec() });
+    const fullPasses = () => calls.filter((c) => c.includes("assignee = currentUser()")).length;
+    await vi.waitFor(() => expect(fullPasses()).toBe(1), { timeout: 10_000, interval: 50 }); // startup pass
+    links = [{ tracker: "github", repo: "o/r", issue: 9, kind: "pull", href: "https://github.com/o/r/pull/9", createdAt: "2026-10-29T00:00:00Z", source: "operator" } as ThreadLink];
+    await jira.startDoneCheck("t1");
+    for (let i = 0; i < 20; i++) await flush();
+    await new Promise((r) => setTimeout(r, 300));
+    for (let i = 0; i < 20; i++) await flush();
+    expect(fullPasses()).toBe(2); // the one requested refresh; PR #9 still unreadable, no loop
+    expect((metadata.get("t1")?.jira as { verifying?: { reasons?: string[] } }).verifying?.reasons).toEqual(["checking PRs"]);
   });
 
   it("`jira sync` runs a full pass now and prints the status; acli failing exits 1 with the error", async () => {
