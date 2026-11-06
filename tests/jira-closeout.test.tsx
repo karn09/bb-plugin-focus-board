@@ -19,11 +19,11 @@ const ticket = (key: string) => ({
 });
 const rec = { links: [{ key: "PT-1", role: "owner" as const, source: "auto" as const }], enrolledAt: null, verifying: null, doneCheck: null, nudgedAt: null, deepCheckedAt: null, reason: null, checkInWith: null };
 
-function Board(p: { drafts: Record<string, CloseoutDraft>; requested?: Set<string>; enabled?: boolean; h: ReturnType<typeof handlers> }) {
+function Board(p: { drafts: Record<string, CloseoutDraft>; requested?: Map<string, number>; enabled?: boolean; h: ReturnType<typeof handlers>; threads?: JiraBoardValue["threads"] }) {
   const [openFor, setOpenFor] = useState<string | null>(null);
   const value: JiraBoardValue = {
-    enabled: p.enabled ?? true, stale: false, ticketByKey: { "PT-1": ticket("PT-1"), "PT-2": ticket("PT-2") }, threads: { t1: rec }, pendingOps: [], onAction: vi.fn(),
-    closeout: { drafts: p.drafts, doneRequested: p.requested ?? new Set(), openFor, setOpenFor, ...p.h },
+    enabled: p.enabled ?? true, stale: false, ticketByKey: { "PT-1": ticket("PT-1"), "PT-2": ticket("PT-2") }, threads: p.threads ?? { t1: rec }, pendingOps: [], onAction: vi.fn(),
+    closeout: { drafts: p.drafts, doneRequested: p.requested ?? new Map(), openFor, setOpenFor, ...p.h },
   };
   return (
     <JiraBoardContext.Provider value={value}>
@@ -37,13 +37,14 @@ const handlers = () => ({
   skip: vi.fn(async () => ({ ok: true })),
   draftWithAgent: vi.fn(async () => ({ ok: true })),
 });
+const req = (at = Date.now()) => new Map([["t1", at]]);
 const dialog = () => screen.queryByRole("dialog");
 const area = (key: string) => screen.getByLabelText(`Comment for ${key}`) as HTMLTextAreaElement;
 
 describe("Jira closeout overlay", () => {
   it("auto-opens only for a draft of a thread this board moved to Done", async () => {
     const h = handlers();
-    const requested = new Set(["t1"]);
+    const requested = req();
     const { rerender } = render(<Board drafts={{}} requested={requested} h={h} />);
     expect(dialog()).toBeNull();
     rerender(<Board drafts={{ t1: draft() }} requested={requested} h={h} />);
@@ -57,7 +58,7 @@ describe("Jira closeout overlay", () => {
 
   it("an edited body is what Post & close sends; unchecking the move reads Post", async () => {
     const h = handlers();
-    render(<Board drafts={{ t1: draft() }} requested={new Set(["t1"])} h={h} />);
+    render(<Board drafts={{ t1: draft() }} requested={req()} h={h} />);
     await waitFor(() => expect(dialog()).not.toBeNull());
     expect(screen.getByText("DONE")).toBeTruthy();
     fireEvent.change(area("PT-1"), { target: { value: "Shipped the fix." } });
@@ -73,7 +74,7 @@ describe("Jira closeout overlay", () => {
   });
 
   it("a ticket that cannot move to Done: the checkbox is disabled with the hint", async () => {
-    render(<Board drafts={{ t1: draft([tk("PT-1", { transition: false, canTransition: false, blocked: "epic" })]) }} requested={new Set(["t1"])} h={handlers()} />);
+    render(<Board drafts={{ t1: draft([tk("PT-1", { transition: false, canTransition: false, blocked: "epic" })]) }} requested={req()} h={handlers()} />);
     await waitFor(() => expect(dialog()).not.toBeNull());
     const box = screen.getByRole("checkbox", { name: "Move PT-1 to Done" }) as HTMLInputElement;
     expect(box.disabled).toBe(true);
@@ -84,7 +85,7 @@ describe("Jira closeout overlay", () => {
 
   it("Draft with agent: sends the instruction; an agent body refreshes an untouched textarea, an edited one offers Use it", async () => {
     const h = handlers();
-    const requested = new Set(["t1"]);
+    const requested = req();
     const two = [tk("PT-1"), tk("PT-2")];
     const { rerender } = render(<Board drafts={{ t1: draft(two) }} requested={requested} h={h} />);
     await waitFor(() => expect(dialog()).not.toBeNull());
@@ -104,7 +105,7 @@ describe("Jira closeout overlay", () => {
 
   it("Later closes and keeps the chip; the chip reopens the overlay; Skip Jira skips", async () => {
     const h = handlers();
-    render(<Board drafts={{ t1: draft() }} requested={new Set(["t1"])} h={h} />);
+    render(<Board drafts={{ t1: draft() }} requested={req()} h={h} />);
     await waitFor(() => expect(dialog()).not.toBeNull());
     fireEvent.click(screen.getByRole("button", { name: "Later" }));
     await waitFor(() => expect(dialog()).toBeNull());
@@ -118,15 +119,44 @@ describe("Jira closeout overlay", () => {
 
   it("a refused post shows the error and keeps the overlay open", async () => {
     const h = { ...handlers(), submit: vi.fn(async () => ({ ok: false, error: "nothing to close out" })) };
-    render(<Board drafts={{ t1: draft() }} requested={new Set(["t1"])} h={h} />);
+    render(<Board drafts={{ t1: draft() }} requested={req()} h={h} />);
     await waitFor(() => expect(dialog()).not.toBeNull());
     fireEvent.click(screen.getByRole("button", { name: "Post & close" }));
     await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("nothing to close out"));
     expect(dialog()).not.toBeNull();
   });
 
+  it("a Done that made no draft is forgotten: a later CLI-made draft does not auto-open", async () => {
+    const h = handlers();
+    const requested = req(Date.now() - 1000);
+    const passedNoDraft = { t1: { ...rec, doneCheck: { at: new Date().toISOString(), verdict: "pass" as const, reasons: [] } } };
+    const { rerender } = render(<Board drafts={{}} requested={requested} threads={{ t1: rec }} h={h} />);
+    expect(requested.size).toBe(1); // still checking
+    rerender(<Board drafts={{}} requested={requested} threads={passedNoDraft} h={h} />);
+    await waitFor(() => expect(requested.size).toBe(0));
+    rerender(<Board drafts={{ t1: draft() }} requested={requested} threads={passedNoDraft} h={h} />);
+    expect(dialog()).toBeNull();
+  });
+
+  it("a remembered Done expires after 5 minutes", async () => {
+    const requested = req(Date.now() - 6 * 60_000);
+    render(<Board drafts={{}} requested={requested} h={handlers()} />);
+    await waitFor(() => expect(requested.size).toBe(0));
+  });
+
+  it("the overlay closes when its draft disappears (posted or skipped elsewhere)", async () => {
+    const h = handlers();
+    const requested = req();
+    const { rerender } = render(<Board drafts={{ t1: draft() }} requested={requested} h={h} />);
+    await waitFor(() => expect(dialog()).not.toBeNull());
+    rerender(<Board drafts={{}} requested={requested} h={h} />);
+    await waitFor(() => expect(dialog()).toBeNull());
+    rerender(<Board drafts={{ t1: draft() }} requested={requested} h={h} />);
+    expect(dialog()).toBeNull(); // closed for good, not hidden: a new draft only shows via the chip
+  });
+
   it("Jira off renders nothing", () => {
-    const { container } = render(<Board enabled={false} drafts={{ t1: draft() }} requested={new Set(["t1"])} h={handlers()} />);
+    const { container } = render(<Board enabled={false} drafts={{ t1: draft() }} requested={req()} h={handlers()} />);
     expect(container.innerHTML).toBe("");
     expect(dialog()).toBeNull();
   });

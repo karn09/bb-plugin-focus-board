@@ -578,9 +578,9 @@ function BoardPage({ subPath }: { subPath: string }) {
     refetchScheduler.schedule("jira", refetchJira);
   });
   // The closeout overlay opens by itself only for threads this board moved to Done.
-  const closeoutRequestedRef = useRef(new Set<string>());
+  const closeoutRequestedRef = useRef(new Map<string, number>());
   const noteDoneRequest = useCallback((threadId: string) => {
-    closeoutRequestedRef.current.add(threadId);
+    closeoutRequestedRef.current.set(threadId, Date.now());
   }, []);
   const [closeoutOpenFor, setCloseoutOpenFor] = useState<string | null>(null);
   const jiraValue = useMemo<JiraBoardValue>(

@@ -13,9 +13,8 @@ type Result = Promise<{ ok: boolean; error?: string }>;
 export type JiraCloseoutValue = {
   /** threadId → draft (jira_board_state.closeouts). */
   drafts: Record<string, CloseoutDraft>;
-  /** Thread ids this board sent done=true for; the overlay opens (and forgets the id) once a draft lands. */
-  // ponytail: an id whose Done made no draft stays until the next draft for it; fine while CLI drafts are rare.
-  doneRequested: Set<string>;
+  /** threadId → when this board sent done=true for it (epoch ms); the overlay opens once its draft lands. */
+  doneRequested: Map<string, number>;
   openFor: string | null;
   setOpenFor: (threadId: string | null) => void;
   submit: (threadId: string, tickets: { key: string; body: string; transition: boolean }[]) => Result;
@@ -23,17 +22,29 @@ export type JiraCloseoutValue = {
   draftWithAgent: (threadId: string, instruction?: string) => Result;
 };
 
+/** A remembered Done with no verdict yet is dropped after this long anyway. */
+const REQUEST_TTL_MS = 5 * 60_000;
+
 export function JiraCloseoutSlot() {
   const v = useContext(JiraBoardContext);
   const c = v?.enabled ? v.closeout : undefined;
+  const threads = v?.threads;
   useEffect(() => {
     if (!c) return;
-    for (const id of c.doneRequested) {
-      if (c.drafts[id] === undefined) continue;
-      c.doneRequested.delete(id);
-      if (c.openFor === null) c.setOpenFor(id);
+    for (const [id, at] of c.doneRequested) {
+      if (c.drafts[id] !== undefined) {
+        c.doneRequested.delete(id);
+        if (c.openFor === null) c.setOpenFor(id);
+        continue;
+      }
+      // finishDone writes the draft before the verdict: a verdict since the request with no draft means none is coming.
+      const rec = threads?.[id];
+      const settled = rec !== undefined && rec.verifying == null && rec.doneCheck != null && Date.parse(rec.doneCheck.at) >= at;
+      if (settled || Date.now() - at > REQUEST_TTL_MS) c.doneRequested.delete(id);
     }
-  }, [c]);
+    // The open draft went (posted or skipped elsewhere, or the thread left Done): close.
+    if (c.openFor !== null && c.drafts[c.openFor] === undefined) c.setOpenFor(null);
+  }, [c, threads]);
   if (!v || !c || c.openFor === null) return null;
   const d = c.drafts[c.openFor];
   if (!d) return null;
