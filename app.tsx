@@ -25,7 +25,8 @@ import { FocusBoardAppIcon } from "./components/ui/icon";
 import type { rpcContract } from "./server";
 import type { jiraRpcContract } from "./lib/jira-server";
 import { JiraBoardContext, type JiraBoardValue } from "./components/jira-card-badges";
-import { boardDoneIds } from "./lib/jira-done-check";
+import { boardDoneIds, type CloseoutDraft } from "./lib/jira-done-check";
+import { JiraCloseoutSlot } from "./components/jira-closeout";
 import { jiraThreadsByKey } from "./components/jira-column";
 import { Board } from "./components/board";
 import { BoardToolbar } from "./components/board-toolbar";
@@ -539,7 +540,8 @@ function BoardPage({ subPath }: { subPath: string }) {
     next: NonNullable<JiraBoardValue["nextByThread"]>;
     refreshRequestedAt: number | null; syncRanAt: number | null; syncEnabled: boolean;
     noNudge: ReadonlySet<string>;
-  }>({ enabled: false, stale: false, tickets: {}, threads: {}, pending: [], snapshotAge: null, error: null, suggestions: [], drift: [], autoLinks: [], next: {}, refreshRequestedAt: null, syncRanAt: null, syncEnabled: true, noNudge: new Set() });
+    closeouts: Record<string, CloseoutDraft>;
+  }>({ enabled: false, stale: false, tickets: {}, threads: {}, pending: [], snapshotAge: null, error: null, suggestions: [], drift: [], autoLinks: [], next: {}, refreshRequestedAt: null, syncRanAt: null, syncEnabled: true, noNudge: new Set(), closeouts: {} });
   const refetchJira = useCallback(() => {
     jiraRpc.call("jira_board_state", null).then(
       async (r) => {
@@ -562,6 +564,7 @@ function BoardPage({ subPath }: { subPath: string }) {
           syncEnabled: r.syncEnabled,
           // Same members keep the same Set: the card menu builder depends on it.
           noNudge: prev.noNudge.size === r.noNudge.length && r.noNudge.every((id) => prev.noNudge.has(id)) ? prev.noNudge : new Set(r.noNudge),
+          closeouts: r.closeouts,
         }));
       },
       () => {}, // Jira is optional state; the board works without it.
@@ -574,6 +577,12 @@ function BoardPage({ subPath }: { subPath: string }) {
   useRealtime("jira-reconcile-changed", () => {
     refetchScheduler.schedule("jira", refetchJira);
   });
+  // The closeout overlay opens by itself only for threads this board moved to Done.
+  const closeoutRequestedRef = useRef(new Set<string>());
+  const noteDoneRequest = useCallback((threadId: string) => {
+    closeoutRequestedRef.current.add(threadId);
+  }, []);
+  const [closeoutOpenFor, setCloseoutOpenFor] = useState<string | null>(null);
   const jiraValue = useMemo<JiraBoardValue>(
     () => ({
       enabled: jiraState.enabled,
@@ -583,13 +592,24 @@ function BoardPage({ subPath }: { subPath: string }) {
       pendingOps: jiraState.pending,
       nextByThread: jiraState.next,
       onAction: (kind, threadId, index, reason) => {
+        if (kind === "confirm-done" || kind === "skip-done") noteDoneRequest(threadId);
         jiraRpc.call("jira_card_action", { kind, threadId, ...(index === undefined ? {} : { index, reason }) }).then(refetchJira, () => {});
       },
       onUndo: (threadId, opIds) => {
         jiraRpc.call("jira_undo", { threadId, opIds }).then(refetchJira, () => {});
       },
+      closeout: {
+        drafts: jiraState.closeouts,
+        doneRequested: closeoutRequestedRef.current,
+        openFor: closeoutOpenFor,
+        setOpenFor: setCloseoutOpenFor,
+        submit: (threadId, tickets) => jiraRpc.call("jira_closeout_submit", { threadId, tickets }).finally(refetchJira),
+        skip: (threadId) => jiraRpc.call("jira_closeout_skip", { threadId }).finally(refetchJira),
+        draftWithAgent: (threadId, instruction) =>
+          jiraRpc.call("jira_closeout_draft_with_agent", { threadId, ...(instruction ? { instruction } : {}) }).finally(refetchJira),
+      },
     }),
-    [jiraState, jiraRpc, refetchJira],
+    [jiraState, jiraRpc, refetchJira, closeoutOpenFor, noteDoneRequest],
   );
   // Jira on: a card with a reason line (nudge, deeper check, failed Done check)
   // reads as Needs you. It rides the error-ack set (grouping.ts StateAcks) to
@@ -3369,6 +3389,7 @@ function BoardPage({ subPath }: { subPath: string }) {
               else next.add(thread.id);
               return next;
             });
+            if (!isThreadDone) noteDoneRequest(thread.id);
             rpc.call("done_set", { threadId: thread.id, done: !isThreadDone }).catch(() => {});
             // Local and optimistic: the card relocates to the Done lane (or
             // back out of it) in the same commit as this batch, so the
@@ -3439,7 +3460,7 @@ function BoardPage({ subPath }: { subPath: string }) {
         },
       }));
     },
-    [actions, applyUnreadStateEffects, clearParkPin, clearSnooze, doneAgeSource, doneIds, exitPinnedLane, familyIndex, filter, groupAssignments, openNewChildThread, pendingStateClaimsRef, persistFilter, persistGroupBy, releaseAttentionFor, requestReveal, restoreParkedPin, runBrowserReveal, rpc, setBrowserNotice, setDoneExtras, setDoneIds, setGroupDialogFor, setSnoozeDialogFor, snoozedIds, sdk, jiraState.enabled, jiraState.noNudge, jiraRpc, refetchJira],
+    [actions, applyUnreadStateEffects, clearParkPin, clearSnooze, doneAgeSource, doneIds, exitPinnedLane, familyIndex, filter, groupAssignments, openNewChildThread, pendingStateClaimsRef, persistFilter, persistGroupBy, releaseAttentionFor, requestReveal, restoreParkedPin, runBrowserReveal, rpc, setBrowserNotice, setDoneExtras, setDoneIds, setGroupDialogFor, setSnoozeDialogFor, snoozedIds, sdk, jiraState.enabled, jiraState.noNudge, jiraRpc, refetchJira, noteDoneRequest],
   );
 
   if (sidebarStatus === "loading" && threads.length === 0) {
@@ -3643,6 +3664,7 @@ function BoardPage({ subPath }: { subPath: string }) {
               const next = new Set(doneIds);
               next.add(threadId);
               setDoneIds(next);
+              noteDoneRequest(threadId);
               rpc.call("done_set", { threadId, done: true }).catch(() => {});
               // Done implies read: the card must not land in Done still
               // claiming unread (or come back from Mark Not Done unread).
@@ -3783,6 +3805,7 @@ function BoardPage({ subPath }: { subPath: string }) {
               else next.delete(openThreadId);
               return next;
             });
+            if (done) noteDoneRequest(openThreadId);
             rpc.call("done_set", { threadId: openThreadId, done }).catch(() => {});
           }}
           onToggleArchived={() => {
@@ -3982,6 +4005,7 @@ function BoardPage({ subPath }: { subPath: string }) {
           />
         );
       })()}
+      <JiraCloseoutSlot />
     </div>
     </PaneSheetCoverageProvider>
     </WallpaperActiveProvider>

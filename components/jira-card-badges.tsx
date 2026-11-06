@@ -6,6 +6,7 @@ import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import type { JiraTicket, QueueOp, ThreadJiraRecord } from "../lib/jira-schema";
 import type { JiraColumnData } from "./jira-column";
+import type { JiraCloseoutValue } from "./jira-closeout";
 import { MenuPopover, MenuPopoverEntry } from "./menu-popover";
 
 export type JiraCardKind =
@@ -23,6 +24,12 @@ const lozengeText = (status: string) => {
   const u = status.toUpperCase();
   return u.length > 14 ? `${u.slice(0, 13)}…` : u;
 };
+/** A ticket's status lozenge (also the closeout overlay's). */
+export const JiraLozenge = ({ status, category }: { status: string; category: JiraTicket["statusCategory"] }) => (
+  <span data-jira-lozenge="" className={cn("rounded px-1 font-sans text-[9px] font-semibold", LOZENGE[TONE[category]])}>
+    {lozengeText(status)}
+  </span>
+);
 /** Jira's mark, bundled so the chip never fetches an icon. */
 const JiraMark = () => (
   <svg viewBox="0 0 24 24" className="size-3 shrink-0" fill="#2684FF" aria-hidden data-jira-mark="">
@@ -49,9 +56,12 @@ export type JiraCardBadgesProps = {
   onSnooze?: (threadId: string) => void;
   /** Undo: cancel this thread's queued writes before a sync pass sends them (jira_undo). */
   onUndo?: (threadId: string, opIds: string[]) => void;
+  /** A Jira closeout draft waits for this thread (components/jira-closeout.tsx). */
+  closeoutPending?: boolean;
+  onOpenCloseout?: (threadId: string) => void;
 };
 
-export function JiraCardBadges({ part, threadId, enabled, stale, record, ticketByKey, pendingOps, onAction, next, onSnooze, onUndo }: JiraCardBadgesProps) {
+export function JiraCardBadges({ part, threadId, enabled, stale, record, ticketByKey, pendingOps, onAction, next, onSnooze, onUndo, closeoutPending, onOpenCloseout }: JiraCardBadgesProps) {
   if (!enabled) return null;
   const links = record?.links ?? [];
   const failed = record?.doneCheck?.verdict === "fail" ? record.doneCheck.reasons : [];
@@ -98,11 +108,7 @@ export function JiraCardBadges({ part, threadId, enabled, stale, record, ticketB
                 >
                   {l.key}
                 </a>
-                {t ? (
-                  <span data-jira-lozenge="" className={cn("rounded px-1 font-sans text-[9px] font-semibold", LOZENGE[tone])}>
-                    {lozengeText(t.status)}
-                  </span>
-                ) : null}
+                {t ? <JiraLozenge status={t.status} category={t.statusCategory} /> : null}
               </span>
             );
           })}
@@ -113,6 +119,19 @@ export function JiraCardBadges({ part, threadId, enabled, stale, record, ticketB
       ) : null;
   return (
     <div className="mt-1 flex flex-wrap items-center gap-1 px-3 pb-2 pl-1.5" data-jira-badges="">
+      {closeoutPending && onOpenCloseout ? (
+        <button
+          type="button"
+          className={cn(chip, "underline")}
+          data-jira-closeout-chip=""
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenCloseout(threadId);
+          }}
+        >
+          Closeout pending
+        </button>
+      ) : null}
       {/* An own op on no linked key (rare): Undo stands alone. */}
       {undoKey === undefined && undoButton ? <span className={chip}>{undoButton}</span> : null}
       {links.length === 0 ? (
@@ -224,12 +243,14 @@ export function JiraCardBadges({ part, threadId, enabled, stale, record, ticketB
   );
 }
 
-export type JiraBoardValue = Omit<JiraCardBadgesProps, "part" | "threadId" | "record" | "next"> & {
+export type JiraBoardValue = Omit<JiraCardBadgesProps, "part" | "threadId" | "record" | "next" | "closeoutPending" | "onOpenCloseout"> & {
   threads: Record<string, ThreadJiraRecord>;
   /** threadId → the deeper check's next step (jira_board_state.next). */
   nextByThread?: Record<string, NonNullable<JiraCardBadgesProps["next"]>>;
   /** The Jira column's data (components/jira-column.tsx); absent renders no column. */
   column?: JiraColumnData;
+  /** The Jira closeout drafts and overlay state (components/jira-closeout.tsx). */
+  closeout?: JiraCloseoutValue;
 };
 export const JiraBoardContext = createContext<JiraBoardValue | null>(null);
 
@@ -237,5 +258,15 @@ export const JiraBoardContext = createContext<JiraBoardValue | null>(null);
 export function JiraCardSlot({ threadId, part }: { threadId: string; part: JiraCardBadgesProps["part"] }) {
   const v = useContext(JiraBoardContext);
   if (v === null || !v.enabled) return null;
-  return <JiraCardBadges {...v} part={part} threadId={threadId} record={v.threads[threadId]} next={v.nextByThread?.[threadId]} />;
+  return (
+    <JiraCardBadges
+      {...v}
+      part={part}
+      threadId={threadId}
+      record={v.threads[threadId]}
+      next={v.nextByThread?.[threadId]}
+      closeoutPending={v.closeout?.drafts[threadId] !== undefined}
+      onOpenCloseout={v.closeout?.setOpenFor}
+    />
+  );
 }
