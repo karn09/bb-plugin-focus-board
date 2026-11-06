@@ -86,6 +86,8 @@ const SYNC_SOON_MS = 2_000;
 const MIGRATED_PR_UNAVAILABLE_KEY = "jira:migrated-pr-unavailable";
 /** threadId → the passed Done's closeout draft, waiting for the operator (nothing posts before it is submitted). */
 const CLOSEOUTS_KEY = "jira:closeouts";
+/** threadId → op ids a closeout submit queued (Done ops whatever their body says); pruned on ack and cancel. */
+const CLOSEOUT_OPS_KEY = "jira:closeout-ops";
 export const JIRA_RECONCILE_CHANGED = "jira-reconcile-changed";
 export const JIRA_CHANGED = "jira-changed";
 
@@ -383,6 +385,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       if (disposed) return;
       for (const r of results) if (!r.ok) passErrors.push(`op ${r.id}: ${r.error}`);
       await store.ack(results);
+      await pruneCloseoutOps();
     },
     ingest: async (snap) => {
       if (!disposed) await ingestSnap(snap);
@@ -455,6 +458,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       if (!parsed.success) return fail(`invalid results: ${parsed.error.message}`);
       try {
         await store.ack(parsed.data);
+        await pruneCloseoutOps();
       } catch (e) {
         return fail(`cannot record results: ${(e as Error).message}`);
       }
@@ -787,7 +791,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   // operatorConfirmed: the operator vouched for the work (Confirm done after no fresh
   // PR data), so the last known ticket data may close it; otherwise stale means comment only.
   const createCloseout = async (threadId: string, skipped: boolean, operatorConfirmed = false) => {
-    await closeouts.loaded;
+    await Promise.all([closeouts.loaded, closeoutOps.loaded]);
     if (closeouts.map.has(threadId) || (await store.pendingOps()).some(threadDoneOp(threadId))) return;
     const rec = await store.readThread(threadId);
     if (rec.links.length === 0) return;
@@ -1082,6 +1086,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   const nextSteps = persisted<z.infer<typeof NextStep>>(NEXT_STEPS_KEY);
   const noNudge = persisted<true>(NO_NUDGE_KEY);
   const closeouts = persisted<CloseoutDraft>(CLOSEOUTS_KEY);
+  const closeoutOps = persisted<string[]>(CLOSEOUT_OPS_KEY);
 
   /** A failed Done check owns the card while its reason shows; once activity clears the reason, normal reminders resume. */
   const checkHolds = (r: ThreadJiraRecord) => r.verifying !== null || (r.doneCheck?.verdict === "fail" && r.reason !== null);
@@ -1242,21 +1247,31 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
 
   // ---- The Jira closeout: the operator approves a passed Done's ticket writes. ----
   const NOTHING = "nothing to close out";
-  /** One of this thread's Done ops: the Done-summary comment or transition. */
-  const threadDoneOp = (threadId: string) => (o: QueueOp) => o.threadId === threadId && isDoneOp(o);
+  /** One of this thread's Done ops: the Done-summary comment or transition, or any op its closeout submit queued. */
+  const threadDoneOp = (threadId: string) => (o: QueueOp) => o.threadId === threadId && (isDoneOp(o) || (closeoutOps.map.get(threadId) ?? []).includes(o.id));
   const dropCloseout = async (threadId: string) => {
     await closeouts.loaded;
     if (!closeouts.map.has(threadId)) return;
     await closeouts.set(threadId, undefined);
     bb.realtime.publish(JIRA_CHANGED, {});
   };
+  /** Submitted op ids leave once acked or cancelled (no longer queued). */
+  async function pruneCloseoutOps() {
+    await closeoutOps.loaded;
+    if (closeoutOps.map.size === 0) return;
+    const queued = new Set((await store.pendingOps()).map((o) => o.id));
+    for (const [id, ids] of [...closeoutOps.map]) {
+      const kept = ids.filter((x) => queued.has(x));
+      if (kept.length !== ids.length) await closeoutOps.set(id, kept.length > 0 ? kept : undefined);
+    }
+  }
   /** "The agent is drafting" ends when every key got a body or after CLOSEOUT_AGENT_MS. */
   const closeoutView = (d: CloseoutDraft): CloseoutDraft =>
     d.agentDrafting && Date.now() - (d.requestedAt ?? 0) >= CLOSEOUT_AGENT_MS ? { ...d, agentDrafting: false } : d;
   const closeoutGuard = async (threadId: string) => {
     if (!(await enabled())) return { ok: false, error: OFF };
     if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread" };
-    await closeouts.loaded;
+    await Promise.all([closeouts.loaded, closeoutOps.loaded]);
     return null;
   };
   /** Inside onceQueued: validate against the draft, drop it, queue each ticket's comment (and chosen transition). */
@@ -1275,6 +1290,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       ids.push((await store.enqueue({ op: "comment", key: t.key, body: t.body, threadId })).id);
       if (t.transition) ids.push((await store.enqueue({ op: "transition", key: t.key, toCategory: "done", threadId })).id);
     }
+    await closeoutOps.set(threadId, [...(closeoutOps.map.get(threadId) ?? []), ...ids]);
     bb.realtime.publish(JIRA_CHANGED, {});
     return { ok: true, queued: ids.length };
   };
@@ -1408,11 +1424,13 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         const ids = [...new Set([...mine.map((o) => o.id), ...(opIds ?? [])])].filter((id) => !foreign.has(id));
         if (ids.length === 0) return { ok: true, ...none };
         const { cancelled, tooLate } = await store.cancel(ids);
-
+        await closeoutOps.loaded;
+        const isMineDone = threadDoneOp(threadId);
+        await pruneCloseoutOps();
         // Every linked ticket's Done writes cancelled now (none already sent or being sent): the Done itself
         // is undone and the card returns to its lane. A key with no pending Done op had its writes sent.
         const rec = await store.readThread(threadId);
-        const doneOps = mine.filter(isDoneOp);
+        const doneOps = mine.filter(isMineDone);
         const keyUndone = (key: string) => {
           const ops = doneOps.filter((o) => "key" in o && o.key === key);
           return ops.length > 0 && ops.every((o) => cancelled.includes(o.id));

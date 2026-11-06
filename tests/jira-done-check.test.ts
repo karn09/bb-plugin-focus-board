@@ -984,6 +984,37 @@ describe("Done check flow", () => {
     expect(await ops()).toEqual([]);
   });
 
+  it("closeout: Undo after a submit with an edited (prefix-less) body still un-stamps Done", async () => {
+    await passed();
+    await submit("t1", [{ key: "PT-1", body: "Shipped it.", transition: true }]);
+    expect(await bb.storage.kv.get("jira:closeout-ops")).toEqual({ t1: expect.arrayContaining([expect.any(String)]) });
+    expect(await undo()).toEqual({ ok: true, cancelled: 2, tooLate: 0 });
+    expect(doneOf("t1")).toBeUndefined();
+    expect(jiraOf("t1")?.doneCheck).toBeNull();
+    expect(await bb.storage.kv.get("jira:closeout-ops")).toEqual({});
+  });
+
+  it("closeout: a re-Done while the submitted (edited) ops are still queued makes no second draft", async () => {
+    await passed();
+    await submit("t1", [{ key: "PT-1", body: "Shipped it.", transition: false }]);
+    await doneSet("t1", false);
+    await doneSet("t1");
+    expect(await closeoutGet()).toBeNull();
+    expect((await ops()).length).toBe(1);
+  });
+
+  it("closeout: acked ops leave jira:closeout-ops", async () => {
+    await passed();
+    await submit("t1", [{ key: "PT-1", body: "Shipped it.", transition: false }]);
+    const ids = (await ops()).map((o: any) => o.id);
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const f = join(mkdtempSync(join((await import("node:os")).tmpdir(), "ack-")), "r.json");
+    writeFileSync(f, JSON.stringify(ids.map((id: string) => ({ id, ok: true, error: null, createdKey: null }))));
+    expect((await harness.behavior.runCli(["jira", "ack", "--file", f])).exitCode).toBe(0);
+    expect(await bb.storage.kv.get("jira:closeout-ops")).toEqual({});
+  });
+
   it("closeout with Jira off: no draft, the RPCs refuse", async () => {
     seed("t1");
     await load({ enabled: false, snapshot: snap({ prs: [pr(1, "merged")] }) });
