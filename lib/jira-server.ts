@@ -19,7 +19,10 @@ import { createIdleWaiters, sendIfIdle, type JobKind } from "./jira-idle";
 import { findTicketText, JIRA_AGENT_TOOLS, JIRA_LINK_TOOL, JIRA_SPAWN_TOOL, jiraConfigure, JiraLinkParams, promoteEpicText, SpawnChildParams, titleWithKey, trackedRegisterTool } from "./jira-agent";
 import { extractJiraKeys, jiraBrowseUrl } from "./jira-keys";
 import { fixQueued, livePrs, prUrl } from "./jira-drift";
-import { capReasons, CHECKING_PRS, DATA_WAIT_MS, DONE_SUMMARY_PREFIX, doneSummary, evaluateMechanical, JIRA_VERDICT_TOOL, NO_PR_DATA, spinOffText, ticketUpdate, verifyTurnText } from "./jira-done-check";
+import {
+  capReasons, CHECKING_PRS, CLOSEOUT_AGENT_MS, CLOSEOUT_MAX, CLOSEOUT_TOOL, CloseoutDraft, closeoutDraftText, DATA_WAIT_MS, DONE_SUMMARY_PREFIX, doneSummary,
+  evaluateMechanical, JIRA_VERDICT_TOOL, NO_PR_DATA, spinOffText, ticketUpdate, transitionBlock, verifyTurnText,
+} from "./jira-done-check";
 import { deepCheckFindings, NUDGE_TEXT, planReminders, replyLine, type DeepNext, type ReminderThread } from "./jira-reminders";
 import { applyReconcile, externalJiraKey, planReconcile, StoredReconcilePlan, threadPrsOf, type ReconThread } from "./jira-reconcile";
 import { DriftItem, JiraTicket, OpResult, QueueOp, ThreadJiraRecord } from "./jira-schema";
@@ -81,6 +84,8 @@ const SYNC_RAN_KEY = "jira:script-seen-at";
 const SYNC_SOON_MS = 2_000;
 /** Set once the old "PR status unavailable" failed checks were cleared (a one-time startup migration). */
 const MIGRATED_PR_UNAVAILABLE_KEY = "jira:migrated-pr-unavailable";
+/** threadId → the passed Done's closeout draft, waiting for the operator (nothing posts before it is submitted). */
+const CLOSEOUTS_KEY = "jira:closeouts";
 export const JIRA_RECONCILE_CHANGED = "jira-reconcile-changed";
 export const JIRA_CHANGED = "jira-changed";
 
@@ -121,7 +126,23 @@ export const jiraRpcContract = defineRpcContract({
       syncEnabled: z.boolean(),
       /** Threads the operator excluded from nudges (Don't nudge). */
       noNudge: z.array(z.string()),
+      /** Passed Dones waiting for the operator's Jira closeout. */
+      closeouts: z.record(z.string(), CloseoutDraft),
     }),
+  },
+  /** A thread's closeout draft, or null. */
+  jira_closeout_get: { input: z.object({ threadId: z.string() }), output: CloseoutDraft.nullable() },
+  /** Post & close: the draft goes and its comments (and chosen transitions) are queued. */
+  jira_closeout_submit: {
+    input: z.object({ threadId: z.string(), tickets: z.array(z.object({ key: JiraTicket.shape.key, body: z.string(), transition: z.boolean() })) }),
+    output: z.object({ ok: z.boolean(), queued: z.number().int(), error: z.string().optional() }),
+  },
+  /** Skip Jira: the draft goes, nothing is queued, the thread stays Done. */
+  jira_closeout_skip: { input: z.object({ threadId: z.string() }), output: z.object({ ok: z.boolean(), error: z.string().optional() }) },
+  /** One turn asking the thread's agent to write the closeout (focus_board_closeout_draft). */
+  jira_closeout_draft_with_agent: {
+    input: z.object({ threadId: z.string(), instruction: z.string().max(500).optional() }),
+    output: z.object({ ok: z.boolean(), error: z.string().optional() }),
   },
   /** A card's Undo: cancel the thread's queued writes not sent yet (opIds: the ones the card showed, so already-sent ones count as tooLate). */
   jira_undo: {
@@ -236,10 +257,10 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   const awaitingVerdict = (threadId: string, rec: ThreadJiraRecord | undefined) => rec?.verifying != null && verifySent.get(threadId) === rec.verifying.startedAt;
   bb.agents.configure((context) => {
     const j = jiraConfigure(cfg.enabled, cfg, context.pluginMetadata as Record<string, unknown>, context.origin?.kind === "fork");
-    const others = toolNames.filter((n) => !JIRA_AGENT_TOOLS.includes(n) && n !== JIRA_VERDICT_TOOL);
+    const others = toolNames.filter((n) => !JIRA_AGENT_TOOLS.includes(n) && n !== JIRA_VERDICT_TOOL && n !== CLOSEOUT_TOOL);
     // The verdict tool whenever on: configure lands only at session start/resume, so a
     // live session must already hold it; the handler refuses unless a verify turn was sent.
-    const tools = [...others, ...j.tools, ...(cfg.enabled ? [JIRA_VERDICT_TOOL] : [])];
+    const tools = [...others, ...j.tools, ...(cfg.enabled ? [JIRA_VERDICT_TOOL, CLOSEOUT_TOOL] : [])];
     return { tools, skills: [], ...(j.instructions ? { instructions: j.instructions } : {}) };
   });
 
@@ -565,7 +586,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
 
   // Check-then-enqueue on one chain: a double click (or two windows) queues
   // a fix once; the second press sees the first's ops still pending.
-  type ColumnResult = { ok: boolean; error?: string; alreadyQueued?: true };
+  type ColumnResult = { ok: boolean; error?: string; alreadyQueued?: true; queued?: number };
   let queueing: Promise<unknown> = Promise.resolve();
   const onceQueued = (isQueued: (ops: QueueOp[]) => boolean, task: () => Promise<ColumnResult>): Promise<ColumnResult> => {
     const run = queueing.then(async () => (isQueued(await store.pendingOps()) ? { ok: true, alreadyQueued: true as const } : task()));
@@ -759,45 +780,50 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     notDone(threadId);
   };
 
-  // Comment (and maybe transition) on every linked ticket, once: a second
-  // Done while the first's Done ops are un-acked queues nothing.
+  // The closeout draft: the Done-summary template per linked ticket not already
+  // done, with the old ticket-update transition rule as its default. Nothing is
+  // queued until the operator submits it. Once per Done: a draft already there,
+  // or this thread's Done ops still queued from an earlier submit, writes nothing.
   // operatorConfirmed: the operator vouched for the work (Confirm done after no fresh
   // PR data), so the last known ticket data may close it; otherwise stale means comment only.
-  const queueTicketUpdate = (threadId: string, skipped: boolean, operatorConfirmed = false) =>
-    onceQueued(
-      (ops) => ops.some((o) => o.threadId === threadId && isDoneOp(o)),
-      async () => {
-        const rec = await store.readThread(threadId);
-        if (rec.links.length === 0) return { ok: true };
-        const f = await doneFacts(threadId);
-        const summary = doneSummary({
-          title: f.title,
-          prUrls: f.prs.filter((p) => p.state !== "closed").map(prUrl),
-          closedUrls: f.prs.filter((p) => p.state === "closed").map(prUrl),
-          childKeys: f.children.flatMap((c) => c.keys),
-          skipped,
-        });
-        const live = f.rows.filter((r) => r.archivedAt === null);
-        for (const l of rec.links) {
-          // Unknown or stale ticket data: comment only, never a blind transition.
-          const t = f.stale && !operatorConfirmed ? undefined : f.snapshot?.tickets.find((x) => x.key === l.key);
-          let ops: NewQueueOp[] = [{ op: "comment", key: l.key, body: summary, threadId: null }];
-          if (t) {
-            const linkedThreadsDone: boolean[] = [];
-            for (const r of live) if ((await store.readThread(r.id)).links.some((x) => x.key === l.key)) linkedThreadsDone.push(await isDone(r.id));
-            ops = ticketUpdate({ ticket: t, linkedThreadsDone, role: l.role, skipped, summary });
-          }
-          for (const op of ops) await store.enqueue({ ...op, threadId });
-        }
-        return { ok: true };
-      },
-    );
+  const createCloseout = async (threadId: string, skipped: boolean, operatorConfirmed = false) => {
+    await closeouts.loaded;
+    if (closeouts.map.has(threadId) || (await store.pendingOps()).some(threadDoneOp(threadId))) return;
+    const rec = await store.readThread(threadId);
+    if (rec.links.length === 0) return;
+    const f = await doneFacts(threadId);
+    const body = doneSummary({
+      title: f.title,
+      prUrls: f.prs.filter((p) => p.state !== "closed").map(prUrl),
+      closedUrls: f.prs.filter((p) => p.state === "closed").map(prUrl),
+      childKeys: f.children.flatMap((c) => c.keys),
+      skipped,
+    });
+    const live = f.rows.filter((r) => r.archivedAt === null);
+    const tickets: CloseoutDraft["tickets"] = [];
+    for (const l of rec.links) {
+      const known = f.snapshot?.tickets.find((x) => x.key === l.key);
+      if (known?.statusCategory === "done") continue;
+      // Unknown or stale ticket data: comment only, never a blind transition.
+      const t = f.stale && !operatorConfirmed ? undefined : known;
+      let blocked: string | null = skipped ? "marked done without the check" : "no fresh ticket data";
+      if (t) {
+        const linkedThreadsDone: boolean[] = [];
+        for (const r of live) if ((await store.readThread(r.id)).links.some((x) => x.key === l.key)) linkedThreadsDone.push(await isDone(r.id));
+        blocked = transitionBlock({ ticket: t, linkedThreadsDone, role: l.role, skipped });
+      }
+      tickets.push({ key: l.key, body, transition: blocked === null, canTransition: blocked === null, ...(blocked === null ? {} : { blocked }) });
+    }
+    if (tickets.length === 0) return;
+    await closeouts.set(threadId, { createdAt: isoNow(), skipped, tickets });
+    bb.realtime.publish(JIRA_CHANGED, {});
+  };
 
-  /** The final Done: stamp, queue the ticket update, then record the verdict
-   *  (a crash before the last write leaves `verifying`, so the resumed check re-queues; onceQueued dedupes). */
+  /** The final Done: stamp, store the closeout draft, then record the verdict
+   *  (a crash before the last write leaves `verifying`, so the resumed check re-runs; an existing draft is kept). */
   const finishDone = async (threadId: string, skipped: boolean, operatorConfirmed = false) => {
     await markDone(threadId);
-    await queueTicketUpdate(threadId, skipped, operatorConfirmed);
+    await createCloseout(threadId, skipped, operatorConfirmed);
     await store.updateThread(threadId, () => ({
       verifying: null,
       reason: null,
@@ -1055,6 +1081,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   const snoozeSeen = persisted<number>(SNOOZE_SEEN_KEY);
   const nextSteps = persisted<z.infer<typeof NextStep>>(NEXT_STEPS_KEY);
   const noNudge = persisted<true>(NO_NUDGE_KEY);
+  const closeouts = persisted<CloseoutDraft>(CLOSEOUTS_KEY);
 
   /** A failed Done check owns the card while its reason shows; once activity clears the reason, normal reminders resume. */
   const checkHolds = (r: ThreadJiraRecord) => r.verifying !== null || (r.doneCheck?.verdict === "fail" && r.reason !== null);
@@ -1213,6 +1240,71 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   };
   bb.background.schedule("jira-reminders", "*/5 * * * *", () => reminderPass().catch(logFail("pass")));
 
+  // ---- The Jira closeout: the operator approves a passed Done's ticket writes. ----
+  const NOTHING = "nothing to close out";
+  /** One of this thread's Done ops: the Done-summary comment or transition. */
+  const threadDoneOp = (threadId: string) => (o: QueueOp) => o.threadId === threadId && isDoneOp(o);
+  const dropCloseout = async (threadId: string) => {
+    await closeouts.loaded;
+    if (!closeouts.map.has(threadId)) return;
+    await closeouts.set(threadId, undefined);
+    bb.realtime.publish(JIRA_CHANGED, {});
+  };
+  /** "The agent is drafting" ends when every key got a body or after CLOSEOUT_AGENT_MS. */
+  const closeoutView = (d: CloseoutDraft): CloseoutDraft =>
+    d.agentDrafting && Date.now() - (d.requestedAt ?? 0) >= CLOSEOUT_AGENT_MS ? { ...d, agentDrafting: false } : d;
+  const closeoutGuard = async (threadId: string) => {
+    if (!(await enabled())) return { ok: false, error: OFF };
+    if (!(await deps.liveLinks()).some((t) => t.id === threadId)) return { ok: false, error: "unknown thread" };
+    await closeouts.loaded;
+    return null;
+  };
+  /** Inside onceQueued: validate against the draft, drop it, queue each ticket's comment (and chosen transition). */
+  const submitCloseout = async (threadId: string, tickets: { key: string; body: string; transition: boolean }[]): Promise<ColumnResult> => {
+    const d = closeouts.map.get(threadId);
+    if (!d) return { ok: false, error: NOTHING };
+    const want = d.tickets.map((t) => t.key).sort().join(" ");
+    if (tickets.map((t) => t.key).sort().join(" ") !== want) return { ok: false, error: `tickets must be exactly ${want}` };
+    for (const t of tickets) {
+      if (t.body.trim() === "" || t.body.length > CLOSEOUT_MAX) return { ok: false, error: `${t.key}: the comment must be 1 to ${CLOSEOUT_MAX} characters` };
+      if (t.transition && !d.tickets.find((x) => x.key === t.key)!.canTransition) return { ok: false, error: `${t.key} cannot move to Done` };
+    }
+    await closeouts.set(threadId, undefined);
+    const ids: string[] = [];
+    for (const t of tickets) {
+      ids.push((await store.enqueue({ op: "comment", key: t.key, body: t.body, threadId })).id);
+      if (t.transition) ids.push((await store.enqueue({ op: "transition", key: t.key, toCategory: "done", threadId })).id);
+    }
+    bb.realtime.publish(JIRA_CHANGED, {});
+    return { ok: true, queued: ids.length };
+  };
+
+  // Offered whenever Jira is on (sessions don't hot-reload tools); refuses unless this thread has a draft naming the key.
+  registerTool({
+    name: CLOSEOUT_TOOL,
+    description:
+      "Write the Jira closeout comment for one of this thread's tickets, only when the operator asked for it. Plain text, at most 4,000 characters. The operator reviews and posts it; this never posts.",
+    parameters: z.object({ key: JiraTicket.shape.key, body: z.string().min(1) }),
+    execute: async ({ key, body }, ctx) => {
+      if (!(await enabled())) return toolText(TOOL_OFF, true);
+      await closeouts.loaded;
+      return perThread(ctx.threadId, async () => {
+        const d = closeouts.map.get(ctx.threadId);
+        if (!d || !d.tickets.some((t) => t.key === key)) return toolText(`No closeout draft for this thread names ${JSON.stringify(key)}; nothing was written.`, true);
+        const drafted = [...new Set([...(d.drafted ?? []), key])];
+        const all = d.tickets.every((t) => drafted.includes(t.key));
+        await closeouts.set(ctx.threadId, {
+          ...d,
+          tickets: d.tickets.map((t) => (t.key === key ? { ...t, body: body.slice(0, CLOSEOUT_MAX) } : t)),
+          drafted,
+          ...(all ? { agentDrafting: false } : {}),
+        });
+        bb.realtime.publish(JIRA_CHANGED, {});
+        return toolText(`Saved the closeout draft for ${JSON.stringify(key)}. The operator reviews and posts it; make no Jira write.`);
+      });
+    },
+  });
+
   bb.rpc.register(jiraRpcContract, {
     jira_reconcile_plan: () =>
       serial(async () => {
@@ -1231,11 +1323,11 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     },
     jira_board_state: async () => {
       const s = jiraSettings(await deps.settings());
-      if (!s.enabled) return { enabled: false, snapshotAge: null, stale: false, error: null, tickets: [], threads: {}, pending: {}, next: {}, refreshRequestedAt: null, syncRanAt: null, syncEnabled: false, noNudge: [] };
+      if (!s.enabled) return { enabled: false, snapshotAge: null, stale: false, error: null, tickets: [], threads: {}, pending: {}, next: {}, refreshRequestedAt: null, syncRanAt: null, syncEnabled: false, noNudge: [], closeouts: {} };
       const { snapshot, ageMs, stale, error } = await store.readSnapshot();
       const threads: Record<string, ThreadJiraRecord> = {};
       for (const { id } of await deps.liveLinks()) threads[id] = await store.readThread(id);
-      await Promise.all([nextSteps.loaded, noNudge.loaded]);
+      await Promise.all([nextSteps.loaded, noNudge.loaded, closeouts.loaded]);
       const next = Object.fromEntries([...nextSteps.map].filter(([id, n]) => threads[id]?.reason === n.reason));
       return {
         enabled: true,
@@ -1250,7 +1342,53 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         syncRanAt: await num(SYNC_RAN_KEY),
         syncEnabled: s.sync,
         noNudge: [...noNudge.map.keys()],
+        closeouts: Object.fromEntries([...closeouts.map].filter(([id]) => id in threads).map(([id, d]) => [id, closeoutView(d)])),
       };
+    },
+    jira_closeout_get: async ({ threadId }) => {
+      if (!(await enabled())) return null;
+      await closeouts.loaded;
+      const d = closeouts.map.get(threadId);
+      return d ? closeoutView(d) : null;
+    },
+    jira_closeout_submit: async ({ threadId, tickets }) => {
+      const guard = await closeoutGuard(threadId);
+      if (guard) return { ...guard, queued: 0 };
+      return perThread(threadId, async () => {
+        const r = await onceQueued((ops) => ops.some(threadDoneOp(threadId)), () => submitCloseout(threadId, tickets));
+        return r.alreadyQueued ? { ok: false, queued: 0, error: NOTHING } : { ok: r.ok, queued: r.queued ?? 0, ...(r.error ? { error: r.error } : {}) };
+      });
+    },
+    jira_closeout_skip: async ({ threadId }) => {
+      const guard = await closeoutGuard(threadId);
+      if (guard) return guard;
+      return perThread(threadId, async () => {
+        if (!closeouts.map.has(threadId)) return { ok: false, error: NOTHING };
+        await dropCloseout(threadId);
+        return { ok: true };
+      });
+    },
+    jira_closeout_draft_with_agent: async ({ threadId, instruction }) => {
+      const guard = await closeoutGuard(threadId);
+      if (guard) return guard;
+      return perThread(threadId, async () => {
+        const d = closeouts.map.get(threadId);
+        if (!d) return { ok: false, error: NOTHING };
+        // Marked before the send: the agent's tool calls may land before sendIfIdle returns.
+        await closeouts.set(threadId, { ...d, agentDrafting: true, requestedAt: Date.now(), drafted: [] });
+        let error: string | undefined;
+        try {
+          const r = await sendIfIdle(bb.sdk.threads as never, threadId, closeoutDraftText(d.tickets.map((t) => t.key), instruction), { log: warn });
+          if (r === "busy") error = "thread is busy — try after this turn";
+          if (r === "gone") error = "thread gone";
+        } catch (e) {
+          error = `not sent: ${(e as Error).message}`;
+        }
+        const cur = closeouts.map.get(threadId);
+        if (error !== undefined && cur) await closeouts.set(threadId, { ...cur, agentDrafting: false });
+        bb.realtime.publish(JIRA_CHANGED, {});
+        return error === undefined ? { ok: true } : { ok: false, error };
+      });
     },
     jira_set_no_nudge: async ({ threadId, value }) => {
       if (!(await enabled())) return { ok: false, error: OFF };
@@ -1270,6 +1408,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         const ids = [...new Set([...mine.map((o) => o.id), ...(opIds ?? [])])].filter((id) => !foreign.has(id));
         if (ids.length === 0) return { ok: true, ...none };
         const { cancelled, tooLate } = await store.cancel(ids);
+
         // Every linked ticket's Done writes cancelled now (none already sent or being sent): the Done itself
         // is undone and the card returns to its lane. A key with no pending Done op had its writes sent.
         const rec = await store.readThread(threadId);
@@ -1281,6 +1420,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         if (rec.links.length > 0 && rec.links.every((l) => keyUndone(l.key)) && rec.doneCheck?.verdict === "pass") {
           await deps.unmarkDone?.(threadId);
           await store.writeThread(threadId, { doneCheck: null });
+          await dropCloseout(threadId);
         }
         return { ok: true, cancelled: cancelled.length, tooLate: tooLate.length };
       });
@@ -1374,7 +1514,11 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     enabled,
     startDoneCheck,
     /** Leaving Done while on: Keep working's path (no stamp, no ops). */
-    stopDoneCheck: (threadId: string) => perThread(threadId, () => endCheck(threadId)).then(() => undefined),
+    stopDoneCheck: (threadId: string) =>
+      perThread(threadId, async () => {
+        await endCheck(threadId);
+        await dropCloseout(threadId);
+      }),
     /** Board links cleared (link_clear): their Jira keys leave the thread's record too. */
     async unlinkCleared(threadId: string, before: ThreadLink[] | null, after: ThreadLink[] | null) {
       const kept = new Set((after ?? []).flatMap((l) => (l.tracker === "external" && l.jira ? [l.jira.key] : [])));

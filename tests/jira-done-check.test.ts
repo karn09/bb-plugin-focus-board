@@ -168,6 +168,14 @@ describe("Done check flow", () => {
   const jiraOf = (id: string) => metadata.get(id)?.jira as Record<string, any> | undefined;
   const doneOf = (id: string) => metadata.get(id)?.[DONE_METADATA_KEY];
   const ops = async () => ((await bb.storage.kv.get("jira:queue")) as { op: string; key: string; toCategory?: string; body?: string }[] | undefined) ?? [];
+  const closeoutGet = (threadId = "t1") => harness.behavior.callRpc("jira_closeout_get", { threadId }) as Promise<any>;
+  const submit = (threadId: string, tickets: { key: string; body: string; transition: boolean }[]) =>
+    harness.behavior.callRpc("jira_closeout_submit", { threadId, tickets }) as Promise<{ ok: boolean; queued: number; error?: string }>;
+  /** The operator approves the closeout draft as drafted (Post & close). */
+  const approve = async (threadId = "t1") => {
+    const d = await closeoutGet(threadId);
+    if (d) expect(await submit(threadId, d.tickets.map((t: any) => ({ key: t.key, body: t.body, transition: t.transition })))).toMatchObject({ ok: true });
+  };
   const doneSet = (threadId: string, done = true) => harness.behavior.callRpc("done_set", { threadId, done });
   const card = (kind: string, threadId = "t1", index?: number, reason?: string) =>
     harness.behavior.callRpc("jira_card_action", { kind, threadId, ...(index === undefined ? {} : { index }), ...(reason === undefined ? {} : { reason }) }) as Promise<{ ok: boolean; error?: string }>;
@@ -196,6 +204,8 @@ describe("Done check flow", () => {
     expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
     expect(jiraOf("t1")?.verifying).toBeNull();
     expect(jiraOf("t1")?.doneCheck).toMatchObject({ verdict: "pass" });
+    expect(await ops()).toEqual([]); // nothing posts before the operator approves the closeout
+    await approve();
     expect((await ops()).map((o) => (o.op === "transition" ? `transition ${o.toCategory}` : o.op))).toEqual(["comment", "transition done"]);
     expect((await ops())[0]!.body).toContain("https://github.com/o/r/pull/1");
     expect(send).not.toHaveBeenCalled();
@@ -231,6 +241,7 @@ describe("Done check flow", () => {
     await ingest(snap({ prs: [pr(1, "merged"), pr(2, "closed")] }));
     expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
     expect(jiraOf("t1")).toMatchObject({ verifying: null, doneCheck: { verdict: "pass" } });
+    await approve();
     const o = await ops();
     expect(o.map((x) => (x.op === "transition" ? `transition ${x.toCategory}` : x.op))).toEqual(["comment", "transition done"]);
     expect(o[0]!.body).toContain("https://github.com/o/r/pull/1");
@@ -262,6 +273,7 @@ describe("Done check flow", () => {
       expect(harness.inspection.realtimeSignals).not.toContainEqual({ channel: "done-changed", payload: { threadId: "t1", done: false } });
       expect(await card("confirm-done")).toEqual({ ok: true });
       expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
+      await approve();
       expect((await ops()).map((o) => o.op)).toEqual(["comment"]);
     } finally {
       vi.useRealTimers();
@@ -277,6 +289,7 @@ describe("Done check flow", () => {
       await vi.advanceTimersByTimeAsync(3 * 60_000 + 5_000);
       await flush();
       expect(await card("confirm-done")).toEqual({ ok: true });
+      await approve();
       expect((await ops()).map((o) => (o.op === "transition" ? `transition ${o.toCategory}` : o.op))).toEqual(["comment", "transition done"]);
     } finally {
       vi.useRealTimers();
@@ -323,6 +336,7 @@ describe("Done check flow", () => {
     expect(jiraOf("t1")).toMatchObject({ reason: null, doneCheck: { verdict: "pending-confirm", reasons: [] } });
     expect(await card("confirm-done")).toEqual({ ok: true });
     expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
+    await approve();
     expect((await ops()).map((o) => o.op)).toEqual(["comment", "transition"]);
   });
 
@@ -347,6 +361,7 @@ describe("Done check flow", () => {
     expect(jiraOf("t1")?.doneCheck.verdict).toBe("pending-confirm");
     await Promise.all([card("confirm-done"), card("confirm-done")]);
     expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
+    await approve();
     expect((await ops()).map((o) => o.op)).toEqual(["comment", "transition"]);
   });
 
@@ -395,6 +410,7 @@ describe("Done check flow", () => {
     expect(await card("skip-done")).toEqual({ ok: true });
     expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
     expect(jiraOf("t1")).toMatchObject({ verifying: null, reason: null, doneCheck: { skipped: true } });
+    await approve();
     expect((await ops()).map((o) => o.op)).toEqual(["comment"]);
     expect(await harness.behavior.callRpc("jira_done_confirm", { threadId: "t1", skip: true })).toEqual({ ok: false, error: "already done" });
     expect((await ops()).map((o) => o.op)).toEqual(["comment"]);
@@ -406,6 +422,7 @@ describe("Done check flow", () => {
     await load({ snapshot: snap({ prs: [pr(1, "merged")] }) });
     await doneSet("t1");
     expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
+    await approve();
     expect((await ops()).map((o) => o.op)).toEqual(["comment"]);
   });
 
@@ -527,13 +544,13 @@ describe("Done check flow", () => {
     expect(jiraOf("t1")).toMatchObject({ reason: "b", doneCheck: { verdict: "fail", reasons: ["b"] } });
   });
 
-  it("finishDone queues the ticket ops before clearing verifying", async () => {
+  it("finishDone writes the closeout draft before clearing verifying", async () => {
     seed("t1");
     const order: string[] = [];
     await load({ snapshot: snap({ prs: [pr(1, "merged")] }) });
     const set = bb.storage.kv.set.bind(bb.storage.kv);
     vi.spyOn(bb.storage.kv, "set").mockImplementation(async (k: string, v: unknown) => {
-      if (k === "jira:queue") order.push("enqueue");
+      if (k === "jira:closeouts") order.push("enqueue");
       return set(k, v as never);
     });
     metaHook = (set) => {
@@ -549,6 +566,7 @@ describe("Done check flow", () => {
     seed("t1", { doneCheck: { at: "x", verdict: "fail", reasons: ["r"] }, reason: "r" });
     await load();
     expect(await card("skip-done")).toEqual({ ok: true });
+    await approve();
     await bb.storage.kv.set("jira:queue", []); // the script drained and acked
     expect(await harness.behavior.callRpc("jira_done_confirm", { threadId: "t1", skip: true })).toEqual({ ok: false, error: "already done" });
     expect(await card("skip-done")).toEqual({ ok: false, error: "already done" });
@@ -578,6 +596,7 @@ describe("Done check flow", () => {
     seed("t1");
     await load({ snapshot: snap({ prs: [pr(1, "merged")] }), kv: { "jira:queue": [{ id: "o1", createdAt: "x", threadId: "t1", op: "comment", key: "PT-1", body: "Focus Board: moving this to In Progress." }] } });
     await doneSet("t1");
+    await approve();
     expect((await ops()).map((o) => o.op)).toEqual(["comment", "comment", "transition"]);
   });
 
@@ -640,6 +659,7 @@ describe("Done check flow", () => {
     await load({ snapshot: snap({ prs: [pr(1, "merged")] }) });
     await doneSet("t1");
     expect(jiraOf("t1")?.doneCheck).toMatchObject({ verdict: "pass" });
+    await approve();
     expect((await ops()).length).toBe(2);
   };
 
@@ -821,6 +841,159 @@ describe("Done check flow", () => {
     await doneSet("t1");
     expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
     expect((await ops()).filter((o) => o.key === "PT-1")).toEqual([]);
+  });
+  // ---- Jira closeout: nothing posts until the operator approves the draft ----
+  const draftTool = (input: object, threadId = "t1") =>
+    harness.callAgentTool("focus_board_closeout_draft", input, { threadId, projectId: "p1" }) as Promise<{ isError?: boolean; content: { text: string }[] }>;
+  const asIs = (d: any) => d.tickets.map((t: any) => ({ key: t.key, body: t.body, transition: t.transition }));
+  const passed = async (over: object = {}, tickets?: JiraTicket[]) => {
+    seed("t1", over);
+    await load({ snapshot: snap({ prs: [pr(1, "merged")], ...(tickets ? { tickets } : {}) }) });
+    await doneSet("t1");
+    expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
+  };
+  const two = { links: [{ key: "PT-1", role: "owner", source: "auto" }, { key: "PT-2", role: "owner", source: "auto" }] };
+
+  it("closeout: a passed check stamps Done and stores a template draft; no op is queued", async () => {
+    await passed();
+    expect(await ops()).toEqual([]);
+    const d = await closeoutGet();
+    expect(d).toMatchObject({ skipped: false, createdAt: expect.any(String), tickets: [{ key: "PT-1", transition: true, canTransition: true }] });
+    expect(d.tickets[0].body.startsWith("Focus Board: thread ")).toBe(true);
+    expect(d.tickets[0].body).toContain("https://github.com/o/r/pull/1");
+    const state = (await harness.behavior.callRpc("jira_board_state", null)) as { closeouts: Record<string, unknown> };
+    expect(state.closeouts.t1).toMatchObject({ tickets: [{ key: "PT-1" }] });
+  });
+
+  it("closeout: tickets already done are left out; none left means no draft", async () => {
+    await passed(two, [ticket(), ticket({ key: "PT-2", statusCategory: "done", status: "Done" })]);
+    expect((await closeoutGet()).tickets.map((t: any) => t.key)).toEqual(["PT-1"]);
+    await harness.lifecycle.dispose();
+    reset();
+    await passed({}, [ticket({ statusCategory: "done", status: "Done" })]);
+    expect(await closeoutGet()).toBeNull();
+    expect(await ops()).toEqual([]);
+  });
+
+  it("closeout: an unlinked thread gets no draft", async () => {
+    await passed({ links: [] });
+    expect(await closeoutGet()).toBeNull();
+  });
+
+  it("closeout: Mark done anyway cannot transition, with a hint", async () => {
+    seed("t1", { doneCheck: { at: "x", verdict: "fail", reasons: ["r"] }, reason: "r" });
+    await load();
+    expect(await card("skip-done")).toEqual({ ok: true });
+    expect(await closeoutGet()).toMatchObject({ skipped: true, tickets: [{ key: "PT-1", transition: false, canTransition: false, blocked: "marked done without the check" }] });
+    expect(await submit("t1", [{ key: "PT-1", body: "x", transition: true }])).toMatchObject({ ok: false });
+    expect(await ops()).toEqual([]);
+  });
+
+  it("closeout: another linked thread not Done blocks the transition with its hint", async () => {
+    seed("t2");
+    await passed();
+    expect((await closeoutGet()).tickets[0]).toMatchObject({ canTransition: false, transition: false, blocked: "other linked threads aren't Done" });
+  });
+
+  it("closeout submit: queues exactly the chosen ops with the edited body; a double submit is refused", async () => {
+    await passed(two, [ticket(), ticket({ key: "PT-2" })]);
+    const r = await submit("t1", [
+      { key: "PT-1", body: "Shipped the fix.", transition: true },
+      { key: "PT-2", body: "Docs only.", transition: false },
+    ]);
+    expect(r).toEqual({ ok: true, queued: 3 });
+    const o = await ops();
+    expect(o.map((x) => `${x.op} ${x.key}${x.body ? ` ${x.body}` : ""}`)).toEqual(["comment PT-1 Shipped the fix.", "transition PT-1", "comment PT-2 Docs only."]);
+    expect(o.every((x: any) => x.threadId === "t1")).toBe(true);
+    expect(await closeoutGet()).toBeNull();
+    expect(await submit("t1", [{ key: "PT-1", body: "again", transition: false }, { key: "PT-2", body: "again", transition: false }])).toEqual({ ok: false, queued: 0, error: "nothing to close out" });
+    expect((await ops()).length).toBe(3);
+  });
+
+  it("closeout submit: wrong keys, a bad body or a refused transition queue nothing and keep the draft", async () => {
+    seed("t2");
+    await passed();
+    const bad = [
+      [],
+      [{ key: "PT-9", body: "x", transition: false }],
+      [{ key: "PT-1", body: "x", transition: false }, { key: "PT-2", body: "x", transition: false }],
+      [{ key: "PT-1", body: "   ", transition: false }],
+      [{ key: "PT-1", body: "y".repeat(4001), transition: false }],
+      [{ key: "PT-1", body: "x", transition: true }], // another linked thread isn't Done
+    ];
+    for (const tickets of bad) expect(await submit("t1", tickets)).toMatchObject({ ok: false, queued: 0 });
+    expect(await ops()).toEqual([]);
+    expect(await closeoutGet()).not.toBeNull();
+  });
+
+  it("closeout skip: the draft goes, Done stays, nothing is queued", async () => {
+    await passed();
+    expect(await harness.behavior.callRpc("jira_closeout_skip", { threadId: "t1" })).toEqual({ ok: true });
+    expect(await closeoutGet()).toBeNull();
+    expect(await ops()).toEqual([]);
+    expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
+    expect(await harness.behavior.callRpc("jira_closeout_skip", { threadId: "t1" })).toEqual({ ok: false, error: "nothing to close out" });
+  });
+
+  it("closeout: leaving Done (done_set false, done clear) deletes the draft", async () => {
+    await passed();
+    await doneSet("t1", false);
+    expect(await closeoutGet()).toBeNull();
+    await doneSet("t1");
+    expect(await closeoutGet()).not.toBeNull();
+    expect((await harness.behavior.runCli(["done", "clear", "t1"])).exitCode).toBe(0);
+    expect(await closeoutGet()).toBeNull();
+  });
+
+  it("closeout draft with agent: busy is refused, a throw is not sent, a send marks the draft drafting", async () => {
+    await passed();
+    const ask = (instruction?: string) =>
+      harness.behavior.callRpc("jira_closeout_draft_with_agent", { threadId: "t1", ...(instruction ? { instruction } : {}) }) as Promise<{ ok: boolean; error?: string }>;
+    status.set("t1", "active");
+    expect(await ask()).toEqual({ ok: false, error: "thread is busy — try after this turn" });
+    status.set("t1", "idle");
+    send.mockRejectedValueOnce(Object.assign(new Error("boom"), { status: 500 }));
+    expect(await ask()).toEqual({ ok: false, error: "not sent: boom" });
+    expect((await closeoutGet()).agentDrafting).toBeFalsy();
+    expect(await ask('shorter "please"')).toEqual({ ok: true });
+    const text = JSON.stringify(send.mock.calls.at(-1));
+    expect(text).toContain("focus_board_closeout_draft");
+    expect(text).toContain("PT-1");
+    expect(text).toContain(JSON.stringify(JSON.stringify('shorter "please"')).slice(1, -1));
+    expect(await closeoutGet()).toMatchObject({ agentDrafting: true, requestedAt: expect.any(Number) });
+    expect(await ops()).toEqual([]);
+  });
+
+  it("closeout tool: refuses without a draft or for an unknown key; a valid call replaces the body (capped) and never submits", async () => {
+    seed("t1");
+    await load({ snapshot: snap({ prs: [pr(1, "merged")] }) });
+    const c = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ pluginMetadata: metadata.get("t1"), thread: T1 } as never));
+    expect(c.tools.map((t) => t.name)).toContain("focus_board_closeout_draft");
+    expect((await draftTool({ key: "PT-1", body: "x" })).isError).toBe(true);
+    expect(await bb.storage.kv.get("jira:closeouts")).toBeUndefined();
+    await doneSet("t1");
+    expect((await draftTool({ key: "PT-9", body: "x" })).isError).toBe(true);
+    expect((await closeoutGet()).tickets[0].body.startsWith("Focus Board: thread ")).toBe(true);
+    await harness.behavior.callRpc("jira_closeout_draft_with_agent", { threadId: "t1" });
+    const r = await draftTool({ key: "PT-1", body: "z".repeat(5000) });
+    expect(r.isError).toBeFalsy();
+    const d = await closeoutGet();
+    expect(d.tickets[0].body).toHaveLength(4000);
+    expect(d.agentDrafting).toBeFalsy(); // every key got a body
+    expect(harness.inspection.realtimeSignals).toContainEqual({ channel: "jira-changed", payload: {} });
+    expect(await ops()).toEqual([]);
+  });
+
+  it("closeout with Jira off: no draft, the RPCs refuse", async () => {
+    seed("t1");
+    await load({ enabled: false, snapshot: snap({ prs: [pr(1, "merged")] }) });
+    await doneSet("t1");
+    expect(await bb.storage.kv.get("jira:closeouts")).toBeUndefined();
+    expect(await closeoutGet()).toBeNull();
+    expect(await submit("t1", [{ key: "PT-1", body: "x", transition: false }])).toMatchObject({ ok: false });
+    expect(await harness.behavior.callRpc("jira_closeout_skip", { threadId: "t1" })).toMatchObject({ ok: false });
+    expect(await harness.behavior.callRpc("jira_closeout_draft_with_agent", { threadId: "t1" })).toMatchObject({ ok: false });
+    expect((await draftTool({ key: "PT-1", body: "x" })).isError).toBe(true);
   });
 });
 

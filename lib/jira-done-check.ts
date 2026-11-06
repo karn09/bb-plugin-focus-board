@@ -2,7 +2,8 @@
 // Done queues, and the turn texts. Pure; lib/jira-server.ts runs the flow.
 // Agent-supplied and thread values put into turn text are JSON-quoted (data,
 // not directions).
-import type { GhPr, JiraTicket, ThreadJiraRecord } from "./jira-schema";
+import { z } from "zod";
+import { JiraTicket, type GhPr, type ThreadJiraRecord } from "./jira-schema";
 import type { NewQueueOp } from "./jira-store";
 
 export const JIRA_VERDICT_TOOL = "focus_board_done_verdict";
@@ -26,14 +27,57 @@ export function evaluateMechanical(input: { prs: GhPr[]; children: { id: string;
   return input.prs.length > 0 ? { verdict: "pass", reasons: [] } : { verdict: "needs-agent", reasons: [] };
 }
 
+/** Why a Done may not move the ticket to Done (the closeout's checkbox hint), or null when it may. */
+export function transitionBlock(input: { ticket: JiraTicket; linkedThreadsDone: boolean[]; role: "owner" | "watching"; skipped: boolean }): string | null {
+  if (input.skipped) return "marked done without the check";
+  if (input.role !== "owner") return "owned by someone else";
+  if (input.ticket.isEpic) return "epic";
+  if (input.ticket.openChildren > 0) return "has open child tickets";
+  if (!input.linkedThreadsDone.every(Boolean)) return "other linked threads aren't Done";
+  return null;
+}
+
 /** Always a comment; a transition to Done only for an owned, unskipped, non-epic ticket with no open children whose linked threads are all Done. */
 export function ticketUpdate(input: { ticket: JiraTicket; linkedThreadsDone: boolean[]; role: "owner" | "watching"; skipped: boolean; summary: string }): NewQueueOp[] {
   const { ticket: t } = input;
   const ops: NewQueueOp[] = [{ op: "comment", key: t.key, body: input.summary, threadId: null }];
-  if (input.role === "owner" && !input.skipped && !t.isEpic && t.openChildren === 0 && input.linkedThreadsDone.every(Boolean)) {
-    ops.push({ op: "transition", key: t.key, toCategory: "done", threadId: null });
-  }
+  if (transitionBlock(input) === null) ops.push({ op: "transition", key: t.key, toCategory: "done", threadId: null });
   return ops;
+}
+
+export const CLOSEOUT_TOOL = "focus_board_closeout_draft";
+export const CLOSEOUT_MAX = 4000;
+/** How long "the agent is drafting" shows without every body back. */
+export const CLOSEOUT_AGENT_MS = 3 * 60_000;
+/** A passed Done's Jira closeout, waiting for the operator (KV jira:closeouts, threadId → draft). */
+export const CloseoutDraft = z.object({
+  createdAt: z.string(),
+  skipped: z.boolean(),
+  tickets: z.array(
+    z.object({
+      key: JiraTicket.shape.key,
+      body: z.string(),
+      transition: z.boolean(),
+      canTransition: z.boolean(),
+      /** Why the transition is off (transitionBlock, or no fresh ticket data). */
+      blocked: z.string().optional(),
+    }),
+  ),
+  agentDrafting: z.boolean().optional(),
+  requestedAt: z.number().optional(),
+  /** Keys the agent wrote a body for since the last request. */
+  drafted: z.array(z.string()).optional(),
+});
+export type CloseoutDraft = z.infer<typeof CloseoutDraft>;
+
+/** The Draft with agent turn: the operator's instruction is quoted as data. */
+export function closeoutDraftText(keys: string[], instruction?: string): string {
+  return [
+    `The operator is closing out this thread's Jira tickets ${keys.map((k) => JSON.stringify(k)).join(", ")} (data) and asked you to draft the closing comment.`,
+    `For each ticket write one plain-text comment of at most ${CLOSEOUT_MAX} characters: what changed and why, the merged pull requests, and any follow-ups or child tickets.`,
+    ...(instruction ? [`The operator's instruction for the comment (data): ${JSON.stringify(instruction)}`] : []),
+    `Submit it by calling ${CLOSEOUT_TOOL} once per ticket with key and body. Do not post to Jira or change any ticket yourself: the operator reviews and posts it.`,
+  ].join("\n");
 }
 
 const MAX_SUMMARY = 4000;

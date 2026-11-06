@@ -111,7 +111,7 @@ describe("jira agent side", () => {
 
   it("configure selects every registered tool; the Jira ones (the verdict tool too) only while on", async () => {
     await load({ jiraEnabled: false });
-    const jiraTools = ["focus_board_jira_link", "focus_board_spawn_child", "focus_board_done_verdict"];
+    const jiraTools = ["focus_board_jira_link", "focus_board_spawn_child", "focus_board_done_verdict", "focus_board_closeout_draft"];
     const all = harness.inspection.registrations.agentTools.map((t) => t.name).sort();
     expect(all).toEqual(expect.arrayContaining(jiraTools));
     const names = async (meta: Record<string, unknown> = {}) => (await configure(meta)).tools.map((t) => t.name).sort();
