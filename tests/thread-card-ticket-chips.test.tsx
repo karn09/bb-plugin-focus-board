@@ -153,6 +153,47 @@ describe("linked store chips — distinct PR vs issue glyphs", () => {
     });
   });
 
+  describe("Jira key chip rides the ticket chip row", () => {
+    const rec = { links: [{ key: "PT-1", role: "owner" as const, source: "auto" as const }], enrolledAt: null, verifying: null, doneCheck: null, nudgedAt: null, deepCheckedAt: null, reason: "waiting on infra", checkInWith: null };
+    const board = (enabled: boolean, threads: object) =>
+      ({ enabled, stale: false, ticketByKey: {}, pendingOps: [], onAction: vi.fn(), threads }) as never;
+    const renderIn = (title: string, value: never | null) => {
+      const card = (
+        <ThreadCard {...({ thread: thread({ id: "thr_ref", displayTitle: title, updatedAt: 5000 }), stateDot: null, isActive: false, isDone: false, projectName: "One", repoHrefBase: BASE, onOpen: vi.fn(), onOpenThread: vi.fn() } as unknown as CardProps)} />
+      );
+      return render(value === null ? card : <JiraBoardContext.Provider value={value}>{card}</JiraBoardContext.Provider>);
+    };
+    const area = () => document.querySelector("[data-ticket-chip-area]");
+    it("the Jira chip shares the GitHub chip's row, after it; the badge row keeps the rest", () => {
+      renderIn("resolve #17: surface a thread's ticket", board(true, { thr_ref: rec }));
+      const jira = document.querySelector("[data-jira-key]")!.closest("[data-jira-chip]")!;
+      expect(jira.closest("[data-ticket-chip-area]")).toBe(chip().closest("[data-ticket-chip-area]"));
+      expect(chip().compareDocumentPosition(jira) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      const badges = document.querySelector("[data-jira-badges]")!;
+      expect(badges.querySelector("[data-jira-key]")).toBeNull();
+      expect(badges.querySelector("[data-jira-reason]")).not.toBeNull();
+    });
+    it("no GitHub chip: the row still renders, holding only the Jira chip", () => {
+      renderIn("plain title", board(true, { thr_ref: rec }));
+      expect(area()).not.toBeNull();
+      expect(area()!.querySelector("[data-ticket-chip]")).toBeNull();
+      expect(area()!.querySelectorAll("[data-jira-chip]")).toHaveLength(1);
+    });
+    it("Jira off, or on with no links: the chip row DOM is upstream's", () => {
+      renderIn("resolve #17: surface a thread's ticket", null);
+      const upstream = area()!.outerHTML;
+      cleanup();
+      renderIn("resolve #17: surface a thread's ticket", board(false, { thr_ref: rec }));
+      expect(area()!.outerHTML).toBe(upstream);
+      cleanup();
+      renderIn("resolve #17: surface a thread's ticket", board(true, {}));
+      expect(area()!.outerHTML).toBe(upstream);
+      cleanup();
+      renderIn("plain title", board(true, {}));
+      expect(area()).toBeNull();
+    });
+  });
+
   it("a forgejo PR id leads with the PR glyph, beside the site favicon", async () => {
     renderCard("Fix render-configs.sh placeholder substitution", {
       repoHrefBase: "https://git.cove/cristos/Homelab",

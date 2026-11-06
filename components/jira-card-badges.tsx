@@ -33,6 +33,8 @@ const JiraMark = () => (
 const chip = "inline-flex min-h-5 max-w-full items-center gap-1 rounded bg-muted px-1 py-0.5 font-mono text-[10px] leading-none text-muted-foreground";
 
 export type JiraCardBadgesProps = {
+  /** "chip": the key chip, mounted in the card's ticket chip row; "badges": everything else, in the badge row. */
+  part: "chip" | "badges";
   threadId: string;
   enabled: boolean;
   stale: boolean;
@@ -49,7 +51,7 @@ export type JiraCardBadgesProps = {
   onUndo?: (threadId: string, opIds: string[]) => void;
 };
 
-export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, pendingOps, onAction, next, onSnooze, onUndo }: JiraCardBadgesProps) {
+export function JiraCardBadges({ part, threadId, enabled, stale, record, ticketByKey, pendingOps, onAction, next, onSnooze, onUndo }: JiraCardBadgesProps) {
   if (!enabled) return null;
   const links = record?.links ?? [];
   const failed = record?.doneCheck?.verdict === "fail" ? record.doneCheck.reasons : [];
@@ -78,9 +80,8 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
     if (menu !== null && menuReason !== undefined) onAction(kind, threadId, menu.index, menuReason);
     setMenu(null);
   };
-  return (
-    <div className="mt-1 flex flex-wrap items-center gap-1 px-3 pb-2 pl-1.5" data-jira-badges="">
-      {links.length > 0 ? (
+  if (part === "chip")
+    return links.length > 0 ? (
         <span className={cn(chip, "flex-wrap gap-x-1")} data-jira-chip="">
           <JiraMark />
           {links.map((l) => {
@@ -109,7 +110,9 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
           {links.some((l) => pendingKeys.has(l.key)) ? <span className="italic text-muted-foreground">pending</span> : null}
           {undoKey !== undefined ? undoButton : null}
         </span>
-      ) : null}
+      ) : null;
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-1 px-3 pb-2 pl-1.5" data-jira-badges="">
       {/* An own op on no linked key (rare): Undo stands alone. */}
       {undoKey === undefined && undoButton ? <span className={chip}>{undoButton}</span> : null}
       {links.length === 0 ? (
@@ -221,7 +224,7 @@ export function JiraCardBadges({ threadId, enabled, stale, record, ticketByKey, 
   );
 }
 
-export type JiraBoardValue = Omit<JiraCardBadgesProps, "threadId" | "record" | "next"> & {
+export type JiraBoardValue = Omit<JiraCardBadgesProps, "part" | "threadId" | "record" | "next"> & {
   threads: Record<string, ThreadJiraRecord>;
   /** threadId → the deeper check's next step (jira_board_state.next). */
   nextByThread?: Record<string, NonNullable<JiraCardBadgesProps["next"]>>;
@@ -231,8 +234,8 @@ export type JiraBoardValue = Omit<JiraCardBadgesProps, "threadId" | "record" | "
 export const JiraBoardContext = createContext<JiraBoardValue | null>(null);
 
 /** The card's one-line hook-up: nothing unless the board provides enabled state. */
-export function JiraCardSlot({ threadId }: { threadId: string }) {
+export function JiraCardSlot({ threadId, part }: { threadId: string; part: JiraCardBadgesProps["part"] }) {
   const v = useContext(JiraBoardContext);
   if (v === null || !v.enabled) return null;
-  return <JiraCardBadges {...v} threadId={threadId} record={v.threads[threadId]} next={v.nextByThread?.[threadId]} />;
+  return <JiraCardBadges {...v} part={part} threadId={threadId} record={v.threads[threadId]} next={v.nextByThread?.[threadId]} />;
 }

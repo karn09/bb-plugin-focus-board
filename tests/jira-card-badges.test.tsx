@@ -1,7 +1,15 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { JiraCardBadges } from "../components/jira-card-badges";
+import { JiraCardBadges as Part, type JiraCardBadgesProps } from "../components/jira-card-badges";
+
+// Both parts as the card mounts them: the key chip (in the ticket chip row) and the badge row.
+const JiraCardBadges = (p: Omit<JiraCardBadgesProps, "part">) => (
+  <>
+    <Part {...p} part="chip" />
+    <Part {...p} part="badges" />
+  </>
+);
 
 const rec = (over: object = {}) => ({
   links: [{ key: "PT-1", role: "owner" as const, source: "auto" as const }],
@@ -14,6 +22,22 @@ const props = { threadId: "t1", enabled: true, stale: false, ticketByKey: t("ind
 
 afterEach(cleanup);
 describe("JiraCardBadges", () => {
+  it("split: the key chip (with pending/Undo) is the chip part; the badge row holds no keys", () => {
+    const mine = { id: "o1", createdAt: "", threadId: "t1", op: "comment" as const, key: "PT-1", body: "x" };
+    const r = rec({ reason: "waiting on infra" });
+    const { container, rerender } = render(<Part {...props} part="badges" onUndo={vi.fn()} pendingOps={[mine]} record={r} />);
+    expect(container.querySelector("[data-jira-key]")).toBeNull();
+    expect(screen.queryByText("pending")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Undo Jira changes" })).toBeNull();
+    expect(container.querySelector("[data-jira-reason]")).not.toBeNull();
+    rerender(<Part {...props} part="chip" onUndo={vi.fn()} pendingOps={[mine]} record={r} />);
+    expect(container.querySelector("[data-jira-badges]")).toBeNull();
+    expect(container.querySelector("[data-jira-chip] [data-jira-key]")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Undo Jira changes" })).toBeTruthy();
+    expect(container.querySelector("[data-jira-reason]")).toBeNull();
+    rerender(<Part {...props} part="chip" record={rec({ links: [] })} />);
+    expect(container.innerHTML).toBe("");
+  });
   it("renders nothing when disabled", () => {
     const { container } = render(<JiraCardBadges {...props} enabled={false} record={rec({ links: [] })} />);
     expect(container.innerHTML).toBe("");

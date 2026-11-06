@@ -1122,7 +1122,8 @@ export function ThreadCardImpl({
   // right), lib/ticket-chips.ts. The toolbar search matches the flat ref
   // set (app.tsx), so a "#38" query still finds every card with a #38 chip.
   // Jira on: the Jira chip owns jira-keyed links, so the generic favicon chip is hidden.
-  const jiraOn = useContext(JiraBoardContext)?.enabled === true;
+  const jiraBoard = useContext(JiraBoardContext);
+  const jiraOn = jiraBoard?.enabled === true;
   const withoutJira = (links: ThreadLink[] | undefined) =>
     jiraOn ? links?.filter((l) => !(l.tracker === "external" && l.jira !== undefined)) : links;
   const ticketRefs = cardTicketRefs({
@@ -1152,7 +1153,9 @@ export function ThreadCardImpl({
   // to the next row, still right-anchored); several ids stay inside the left
   // half so the PR chip keeps row one's right end.
   const issuesWidthClass = issueRefCount > 1 ? CHIP_MIDPOINT_CAP : CHIP_FULL_ROW;
-  const hasChips = issueChips.length + pullChips.length + tagChips.length > 0;
+  // The Jira key chip rides the chip row (after the PR chips); with no links the row is upstream's.
+  const jiraChip = jiraOn && !compact && (jiraBoard.threads[thread.id]?.links.length ?? 0) > 0;
+  const hasChips = issueChips.length + pullChips.length + tagChips.length > 0 || jiraChip;
   // Issue #191: nested child rows show the child's own chips — the same
   // `cardTicketRefs` call the child chips with standalone (title + branch
   // scan, the project's repo base, the store links via `childLinkedIssuesFor`,
@@ -1808,7 +1811,7 @@ export function ThreadCardImpl({
               {branch === "" ? null : <span className="text-muted-foreground/40"> · {branch}</span>}
             </p>
           </a>
-          {compact ? null : <JiraCardSlot threadId={thread.id} />}
+          {compact ? null : <JiraCardSlot threadId={thread.id} part="badges" />}
           {hasChips ? (
             // Issue #104's chip area: three regions on a wrapping flex line.
             // The issues region keeps a lone row-anchor per provider; the
@@ -1840,7 +1843,7 @@ export function ThreadCardImpl({
                   ))}
                 </div>
               )}
-              {pullChips.length === 0 ? null : (
+              {pullChips.length === 0 && !jiraChip ? null : (
                 // PRs: the first row's right end, bumped to the next row's
                 // right end only when the issues region claims the room.
                 <div
@@ -1856,6 +1859,7 @@ export function ThreadCardImpl({
                       projectRepo={repo}
                     />
                   ))}
+                  {jiraChip ? <JiraCardSlot threadId={thread.id} part="chip" /> : null}
                 </div>
               )}
               {tagChips.length === 0 ? null : (
