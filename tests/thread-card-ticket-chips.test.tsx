@@ -151,6 +151,24 @@ describe("linked store chips — distinct PR vs issue glyphs", () => {
       renderWith(false);
       await waitFor(() => expect(document.querySelector("[data-ticket-chip] img")).not.toBeNull());
     });
+    // Links an agent added earlier as a plain Atlassian URL carry no `jira` field.
+    const plainLink = { tracker: "external" as const, url: "https://growtherapy.atlassian.net/browse/PT-3879", hostname: "growtherapy.atlassian.net", label: "PT-3879", createdAt: "2026-10-09T00:00:00.000Z", source: "agent" as const };
+    const recWith = (key: string) => ({ links: [{ key, role: "owner" as const, source: "auto" as const }], enrolledAt: null, verifying: null, doneCheck: null, nudgedAt: null, deepCheckedAt: null, reason: null, checkInWith: null });
+    const renderPlain = (recordKey: string) =>
+      render(
+        <JiraBoardContext.Provider value={({ enabled: true, stale: false, ticketByKey: {}, pendingOps: [], onAction: vi.fn(), threads: { thr_p: recWith(recordKey) } }) as never}>
+          <ThreadCard {...({ thread: thread({ id: "thr_p", displayTitle: "plain title", updatedAt: 5000 }), stateDot: null, isActive: false, isDone: false, projectName: "One", repoHrefBase: BASE, onOpen: vi.fn(), onOpenThread: vi.fn(), linkedIssues: [plainLink] } as unknown as CardProps)} />
+        </JiraBoardContext.Provider>,
+      );
+    it("Jira on: a plain Atlassian /browse/KEY link the Jira chip already shows is hidden (no duplicate chip)", () => {
+      renderPlain("PT-3879");
+      expect(document.querySelector("[data-ticket-chip]")).toBeNull();
+      expect(document.querySelectorAll("[data-jira-chip] [data-jira-key]")).toHaveLength(1);
+    });
+    it("Jira on: a plain Atlassian link the Jira chip does not show stays (nothing disappears)", () => {
+      renderPlain("PT-9999");
+      expect(document.querySelector("[data-ticket-chip]")).not.toBeNull();
+    });
   });
 
   describe("Jira key chip rides the ticket chip row", () => {

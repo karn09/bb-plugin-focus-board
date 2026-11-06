@@ -1124,8 +1124,14 @@ export function ThreadCardImpl({
   // Jira on: the Jira chip owns jira-keyed links, so the generic favicon chip is hidden.
   const jiraBoard = useContext(JiraBoardContext);
   const jiraOn = jiraBoard?.enabled === true;
+  // Links an agent added as a plain Atlassian /browse/KEY URL carry no `jira` field:
+  // hide those too when the Jira chip already shows that key, so no ticket vanishes.
+  const jiraShown = new Set((jiraBoard?.threads[thread.id]?.links ?? []).map((l) => l.key));
+  const browseKey = (url: string) => /^https:\/\/[^/]+\.atlassian\.net\/browse\/([A-Z][A-Z0-9]+-\d+)\/?$/.exec(url)?.[1];
   const withoutJira = (links: ThreadLink[] | undefined) =>
-    jiraOn ? links?.filter((l) => !(l.tracker === "external" && l.jira !== undefined)) : links;
+    jiraOn
+      ? links?.filter((l) => !(l.tracker === "external" && (l.jira !== undefined || jiraShown.has(browseKey(l.url) ?? ""))))
+      : links;
   const ticketRefs = cardTicketRefs({
     title: thread.displayTitle,
     branch,
