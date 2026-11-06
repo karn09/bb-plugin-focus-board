@@ -1249,12 +1249,22 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
   const NOTHING = "nothing to close out";
   /** One of this thread's Done ops: the Done-summary comment or transition, or any op its closeout submit queued. */
   const threadDoneOp = (threadId: string) => (o: QueueOp) => o.threadId === threadId && (isDoneOp(o) || (closeoutOps.map.get(threadId) ?? []).includes(o.id));
-  const dropCloseout = async (threadId: string) => {
+  /** quiet: Jira is off, so only the KV entry goes (no signal); nothing is written when there is no draft. */
+  const dropCloseout = async (threadId: string, quiet = false) => {
     await closeouts.loaded;
     if (!closeouts.map.has(threadId)) return;
     await closeouts.set(threadId, undefined);
-    bb.realtime.publish(JIRA_CHANGED, {});
+    if (!quiet) bb.realtime.publish(JIRA_CHANGED, {});
   };
+  /** Drafts and submitted-op records of threads no longer live (archived, gone) leave. */
+  const pruneGone = async (live: Set<string>) => {
+    await Promise.all([closeouts.loaded, closeoutOps.loaded]);
+    for (const id of [...closeouts.map.keys()]) if (!live.has(id)) await closeouts.set(id, undefined);
+    for (const id of [...closeoutOps.map.keys()]) if (!live.has(id)) await closeoutOps.set(id, undefined);
+  };
+  void (async () => {
+    if (await enabled()) await pruneGone(new Set((await deps.liveLinks()).map((t) => t.id)));
+  })().catch((e) => warn(`jira: pruning closeouts failed: ${(e as Error).message}`));
   /** Submitted op ids leave once acked or cancelled (no longer queued). */
   async function pruneCloseoutOps() {
     await closeoutOps.loaded;
@@ -1343,7 +1353,8 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       const { snapshot, ageMs, stale, error } = await store.readSnapshot();
       const threads: Record<string, ThreadJiraRecord> = {};
       for (const { id } of await deps.liveLinks()) threads[id] = await store.readThread(id);
-      await Promise.all([nextSteps.loaded, noNudge.loaded, closeouts.loaded]);
+      await Promise.all([nextSteps.loaded, noNudge.loaded]);
+      await pruneGone(new Set(Object.keys(threads)));
       const next = Object.fromEntries([...nextSteps.map].filter(([id, n]) => threads[id]?.reason === n.reason));
       return {
         enabled: true,
@@ -1358,7 +1369,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         syncRanAt: await num(SYNC_RAN_KEY),
         syncEnabled: s.sync,
         noNudge: [...noNudge.map.keys()],
-        closeouts: Object.fromEntries([...closeouts.map].filter(([id]) => id in threads).map(([id, d]) => [id, closeoutView(d)])),
+        closeouts: Object.fromEntries([...closeouts.map].map(([id, d]) => [id, closeoutView(d)])),
       };
     },
     jira_closeout_get: async ({ threadId }) => {
@@ -1423,9 +1434,11 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         const foreign = new Set(pending.filter((o) => o.threadId !== threadId).map((o) => o.id));
         const ids = [...new Set([...mine.map((o) => o.id), ...(opIds ?? [])])].filter((id) => !foreign.has(id));
         if (ids.length === 0) return { ok: true, ...none };
-        const { cancelled, tooLate } = await store.cancel(ids);
+        // Read before the cancel's prune drops them: a submitted comment counts as a Done op whatever its body says.
         await closeoutOps.loaded;
-        const isMineDone = threadDoneOp(threadId);
+        const submitted = new Set(closeoutOps.map.get(threadId) ?? []);
+        const isMineDone = (o: QueueOp) => isDoneOp(o) || submitted.has(o.id);
+        const { cancelled, tooLate } = await store.cancel(ids);
         await pruneCloseoutOps();
         // Every linked ticket's Done writes cancelled now (none already sent or being sent): the Done itself
         // is undone and the card returns to its lane. A key with no pending Done op had its writes sent.
@@ -1532,6 +1545,8 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     enabled,
     startDoneCheck,
     /** Leaving Done while on: Keep working's path (no stamp, no ops). */
+    /** Leaving Done while off: only a leftover closeout draft goes (no signal, no other write). */
+    dropCloseoutQuietly: (threadId: string) => dropCloseout(threadId, true),
     stopDoneCheck: (threadId: string) =>
       perThread(threadId, async () => {
         await endCheck(threadId);

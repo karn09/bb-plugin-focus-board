@@ -2257,7 +2257,7 @@ export default async function plugin(bb: BbPluginApi) {
       // Jira on: a Done drop is a request (lib/jira-server startDoneCheck).
       if (done && (await jira.enabled())) return { done: (await jira.startDoneCheck(threadId)) === "done" };
       // Jira on: leaving Done ends a running check (Keep working), so it cannot stamp Done.
-      if (!done && (await jira.enabled())) await jira.stopDoneCheck(threadId);
+      if (!done) await ((await jira.enabled()) ? jira.stopDoneCheck(threadId) : jira.dropCloseoutQuietly(threadId));
       await writeDoneRecord(threadId, done);
       bb.realtime.publish(DONE_CHANGED, { threadId, done });
       return { done };
@@ -2891,7 +2891,7 @@ export default async function plugin(bb: BbPluginApi) {
       const cleared: string[] = [];
       const stopCheck = await jira.enabled(); // Jira on: a clear ends a running Done check
       for (const threadId of input.positionals["thread-id"]) {
-        if (stopCheck) await jira.stopDoneCheck(threadId);
+        await (stopCheck ? jira.stopDoneCheck(threadId) : jira.dropCloseoutQuietly(threadId));
         await writeDoneRecord(threadId, false);
         bb.realtime.publish(DONE_CHANGED, { threadId, done: false });
         cleared.push(threadId);

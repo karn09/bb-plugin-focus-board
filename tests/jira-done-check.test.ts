@@ -1015,6 +1015,50 @@ describe("Done check flow", () => {
     expect(await bb.storage.kv.get("jira:closeout-ops")).toEqual({});
   });
 
+  it("closeout: Undo of a submitted comment-only closeout with an edited body un-stamps Done", async () => {
+    await passed();
+    await submit("t1", [{ key: "PT-1", body: "Shipped it.", transition: false }]);
+    expect(await undo()).toEqual({ ok: true, cancelled: 1, tooLate: 0 });
+    expect(doneOf("t1")).toBeUndefined();
+    expect(jiraOf("t1")?.doneCheck).toBeNull();
+  });
+
+  it("closeout: leaving Done with Jira off still deletes a leftover draft, and nothing else differs", async () => {
+    seed("t1");
+    const leftover = { t1: { createdAt: "x", skipped: false, tickets: [{ key: "PT-1", body: "b", transition: false, canTransition: false }] } };
+    await load({ enabled: false, kv: { "jira:closeouts": leftover } });
+    const before = harness.inspection.realtimeSignals.length;
+    await doneSet("t1");
+    expect(doneOf("t1")).toMatchObject({ doneAt: expect.any(String) });
+    await doneSet("t1", false);
+    expect(await bb.storage.kv.get("jira:closeouts")).toEqual({});
+    expect(doneOf("t1")).toBeUndefined();
+    expect(jiraOf("t1")).toEqual(rec());
+    expect(harness.inspection.realtimeSignals.slice(before).map((x: any) => x.channel)).toEqual(["done-changed", "done-changed"]);
+    expect(await ops()).toEqual([]);
+  });
+
+  it("closeout: Jira off and no draft: leaving Done writes no closeout KV at all", async () => {
+    seed("t1");
+    await load({ enabled: false });
+    await doneSet("t1");
+    await doneSet("t1", false);
+    expect(await bb.storage.kv.get("jira:closeouts")).toBeUndefined();
+  });
+
+  it("closeout: drafts and closeout-ops of threads no longer live are pruned (startup and board state)", async () => {
+    seed("t1");
+    const d = { createdAt: "x", skipped: false, tickets: [{ key: "PT-1", body: "b", transition: false, canTransition: false }] };
+    await load({ kv: { "jira:closeouts": { t1: d, gone: d }, "jira:closeout-ops": { gone: ["zz"] } } });
+    await flush();
+    expect(Object.keys((await bb.storage.kv.get("jira:closeouts")) as object)).toEqual(["t1"]);
+    expect(await bb.storage.kv.get("jira:closeout-ops")).toEqual({});
+    rows.delete("t1"); // archived since
+    const state = (await harness.behavior.callRpc("jira_board_state", null)) as { closeouts: Record<string, unknown> };
+    expect(state.closeouts).toEqual({});
+    expect(await bb.storage.kv.get("jira:closeouts")).toEqual({});
+  });
+
   it("closeout with Jira off: no draft, the RPCs refuse", async () => {
     seed("t1");
     await load({ enabled: false, snapshot: snap({ prs: [pr(1, "merged")] }) });
