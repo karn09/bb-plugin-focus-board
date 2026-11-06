@@ -140,6 +140,7 @@ function checksOf(rollup: Raw): GhPr["checks"] {
 const REVIEW: Record<string, GhPr["reviewDecision"]> = { APPROVED: "approved", CHANGES_REQUESTED: "changes_requested", REVIEW_REQUIRED: "review_required" };
 
 const MENTIONS_TTL_MS = 30 * 60_000;
+const CLOSED_QUIET_MS = 24 * 60 * 60_000;
 
 export function createSyncCore(deps: SyncDeps) {
   const { run } = deps;
@@ -227,10 +228,14 @@ export function createSyncCore(deps: SyncDeps) {
   }
 
   // One unreadable PR (or search) skips just that ref; the failures are counted in snapshot.error.
-  // Merged/closed PRs in the previous snapshot never change: reused, not re-read.
-  async function fetchPrs(wanted: SyncWanted, linkedKeys: string[], previous: JiraSnapshot | null) {
+  // A merged PR never changes: reused, not re-read. A closed one can be reopened: reused
+  // only on a scheduled pass once quiet for 24h. manual (`jira sync`, Refresh, a Done data wait) skips the mention cache.
+  async function fetchPrs(wanted: SyncWanted, linkedKeys: string[], previous: JiraSnapshot | null, manual: boolean) {
     const terminal = new Map<string, GhPr>();
-    for (const p of previous?.prs ?? []) if (p.state !== "open") terminal.set(`${p.repo}#${p.number}`, p);
+    for (const p of previous?.prs ?? []) {
+      const quiet = Date.now() - Date.parse(p.updatedAt) > CLOSED_QUIET_MS; // NaN (no updatedAt): not quiet
+      if (p.state === "merged" || (p.state === "closed" && quiet && !manual)) terminal.set(`${p.repo}#${p.number}`, p);
+    }
     const failed: string[] = [];
     let attempted = 0;
     const prs = await pool(wanted.prRefs, 6, async ({ repo, number }): Promise<GhPr | null> => {
@@ -241,6 +246,7 @@ export function createSyncCore(deps: SyncDeps) {
       try {
         p = json(await run("gh", ["pr", "view", String(number), "-R", repo, "--json",
           "state,mergedAt,headRefName,title,body,statusCheckRollup,reviewDecision,updatedAt"]));
+        if (!p || typeof p !== "object") throw new Error(`gh pr view ${number} -R ${repo}: no JSON`);
       } catch (e) {
         failed.push(msg(e));
         return null;
@@ -256,7 +262,7 @@ export function createSyncCore(deps: SyncDeps) {
     let searched = 0;
     const mentions = await pool(linkedKeys, 3, async (key): Promise<SyncSnapshot["mentions"]> => {
       const hit = mentionCache.get(key);
-      if (hit && Date.now() - hit.at < MENTIONS_TTL_MS) return hit.rows;
+      if (hit && !manual && Date.now() - hit.at < MENTIONS_TTL_MS) return hit.rows;
       searched++;
       let rs: Raw[];
       try {
@@ -276,7 +282,7 @@ export function createSyncCore(deps: SyncDeps) {
     return { prs: prs.filter((p): p is GhPr => p !== null), mentions: mentions.flat(), error: errors.length ? errors.join("; ") : null };
   }
 
-  async function pass(): Promise<void> {
+  async function pass({ manual = false }: { manual?: boolean } = {}): Promise<void> {
     const wanted = await deps.wanted();
     await drain();
     // Queued writes always go out; Jira/GitHub are fetched only when a pass is due or Refresh is pending.
@@ -292,7 +298,8 @@ export function createSyncCore(deps: SyncDeps) {
     }
     if (snap.ok) {
       try {
-        Object.assign(snap, await fetchPrs(wanted, wanted.linkedKeys.filter((k) => KEY.test(k)), await deps.previous()));
+        Object.assign(snap, await fetchPrs(wanted, wanted.linkedKeys.filter((k) => KEY.test(k)),
+          await deps.previous().catch(() => null), manual)); // an unreadable snapshot: fetch everything
       } catch (e) {
         snap.prs = [];
         snap.mentions = [];

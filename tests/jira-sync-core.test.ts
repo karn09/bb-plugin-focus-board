@@ -446,6 +446,55 @@ describe("sync pass", () => {
       await core().pass();
       expect(searches()).toBe(3);
     });
+    it("closed PRs: reused only when quiet for 24h and the pass is scheduled; merged always reused", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-11-05T10:00:00Z"));
+      wanted = { ...wanted, prRefs: [1, 2, 3].map((number) => ({ repo: "o/r", number })) };
+      previous = prev([
+        { ...ghPr(1, "closed"), updatedAt: "2026-11-05T09:00:00Z" },
+        { ...ghPr(2, "closed"), updatedAt: "2026-11-02T10:00:00Z" },
+        { ...ghPr(3, "merged"), updatedAt: "2026-11-05T09:00:00Z" },
+      ]);
+      const viewed = () => calls.filter((c) => c.args[0] === "pr").map((c) => c.args[2]);
+      await core().pass();
+      expect(viewed()).toEqual(["1"]);
+      expect(snap().prs[1]).toEqual(previous.prs[1]);
+      calls = [];
+      await core().pass({ manual: true });
+      expect(viewed()).toEqual(["1", "2"]);
+      expect(snap().prs[2]).toEqual(previous.prs[2]);
+    });
+    it("a manual pass bypasses the mention cache", async () => {
+      wanted = { ...wanted, linkedKeys: ["ENG-1"] };
+      const c = core();
+      const searches = () => calls.filter((x) => x.args[0] === "search").length;
+      await c.pass();
+      await c.pass();
+      expect(searches()).toBe(1);
+      await c.pass({ manual: true });
+      expect(searches()).toBe(2);
+    });
+    it("a failing snapshot read means every PR is fetched", async () => {
+      wanted = { ...wanted, prRefs: [{ repo: "o/r", number: 1 }] };
+      await createSyncCore({
+        run,
+        previous: async () => { throw new Error("kv down"); },
+        wanted: async () => wanted,
+        pendingOps: async () => [],
+        claim: async () => true,
+        ack: async () => {},
+        ingest: async (s) => void ingested.push(s),
+      }).pass();
+      expect(snap().prs.map((p) => p.number)).toEqual([1]);
+      expect(snap().error).toBeNull();
+    });
+    it("an empty pr view output costs only that ref; mentions still run", async () => {
+      wanted = { ...wanted, linkedKeys: ["ENG-1"], prRefs: [{ repo: "o/r", number: 1 }] };
+      rules.gh = [{ match: "pr view", stdout: "" }, { match: "search prs", stdout: "[]" }];
+      await pass();
+      expect(snap().error).toMatch(/^gh: 1 of 1 PRs unreadable /);
+      expect(calls.some((c) => c.args[0] === "search")).toBe(true);
+    });
     it("a failed mention search is not cached", async () => {
       wanted = { ...wanted, linkedKeys: ["ENG-1"] };
       rules.gh = [{ match: "search prs", fail: "rate limited" }];

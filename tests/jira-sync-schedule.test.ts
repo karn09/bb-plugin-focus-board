@@ -255,6 +255,21 @@ describe("built-in Jira sync", () => {
     await load(); // afterEach disposes this one
   });
 
+  it("`jira sync` and a Done check data wait re-run mention searches the scheduled pass just made", async () => {
+    await load();
+    metadata.set("t1", { jira: rec() });
+    await harness.runSchedule("jira-sync");
+    const mentionSearches = () => calls.filter((c) => c.startsWith("gh search prs PT-1")).length;
+    expect(mentionSearches()).toBe(1);
+    expect((await harness.behavior.runCli(["jira", "sync"])).exitCode).toBe(0);
+    expect(mentionSearches()).toBe(2);
+    await new Promise((r) => setTimeout(r, 5)); // the data wait's request must be newer than that snapshot
+    links = [{ tracker: "github", repo: "o/r", issue: 9, kind: "pull", href: "https://github.com/o/r/pull/9", createdAt: "2026-10-29T00:00:00Z", source: "operator" } as ThreadLink];
+    await jira.startDoneCheck("t1");
+    await flush();
+    expect(mentionSearches()).toBe(3);
+  });
+
   it("`jira sync` runs a full pass now and prints the status; acli failing exits 1 with the error", async () => {
     await load();
     await harness.runSchedule("jira-sync");

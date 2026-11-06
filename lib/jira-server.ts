@@ -390,7 +390,8 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
         forceFull = manual;
         passErrors = [];
         await bb.storage.kv.set(SYNC_RAN_KEY, Date.now());
-        await core.pass();
+        // Fresh PR data wanted: `jira sync`, or an open request (Refresh, a Done check's data wait).
+        await core.pass({ manual: manual || (await refreshPending((await store.readSnapshot()).snapshot)) !== null });
       } finally {
         syncing = null;
         if (rerun && !disposed) {
