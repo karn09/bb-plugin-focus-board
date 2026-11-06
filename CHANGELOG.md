@@ -7,7 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **Optional Jira integration, off by default (`jiraEnabled`).** Threads link to Jira tickets, the Attention view gets a Jira column, and Done becomes a checked request, with Jira and GitHub sync built in. Setup and rollout are in `docs/fork-notes.md`.
+- **Optional Jira integration, off by default (`jiraEnabled`).** Threads link to Jira tickets, the Attention view gets a Jira column, and Done becomes a checked request whose Jira closeout you approve before anything posts, with Jira and GitHub sync built in. Setup and rollout are in `docs/fork-notes.md`.
 
 ### Changed
 
