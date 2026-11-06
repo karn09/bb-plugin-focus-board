@@ -1,7 +1,7 @@
 // lib/jira-sync-core.ts against an injected fake runner (no executables).
 // The fake answers from rules matched on "<tool> <args…>", logs every call,
 // and reproduces acli's search field allowlist (refused fields fail the call).
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { JiraSnapshot, OpResult, type QueueOp } from "../lib/jira-schema";
 import { createSyncCore, descriptionText, toTicket, type SyncWanted } from "../lib/jira-sync-core";
 
@@ -15,6 +15,7 @@ let acked: OpResult[][];
 let ingested: unknown[];
 let ackFails: boolean;
 let claim: (id: string) => boolean;
+let previous: JiraSnapshot | null;
 
 // Real acli: `workitem search --fields` only accepts a fixed set (parent, updated, subtasks... are refused).
 const SEARCH_OK = new Set(["key", "summary", "status", "assignee", "issuetype", "description", "priority", "labels"]);
@@ -35,6 +36,7 @@ const run = async (tool: "acli" | "gh", args: readonly string[]) => {
 const core = () =>
   createSyncCore({
     run,
+    previous: async () => previous,
     wanted: async () => wanted,
     pendingOps: async () => ops,
     claim: async (id) => claim(id),
@@ -73,6 +75,7 @@ beforeEach(() => {
   ingested = [];
   ackFails = false;
   claim = (id) => ops.some((o) => o.id === id);
+  previous = null;
 });
 
 describe("toTicket", () => {
@@ -205,6 +208,7 @@ describe("sync pass", () => {
         inFlight--;
         return run(tool, args);
       },
+      previous: async () => null,
       wanted: async () => wanted,
       pendingOps: async () => [],
       claim: async () => true,
@@ -357,6 +361,100 @@ describe("sync pass", () => {
     expect(s.ok).toBe(true);
     expect(s.prs.map((p) => p.number)).toEqual([7]);
     expect(s.error).toMatch(/^gh: 1 of 2 PRs unreadable \(.*no such PR.*\)$/);
+  });
+
+  describe("PR fetch speed", () => {
+    afterEach(() => vi.useRealTimers());
+    const prJson = (state: string) => JSON.stringify({ state, mergedAt: state === "MERGED" ? "2026-10-28T00:00:00Z" : null, headRefName: "b", title: "t", body: "", reviewDecision: null, updatedAt: "2026-10-29T00:00:00Z", statusCheckRollup: [] });
+    const ghPr = (number: number, state: "open" | "merged" | "closed") => ({ repo: "o/r", number, state, headRef: "old", title: "old", body: "", checks: "none" as const, reviewDecision: null, updatedAt: "2026-10-01T00:00:00Z" });
+    const prev = (prs: ReturnType<typeof ghPr>[]): JiraSnapshot => ({ version: 1, takenAt: "2026-10-29T00:00:00Z", ok: true, error: null, me: { accountId: "me1" }, tickets: [], prs, mentions: [] });
+    const peakOf = async (sub: string, build: () => void) => {
+      build();
+      let inFlight = 0;
+      let peak = 0;
+      await createSyncCore({
+        run: async (tool, args) => {
+          const hit = `${tool} ${args.join(" ")}`.includes(sub);
+          if (hit) peak = Math.max(peak, ++inFlight);
+          await new Promise((r) => setTimeout(r, 1));
+          if (hit) inFlight--;
+          return run(tool, args);
+        },
+        previous: async () => null,
+        wanted: async () => wanted,
+        pendingOps: async () => [],
+        claim: async () => true,
+        ack: async () => {},
+        ingest: async (s) => void ingested.push(s),
+      }).pass();
+      return peak;
+    };
+    beforeEach(() => {
+      rules.acli = [{ match: "search", stdout: JSON.stringify([issue("ENG-1")]) }];
+      rules.gh = [{ match: "pr view", stdout: prJson("OPEN") }, { match: "search prs", stdout: "[]" }];
+    });
+    it("pr views run at most 6 at a time, in input order", async () => {
+      const peak = await peakOf("pr view", () => {
+        wanted = { ...wanted, prRefs: Array.from({ length: 20 }, (_, i) => ({ repo: "o/r", number: i + 1 })) };
+      });
+      expect(peak).toBe(6);
+      expect(snap().prs.map((p) => p.number)).toEqual(Array.from({ length: 20 }, (_, i) => i + 1));
+    });
+    it("mention searches run at most 3 at a time", async () => {
+      const peak = await peakOf("search prs", () => {
+        wanted = { ...wanted, linkedKeys: Array.from({ length: 10 }, (_, i) => `ENG-${i + 1}`) };
+      });
+      expect(peak).toBe(3);
+    });
+    it("terminal PRs in the previous snapshot are reused as-is; open/unknown ones are re-fetched", async () => {
+      wanted = { ...wanted, prRefs: [1, 2, 3, 4].map((number) => ({ repo: "o/r", number })) };
+      previous = prev([ghPr(1, "merged"), ghPr(2, "closed"), ghPr(3, "open")]);
+      await pass();
+      const viewed = calls.filter((c) => c.args[0] === "pr").map((c) => c.args[2]);
+      expect(viewed).toEqual(["3", "4"]);
+      const s = snap();
+      expect(s.prs.map((p) => p.number)).toEqual([1, 2, 3, 4]);
+      expect(s.prs[0]).toEqual(ghPr(1, "merged"));
+      expect(s.prs[1]).toEqual(ghPr(2, "closed"));
+      expect(s.prs[2]).toEqual(expect.objectContaining({ number: 3, headRef: "b", title: "t" }));
+    });
+    it("the failure count only counts refs attempted this pass", async () => {
+      wanted = { ...wanted, prRefs: [1, 2, 3].map((number) => ({ repo: "o/r", number })) };
+      previous = prev([ghPr(1, "merged")]);
+      rules.gh = [{ match: "pr view 3", fail: "no such PR" }, ...rules.gh];
+      await pass();
+      expect(snap().error).toMatch(/^gh: 1 of 2 PRs unreadable /);
+      expect(snap().prs.map((p) => p.number)).toEqual([1, 2]);
+    });
+    it("mentions are reused within 30 minutes and refetched after", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-11-05T10:00:00Z"));
+      wanted = { ...wanted, linkedKeys: ["ENG-1"] };
+      rules.gh = [{ match: "search prs", stdout: JSON.stringify([{ repository: { nameWithOwner: "o/r" }, number: 3, closedAt: "2026-10-28T00:00:00Z" }]) }];
+      const c = core();
+      const searches = () => calls.filter((x) => x.args[0] === "search").length;
+      await c.pass();
+      expect(searches()).toBe(1);
+      vi.setSystemTime(new Date("2026-11-05T10:29:00Z"));
+      await c.pass();
+      expect(searches()).toBe(1);
+      expect(snap().mentions).toEqual([{ key: "ENG-1", repo: "o/r", number: 3, mergedAt: "2026-10-28T00:00:00Z" }]);
+      vi.setSystemTime(new Date("2026-11-05T10:31:00Z"));
+      await c.pass();
+      expect(searches()).toBe(2);
+      // A fresh core (a restart) refetches.
+      await core().pass();
+      expect(searches()).toBe(3);
+    });
+    it("a failed mention search is not cached", async () => {
+      wanted = { ...wanted, linkedKeys: ["ENG-1"] };
+      rules.gh = [{ match: "search prs", fail: "rate limited" }];
+      const c = core();
+      await c.pass();
+      expect(snap().error).toMatch(/1 of 1 mention searches failed/);
+      await c.pass();
+      expect(calls.filter((x) => x.args[0] === "search")).toHaveLength(2);
+    });
   });
 
   it("never passes a space-joined command as one argv entry", async () => {

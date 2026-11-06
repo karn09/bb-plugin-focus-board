@@ -355,6 +355,7 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
       const w = await computeWanted(jiraSettings(await deps.settings()));
       return forceFull ? { ...w, fullSync: true } : w;
     },
+    previous: async () => (await store.readSnapshot()).snapshot,
     pendingOps: () => store.pendingOps(),
     claim: (id) => store.claim(id),
     ack: async (results) => {

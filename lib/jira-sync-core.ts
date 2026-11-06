@@ -5,7 +5,7 @@
 // lib/jira-exec.ts runTool, tests a fake. A tool failure on a fetch goes
 // into the snapshot (ok:false / error); only a failing ack or ingest
 // rejects the pass.
-import type { GhPr, JiraTicket, OpResult, QueueOp } from "./jira-schema";
+import type { GhPr, JiraSnapshot, JiraTicket, OpResult, QueueOp } from "./jira-schema";
 import { jiraBrowseUrl } from "./jira-keys";
 
 export type ToolRunner = (tool: "acli" | "gh", args: readonly string[]) => Promise<string>;
@@ -20,6 +20,8 @@ export type SyncWanted = {
 export type SyncDeps = {
   run: ToolRunner;
   wanted: () => Promise<SyncWanted>;
+  /** The stored snapshot: its merged/closed PRs are reused, not re-read. */
+  previous: () => Promise<JiraSnapshot | null>;
   pendingOps: () => Promise<QueueOp[]>;
   /** Re-checked right before each apply: false means the op was cancelled since the read (skip, no ack). */
   claim: (opId: string) => Promise<boolean>;
@@ -137,8 +139,12 @@ function checksOf(rollup: Raw): GhPr["checks"] {
 }
 const REVIEW: Record<string, GhPr["reviewDecision"]> = { APPROVED: "approved", CHANGES_REQUESTED: "changes_requested", REVIEW_REQUIRED: "review_required" };
 
+const MENTIONS_TTL_MS = 30 * 60_000;
+
 export function createSyncCore(deps: SyncDeps) {
   const { run } = deps;
+  // ponytail: in-memory (the snapshot schema has no per-key fetch time); a restart refetches every key once.
+  const mentionCache = new Map<string, { at: number; rows: SyncSnapshot["mentions"] }>();
   const acli = (...a: string[]) => run("acli", ["jira", "workitem", ...a]);
   const search = async (jql: string) => asList(json(await acli("search", "--jql", jql, "--fields", FIELDS, "--json", "--paginate")));
 
@@ -221,41 +227,53 @@ export function createSyncCore(deps: SyncDeps) {
   }
 
   // One unreadable PR (or search) skips just that ref; the failures are counted in snapshot.error.
-  async function fetchPrs(wanted: SyncWanted, linkedKeys: string[]) {
-    const prs: GhPr[] = [];
+  // Merged/closed PRs in the previous snapshot never change: reused, not re-read.
+  async function fetchPrs(wanted: SyncWanted, linkedKeys: string[], previous: JiraSnapshot | null) {
+    const terminal = new Map<string, GhPr>();
+    for (const p of previous?.prs ?? []) if (p.state !== "open") terminal.set(`${p.repo}#${p.number}`, p);
     const failed: string[] = [];
-    for (const { repo, number } of wanted.prRefs) {
+    let attempted = 0;
+    const prs = await pool(wanted.prRefs, 6, async ({ repo, number }): Promise<GhPr | null> => {
+      const kept = terminal.get(`${repo}#${number}`);
+      if (kept) return kept;
+      attempted++;
       let p: Raw;
       try {
         p = json(await run("gh", ["pr", "view", String(number), "-R", repo, "--json",
           "state,mergedAt,headRefName,title,body,statusCheckRollup,reviewDecision,updatedAt"]));
       } catch (e) {
         failed.push(msg(e));
-        continue;
+        return null;
       }
-      prs.push({
+      return {
         repo, number, state: p.state === "MERGED" || p.mergedAt ? "merged" : p.state === "CLOSED" ? "closed" : "open",
         headRef: p.headRefName ?? "", title: p.title ?? "", body: p.body ?? "", checks: checksOf(p.statusCheckRollup),
         reviewDecision: REVIEW[p.reviewDecision] ?? null, updatedAt: p.updatedAt ?? "",
-      });
-    }
-    const mentions: SyncSnapshot["mentions"] = [];
+      };
+    });
+    // GitHub search allows ~30 requests/min: 3 at a time, and each key at most once per 30 minutes.
     const searchFailed: string[] = [];
-    for (const key of linkedKeys) {
+    let searched = 0;
+    const mentions = await pool(linkedKeys, 3, async (key): Promise<SyncSnapshot["mentions"]> => {
+      const hit = mentionCache.get(key);
+      if (hit && Date.now() - hit.at < MENTIONS_TTL_MS) return hit.rows;
+      searched++;
       let rs: Raw[];
       try {
         rs = json(await run("gh", ["search", "prs", key, "--merged", "--json", "repository,number,closedAt", "--limit", "10"])) ?? [];
       } catch (e) {
         searchFailed.push(msg(e));
-        continue;
+        return [];
       }
-      for (const r of rs) mentions.push({ key, repo: r.repository?.nameWithOwner ?? "", number: r.number, mergedAt: r.closedAt ?? "" });
-    }
+      const rows = rs.map((r) => ({ key, repo: r.repository?.nameWithOwner ?? "", number: r.number, mergedAt: r.closedAt ?? "" }));
+      mentionCache.set(key, { at: Date.now(), rows });
+      return rows;
+    });
     const errors = [
-      ...(failed.length ? [`gh: ${failed.length} of ${wanted.prRefs.length} PRs unreadable (${failed[0]})`] : []),
-      ...(searchFailed.length ? [`gh: ${searchFailed.length} of ${linkedKeys.length} mention searches failed (${searchFailed[0]})`] : []),
+      ...(failed.length ? [`gh: ${failed.length} of ${attempted} PRs unreadable (${failed[0]})`] : []),
+      ...(searchFailed.length ? [`gh: ${searchFailed.length} of ${searched} mention searches failed (${searchFailed[0]})`] : []),
     ];
-    return { prs, mentions, error: errors.length ? errors.join("; ") : null };
+    return { prs: prs.filter((p): p is GhPr => p !== null), mentions: mentions.flat(), error: errors.length ? errors.join("; ") : null };
   }
 
   async function pass(): Promise<void> {
@@ -274,7 +292,7 @@ export function createSyncCore(deps: SyncDeps) {
     }
     if (snap.ok) {
       try {
-        Object.assign(snap, await fetchPrs(wanted, wanted.linkedKeys.filter((k) => KEY.test(k))));
+        Object.assign(snap, await fetchPrs(wanted, wanted.linkedKeys.filter((k) => KEY.test(k)), await deps.previous()));
       } catch (e) {
         snap.prs = [];
         snap.mentions = [];
