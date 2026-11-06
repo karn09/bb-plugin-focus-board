@@ -1257,10 +1257,25 @@ export function registerJira(bb: BbPluginApi, deps: JiraDeps) {
     if (!quiet) bb.realtime.publish(JIRA_CHANGED, {});
   };
   /** Drafts and submitted-op records of threads no longer live (archived, gone) leave. */
+  // A thread missing from a list read is only a candidate: a partial or lagging
+  // list (e.g. at startup) must never cost a live thread its closeout draft.
+  // Prune only when bb confirms the thread archived or not found.
+  const confirmedGone = async (threadId: string) => {
+    try {
+      return (await bb.sdk.threads.get({ threadId })).archivedAt != null;
+    } catch (e) {
+      const err = e as { status?: number; code?: string };
+      return err.status === 404 || err.code === "thread_not_found";
+    }
+  };
   const pruneGone = async (live: Set<string>) => {
     await Promise.all([closeouts.loaded, closeoutOps.loaded]);
-    for (const id of [...closeouts.map.keys()]) if (!live.has(id)) await closeouts.set(id, undefined);
-    for (const id of [...closeoutOps.map.keys()]) if (!live.has(id)) await closeoutOps.set(id, undefined);
+    const candidates = new Set([...closeouts.map.keys(), ...closeoutOps.map.keys()].filter((id) => !live.has(id)));
+    for (const id of candidates) {
+      if (!(await confirmedGone(id))) continue;
+      if (closeouts.map.has(id)) await closeouts.set(id, undefined);
+      if (closeoutOps.map.has(id)) await closeoutOps.set(id, undefined);
+    }
   };
   void (async () => {
     if (await enabled()) await pruneGone(new Set((await deps.liveLinks()).map((t) => t.id)));

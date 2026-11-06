@@ -108,6 +108,8 @@ describe("Done check flow", () => {
   let send: ReturnType<typeof vi.fn>;
   let metaHook: ((set: Record<string, any> | undefined) => void) | null = null;
   let listGate: Promise<void> | null = null;
+  /** Threads that exist (get finds them) but a list read misses: a lagging or partial list. */
+  const lagging = new Set<string>();
 
   async function load(opts: { enabled?: boolean; snapshot?: object | null; kv?: Record<string, unknown> } = {}) {
     send = vi.fn(async () => ({}));
@@ -133,7 +135,10 @@ describe("Done check flow", () => {
             }
             return args?.archived ? [] : [...rows.keys()].map(row);
           },
-          get: async ({ threadId }: { threadId: string }) => row(threadId),
+          get: async ({ threadId }: { threadId: string }) => {
+            if (!rows.has(threadId) && !lagging.has(threadId)) throw Object.assign(new Error("not found"), { status: 404, code: "thread_not_found" });
+            return row(threadId);
+          },
           send,
           getPluginMetadata: async ({ threadId }: { threadId: string }) => metadata.get(threadId) ?? {},
           updatePluginMetadata: async ({ threadId, set, remove }: { threadId: string; set?: Record<string, unknown>; remove?: string[] }) => {
@@ -160,6 +165,7 @@ describe("Done check flow", () => {
     metadata.clear();
     status.clear();
     rows.clear();
+    lagging.clear();
   };
   afterEach(async () => {
     await harness.lifecycle.dispose();
@@ -1053,10 +1059,20 @@ describe("Done check flow", () => {
     await flush();
     expect(Object.keys((await bb.storage.kv.get("jira:closeouts")) as object)).toEqual(["t1"]);
     expect(await bb.storage.kv.get("jira:closeout-ops")).toEqual({});
-    rows.delete("t1"); // archived since
+    rows.delete("t1"); // deleted since
     const state = (await harness.behavior.callRpc("jira_board_state", null)) as { closeouts: Record<string, unknown> };
     expect(state.closeouts).toEqual({});
     expect(await bb.storage.kv.get("jira:closeouts")).toEqual({});
+  });
+
+  it("closeout: a draft survives when a list read merely misses its thread (only confirmed-gone threads are pruned)", async () => {
+    seed("t1");
+    const d = { createdAt: "x", skipped: false, tickets: [{ key: "PT-1", body: "b", transition: false, canTransition: false }] };
+    lagging.add("t2"); // exists, but the list doesn't return it
+    await load({ kv: { "jira:closeouts": { t1: d, t2: d } } });
+    await flush();
+    await harness.behavior.callRpc("jira_board_state", null);
+    expect(Object.keys((await bb.storage.kv.get("jira:closeouts")) as object).sort()).toEqual(["t1", "t2"]);
   });
 
   it("closeout with Jira off: no draft, the RPCs refuse", async () => {
